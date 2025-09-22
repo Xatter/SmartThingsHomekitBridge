@@ -200,7 +200,10 @@ export class SmartThingsAPI {
       const switchStatus = status.components?.main?.switch?.switch?.value || 'off';
 
       // For Samsung ACs: if switch is off, the device mode should be 'off' regardless of airConditionerMode
+      // However, during a mode change operation, there might be a brief period where the switch is still 'off'
+      // but the airConditionerMode has been set. In this case, we should trust the airConditionerMode.
       if (switchStatus === 'off' && status.components?.main?.airConditionerMode) {
+        const airConditionerMode = status.components?.main?.airConditionerMode?.airConditionerMode?.value;
         mode = 'off';
       }
 
@@ -281,13 +284,19 @@ export class SmartThingsAPI {
         } else {
           // For heat/cool/auto modes, use airConditionerMode
           // First turn the device on if it's not already on
+          console.log(`Turning on Samsung AC switch for device ${deviceId} before setting mode to ${mode}`);
           await client.devices.executeCommand(deviceId, {
             component: 'main',
             capability: 'switch',
             command: 'on',
             arguments: [],
           });
+          console.log(`Samsung AC switch turned on for device ${deviceId}`);
 
+          // Small delay to ensure switch command is processed
+          await new Promise(resolve => setTimeout(resolve, 1000));
+
+          console.log(`Setting Samsung AC mode to ${mode} for device ${deviceId}`);
           await client.devices.executeCommand(deviceId, {
             component: 'main',
             capability: 'airConditionerMode',

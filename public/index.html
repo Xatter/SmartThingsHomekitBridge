@@ -332,12 +332,12 @@
             const fetchMatterInfo = async () => {
                 setLoading(true);
                 try {
-                    const response = await fetch('/api/matter/pairing');
+                    const response = await fetch('/api/homekit/pairing');
                     const data = await response.json();
                     setMatterInfo(data);
                 } catch (error) {
-                    setError('Failed to fetch Matter info');
-                    console.error('Error fetching Matter info:', error);
+                    setError('Failed to fetch HomeKit info');
+                    console.error('Error fetching HomeKit info:', error);
                 } finally {
                     setLoading(false);
                 }
@@ -370,8 +370,8 @@
             return (
                 <div className="container">
                     <div className="header">
-                        <h1>SmartThings Matter Bridge</h1>
-                        <p>Bridge your SmartThings HVAC devices to Matter/HomeKit</p>
+                        <h1>SmartThings HomeKit Bridge</h1>
+                        <p>Bridge your SmartThings HVAC devices to HomeKit</p>
                     </div>
 
                     <div className="nav">
@@ -389,7 +389,7 @@
                                 window.location.hash = 'setup';
                             }}
                         >
-                            Matter Setup
+                            HomeKit Setup
                         </button>
                     </div>
 
@@ -559,21 +559,21 @@
 
         function SetupPage({ matterInfo, loading }) {
             if (loading) {
-                return <div className="loading">Loading Matter setup...</div>;
+                return <div className="loading">Loading HomeKit setup...</div>;
             }
 
             if (!matterInfo) {
                 return (
                     <div className="card">
-                        <h2>Matter Setup Unavailable</h2>
-                        <p>Could not load Matter pairing information.</p>
+                        <h2>HomeKit Setup Unavailable</h2>
+                        <p>Could not load HomeKit pairing information.</p>
                     </div>
                 );
             }
 
             return (
                 <div className="card">
-                    <h2>Matter/HomeKit Setup</h2>
+                    <h2>HomeKit Setup</h2>
 
                     {matterInfo.qrCode && (
                         <div className="qr-code">
@@ -598,12 +598,6 @@
                                 ))}
                             </ol>
 
-                            <h3>General Matter Controller Instructions</h3>
-                            <ol>
-                                {matterInfo.instructions.general.map((step, index) => (
-                                    <li key={index}>{step}</li>
-                                ))}
-                            </ol>
                         </div>
                     )}
                 </div>

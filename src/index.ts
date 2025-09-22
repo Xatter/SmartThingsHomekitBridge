@@ -4,13 +4,13 @@ import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { LightingMonitor } from '@/monitoring/LightingMonitor';
 import { Coordinator } from '@/coordinator/Coordinator';
-import { MatterServer } from '@/matter/MatterServer';
+import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { WebServer } from '@/web/server';
 
 dotenv.config();
 
 async function startup(): Promise<void> {
-  console.log('🚀 Starting SmartThings Matter Bridge...');
+  console.log('🚀 Starting SmartThings HomeKit Bridge...');
 
   // Debug environment variables
   console.log('Environment check:');
@@ -21,7 +21,8 @@ async function startup(): Promise<void> {
   const tokenPath = process.env.AUTH_TOKEN_PATH || './data/smartthings_token.json';
   const statePath = process.env.DEVICE_STATE_PATH || './data/device_state.json';
   const webPort = parseInt(process.env.WEB_PORT || '3000');
-  const matterPort = parseInt(process.env.MATTER_PORT || '5540');
+  const hapPort = parseInt(process.env.HAP_PORT || '51826');
+  const hapPincode = process.env.HAP_PINCODE || '942-37-286';
   const lightingInterval = parseInt(process.env.LIGHTING_CHECK_INTERVAL || '60');
   const pollInterval = parseInt(process.env.DEVICE_POLL_INTERVAL || '300');
 
@@ -42,12 +43,12 @@ async function startup(): Promise<void> {
 
     const lightingMonitor = new LightingMonitor(smartThingsAPI, lightingInterval);
 
-    const matterServer = new MatterServer(matterPort);
+    const hapServer = new SmartThingsHAPServer(hapPort, hapPincode);
 
     const coordinator = new Coordinator(
       smartThingsAPI,
       lightingMonitor,
-      matterServer,
+      hapServer,
       statePath,
       pollInterval
     );
@@ -68,7 +69,7 @@ async function startup(): Promise<void> {
       smartThingsAuth,
       smartThingsAPI,
       coordinator,
-      matterServer,
+      hapServer,
       onAuthSuccess
     );
 
@@ -79,11 +80,12 @@ async function startup(): Promise<void> {
       console.log('✅ SmartThings authentication found');
     }
 
+    console.log('⚡ Starting HAP server...');
+    await hapServer.initialize(coordinator);
+    await hapServer.start();
+
     console.log('🔧 Initializing coordinator...');
     await coordinator.initialize();
-
-    console.log('⚡ Starting Matter server...');
-    await matterServer.initialize(coordinator);
 
     console.log('🌐 Starting web server...');
     await webServer.start();
@@ -93,16 +95,16 @@ async function startup(): Promise<void> {
       lightingMonitor.start();
     }
 
-    console.log('✅ SmartThings Matter Bridge is running!');
+    console.log('✅ SmartThings HomeKit Bridge is running!');
     console.log('');
     console.log('📱 Web Interface: http://localhost:' + webPort);
-    console.log('🏠 Matter Server: Port ' + matterPort);
+    console.log('🏠 HomeKit Bridge: Port ' + hapPort);
     console.log('');
 
-    if (matterServer.getQrCode()) {
-      console.log('🔗 Matter Pairing Information:');
+    if (hapServer.getQrCode()) {
+      console.log('🔗 HomeKit Pairing Information:');
       console.log('   QR Code: Available in web interface');
-      console.log('   Manual Code:', matterServer.getPairingCode());
+      console.log('   Setup Code:', hapServer.getPairingCode());
     }
 
     const gracefulShutdown = async (signal: string) => {
@@ -111,7 +113,7 @@ async function startup(): Promise<void> {
       try {
         coordinator.stop();
         lightingMonitor.stop();
-        await matterServer.stop();
+        await hapServer.stop();
         await webServer.stop();
 
         console.log('✅ Graceful shutdown complete');
@@ -126,7 +128,7 @@ async function startup(): Promise<void> {
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
   } catch (error) {
-    console.error('❌ Failed to start SmartThings Matter Bridge:', error);
+    console.error('❌ Failed to start SmartThings HomeKit Bridge:', error);
     process.exit(1);
   }
 }

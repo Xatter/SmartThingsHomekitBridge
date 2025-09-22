@@ -2,13 +2,14 @@ import * as cron from 'node-cron';
 import { promises as fs } from 'fs';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { LightingMonitor } from '@/monitoring/LightingMonitor';
-import { MatterServer } from '@/matter/MatterServer';
-import { CoordinatorState, DeviceState, MatterThermostatEvent, UnifiedDevice } from '@/types';
+import { SmartThingsHAPServer } from '@/hap/HAPServer';
+import { CoordinatorState, DeviceState, UnifiedDevice } from '@/types';
+import { HAPThermostatEvent } from '@/hap/HAPServer';
 
 export class Coordinator {
   private readonly api: SmartThingsAPI;
   private readonly lightingMonitor: LightingMonitor;
-  private readonly matterServer: MatterServer;
+  private readonly hapServer: SmartThingsHAPServer;
   private readonly stateFilePath: string;
   private state: CoordinatorState;
   private pollTask: cron.ScheduledTask | null = null;
@@ -17,13 +18,13 @@ export class Coordinator {
   constructor(
     api: SmartThingsAPI,
     lightingMonitor: LightingMonitor,
-    matterServer: MatterServer,
+    hapServer: SmartThingsHAPServer,
     stateFilePath: string,
     pollIntervalSeconds: number = 300
   ) {
     this.api = api;
     this.lightingMonitor = lightingMonitor;
-    this.matterServer = matterServer;
+    this.hapServer = hapServer;
     this.stateFilePath = stateFilePath;
     this.pollInterval = this.convertSecondsToInterval(pollIntervalSeconds);
 
@@ -45,7 +46,13 @@ export class Coordinator {
 
   async initialize(): Promise<void> {
     await this.loadState();
-    await this.reloadDevices();
+    // Only reload devices if we have auth and existing devices to restore
+    if (this.api.hasAuth() && this.state.pairedDevices.length > 0) {
+      // Defer device loading to avoid blocking pairing process
+      setTimeout(async () => {
+        await this.reloadDevices();
+      }, 2000);
+    }
     this.startPolling();
   }
 
@@ -104,6 +111,8 @@ export class Coordinator {
       return;
     }
 
+    console.log('⏳ Reloading devices - this may take a moment...');
+
     try {
       console.log('🔍 Reloading devices from SmartThings...');
       const filteredDevices = await this.api.getDevices([]);
@@ -125,10 +134,10 @@ export class Coordinator {
         const deviceState = await this.getDeviceStateByDevice(device);
         if (deviceState) {
           try {
-            await this.matterServer.addDevice(device.deviceId, deviceState);
-            console.log(`✅ Added ${device.name} to Matter bridge`);
+            await this.hapServer.addDevice(device.deviceId, deviceState);
+            console.log(`✅ Added ${device.name} to HomeKit bridge`);
           } catch (error) {
-            console.error(`❌ Failed to add ${device.name} to Matter bridge:`, error);
+            console.error(`❌ Failed to add ${device.name} to HomeKit bridge:`, error);
           }
         }
       }
@@ -351,8 +360,8 @@ export class Coordinator {
     }
   }
 
-  async handleMatterThermostatEvent(event: MatterThermostatEvent): Promise<void> {
-    console.log(`Handling Matter thermostat event for device ${event.deviceId}:`, event);
+  async handleHAPThermostatEvent(event: HAPThermostatEvent): Promise<void> {
+    console.log(`Handling HAP thermostat event for device ${event.deviceId}:`, event);
 
     const currentState = this.state.deviceStates.get(event.deviceId);
     if (!currentState) {
@@ -380,11 +389,21 @@ export class Coordinator {
   private async getDeviceStateByDevice(device: UnifiedDevice): Promise<DeviceState | null> {
     try {
       const status = await this.api.getDeviceStatus(device.deviceId);
+      if (!status) {
+        console.error(`No status returned for device ${device.name}`);
+        return null;
+      }
+
       return {
+        id: device.deviceId,
         name: device.name,
-        currentTemperature: status.temperature || 70,
-        temperatureSetpoint: status.targetTemperature || status.coolingSetpoint || 72,
-        mode: status.mode || 'off',
+        currentTemperature: status.currentTemperature || 70,
+        temperatureSetpoint: status.temperatureSetpoint || 72,
+        mode: status.mode,
+        lightOn: false, // Air conditioners don't have lights
+        lastUpdated: new Date(),
+        heatingSetpoint: status.heatingSetpoint,
+        coolingSetpoint: status.coolingSetpoint,
       };
     } catch (error) {
       console.error(`Failed to get device state for ${device.name}:`, error);

@@ -6,6 +6,12 @@ export interface DeviceState {
   mode: 'heat' | 'cool' | 'auto' | 'off';
   lightOn: boolean;
   lastUpdated: Date;
+  // Enhanced thermostat properties
+  heatingSetpoint?: number;
+  coolingSetpoint?: number;
+  operatingState?: 'idle' | 'heating' | 'cooling';
+  humidity?: number;
+  outdoorTemperature?: number;
 }
 
 export interface CoordinatorState {
@@ -57,12 +63,6 @@ export interface ThermostatCapabilities {
   customThermostatSetpointControl?: boolean;
 }
 
-export interface MatterThermostatEvent {
-  deviceId: string;
-  type: 'temperature' | 'mode' | 'both';
-  temperature?: number;
-  mode?: 'heat' | 'cool' | 'auto' | 'off';
-}
 
 export interface UnifiedDevice {
   deviceId: string;

@@ -1,13 +1,13 @@
 import { Router, Request, Response } from 'express';
-import { MatterServer } from '@/matter/MatterServer';
+import { SmartThingsHAPServer } from '@/hap/HAPServer';
 
-export function createMatterRoutes(matterServer: MatterServer): Router {
+export function createHomeKitRoutes(hapServer: SmartThingsHAPServer): Router {
   const router = Router();
 
   router.get('/pairing', (req: Request, res: Response) => {
     try {
-      const qrCode = matterServer.getQrCode();
-      const pairingCode = matterServer.getPairingCode();
+      const qrCode = hapServer.getQrCode();
+      const pairingCode = hapServer.getPairingCode();
 
       res.json({
         qrCode,
@@ -17,26 +17,21 @@ export function createMatterRoutes(matterServer: MatterServer): Router {
             'Open the Home app on your iOS device',
             'Tap the + button to add a new accessory',
             'Choose "Add Accessory"',
-            'Scan the QR code below or enter the manual pairing code',
+            'Scan the QR code below or enter the setup code',
             'Follow the on-screen instructions to complete pairing'
-          ],
-          general: [
-            'Use any Matter-compatible controller',
-            'Scan the QR code or enter the manual pairing code',
-            'Your thermostats will appear as individual devices'
           ]
         }
       });
     } catch (error) {
-      console.error('Error getting Matter pairing info:', error);
+      console.error('Error getting HomeKit pairing info:', error);
       res.status(500).json({ error: 'Failed to get pairing information' });
     }
   });
 
   router.get('/status', (req: Request, res: Response) => {
     try {
-      const qrCode = matterServer.getQrCode();
-      const pairingCode = matterServer.getPairingCode();
+      const qrCode = hapServer.getQrCode();
+      const pairingCode = hapServer.getPairingCode();
 
       res.json({
         running: qrCode !== null,
@@ -44,8 +39,8 @@ export function createMatterRoutes(matterServer: MatterServer): Router {
         pairingCode,
       });
     } catch (error) {
-      console.error('Error getting Matter status:', error);
-      res.status(500).json({ error: 'Failed to get Matter status' });
+      console.error('Error getting HomeKit status:', error);
+      res.status(500).json({ error: 'Failed to get HomeKit status' });
     }
   });
 

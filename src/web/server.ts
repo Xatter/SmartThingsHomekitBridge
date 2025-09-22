@@ -5,10 +5,10 @@ import path from 'path';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { Coordinator } from '@/coordinator/Coordinator';
-import { MatterServer } from '@/matter/MatterServer';
+import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { createAuthRoutes } from './routes/auth';
 import { createDevicesRoutes } from './routes/devices';
-import { createMatterRoutes } from './routes/matter';
+import { createHomeKitRoutes } from './routes/homekit';
 
 export class WebServer {
   private app: express.Application;
@@ -45,12 +45,12 @@ export class WebServer {
     auth: SmartThingsAuthentication,
     api: SmartThingsAPI,
     coordinator: Coordinator,
-    matterServer: MatterServer,
+    hapServer: SmartThingsHAPServer,
     onAuthSuccess?: () => void
   ): void {
     this.app.use('/api/auth', createAuthRoutes(auth, onAuthSuccess));
     this.app.use('/api/devices', createDevicesRoutes(api, coordinator));
-    this.app.use('/api/matter', createMatterRoutes(matterServer));
+    this.app.use('/api/homekit', createHomeKitRoutes(hapServer));
 
     this.app.get('/api/health', (req, res) => {
       res.json({
@@ -58,7 +58,7 @@ export class WebServer {
         timestamp: new Date().toISOString(),
         services: {
           smartthings: api.hasAuth(),
-          matter: matterServer.getQrCode() !== null,
+          homekit: hapServer.getQrCode() !== null,
         },
       });
     });
