@@ -153,8 +153,18 @@ export class Coordinator {
   }
 
   private determineCurrentMode(): void {
-    const modes = Array.from(this.state.deviceStates.values()).map(state => state.mode);
-    const modeCount = modes.reduce((acc, mode) => {
+    // Only consider devices that are ON (mode !== 'off') for determining the active mode
+    const onDeviceModes = Array.from(this.state.deviceStates.values())
+      .filter(state => state.mode !== 'off')
+      .map(state => state.mode);
+
+    if (onDeviceModes.length === 0) {
+      // All devices are off
+      this.state.currentMode = 'off';
+      return;
+    }
+
+    const modeCount = onDeviceModes.reduce((acc, mode) => {
       acc[mode] = (acc[mode] || 0) + 1;
       return acc;
     }, {} as Record<string, number>);
@@ -278,12 +288,13 @@ export class Coordinator {
       return;
     }
 
-    console.log(`Synchronizing all devices to ${newMode} mode`);
+    console.log(`Synchronizing all ON devices to ${newMode} mode`);
 
     const promises = this.state.pairedDevices.map(async (deviceId) => {
       try {
         const currentState = this.state.deviceStates.get(deviceId);
-        if (currentState && currentState.mode !== newMode) {
+        // Only synchronize devices that are already ON (mode !== 'off')
+        if (currentState && currentState.mode !== 'off' && currentState.mode !== newMode) {
           await this.api.setMode(deviceId, newMode);
           currentState.mode = newMode;
           currentState.lastUpdated = new Date();
