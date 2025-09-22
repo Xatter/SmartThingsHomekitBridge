@@ -90,18 +90,28 @@ export class Coordinator {
     }
 
     try {
+      console.log('🔍 Reloading devices from SmartThings...');
+      const allDevices = await this.api.getAllDevices();
+      console.log(`📱 Found ${allDevices.length} total devices`);
+
       const filteredDevices = await this.api.getFilteredDevices();
       const deviceIds = filteredDevices.map(device => device.deviceId);
+
+      console.log('🏠 HVAC devices found:');
+      filteredDevices.forEach(device => {
+        console.log(`  - ${device.name} (${device.deviceId})`);
+        console.log(`    Capabilities: ${device.capabilities.map(cap => cap.id).join(', ')}`);
+      });
 
       this.state.pairedDevices = deviceIds;
       this.lightingMonitor.setDevices(deviceIds);
 
-      console.log(`Reloaded devices: Found ${deviceIds.length} HVAC devices`);
+      console.log(`✅ Reloaded devices: Found ${deviceIds.length} HVAC devices`);
 
       await this.updateDeviceStates();
       await this.saveState();
     } catch (error) {
-      console.error('Error reloading devices:', error);
+      console.error('❌ Error reloading devices:', error);
     }
   }
 

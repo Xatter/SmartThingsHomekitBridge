@@ -51,6 +51,10 @@ export interface ThermostatCapabilities {
   thermostatMode?: boolean;
   thermostatOperatingState?: boolean;
   switch?: boolean;
+  // Samsung air conditioner specific capabilities
+  airConditionerMode?: boolean;
+  airConditionerFanMode?: boolean;
+  customThermostatSetpointControl?: boolean;
 }
 
 export interface MatterThermostatEvent {

@@ -38,19 +38,64 @@ export class SmartThingsAPI {
     }
 
     try {
-      const devices = await client.devices.list();
-      return devices.map((device: any) => ({
-        deviceId: device.deviceId!,
-        name: device.name!,
-        label: device.label!,
-        manufacturerName: device.manufacturerName || '',
-        presentationId: device.presentationId || '',
-        deviceTypeName: device.deviceTypeName || '',
-        capabilities: device.capabilities || [],
-        components: device.components || [],
-      }));
+      console.log('📡 Fetching device list from SmartThings...');
+      const deviceList = await client.devices.list();
+      console.log(`📱 Found ${deviceList.length} devices, fetching detailed info...`);
+
+      // Fetch detailed information for each device
+      const devicePromises = deviceList.map(async (deviceSummary: any) => {
+        try {
+          console.log(`🔍 Fetching details for device: ${deviceSummary.name || deviceSummary.deviceId}`);
+          const deviceDetails = await client.devices.get(deviceSummary.deviceId);
+          console.log(`🔍 Device ${deviceSummary.deviceId} details:`, {
+            capabilities: deviceDetails.capabilities?.length || 0,
+            components: deviceDetails.components?.length || 0,
+            rawCapabilities: deviceDetails.capabilities?.map(cap => cap.id).join(', ') || 'none',
+            componentCapabilities: deviceDetails.components?.map(comp =>
+              `${comp.id}: [${comp.capabilities?.map(cap => cap.id).join(', ') || 'none'}]`
+            ).join(' | ') || 'none'
+          });
+          // Extract capabilities from components if top-level capabilities are empty
+          let capabilities = deviceDetails.capabilities || [];
+          if (capabilities.length === 0 && deviceDetails.components) {
+            // Flatten all capabilities from all components
+            capabilities = deviceDetails.components.reduce((allCaps: any[], component: any) => {
+              const componentCaps = component.capabilities || [];
+              return allCaps.concat(componentCaps);
+            }, []);
+          }
+
+          return {
+            deviceId: deviceDetails.deviceId!,
+            name: deviceDetails.name!,
+            label: deviceDetails.label!,
+            manufacturerName: deviceDetails.manufacturerName || '',
+            presentationId: deviceDetails.presentationId || '',
+            deviceTypeName: deviceDetails.deviceTypeName || '',
+            capabilities: capabilities,
+            components: deviceDetails.components || [],
+          };
+        } catch (error) {
+          console.error(`❌ Error fetching details for device ${deviceSummary.deviceId}:`, error);
+          // Return basic info if detailed fetch fails
+          return {
+            deviceId: deviceSummary.deviceId!,
+            name: deviceSummary.name!,
+            label: deviceSummary.label!,
+            manufacturerName: deviceSummary.manufacturerName || '',
+            presentationId: deviceSummary.presentationId || '',
+            deviceTypeName: deviceSummary.deviceTypeName || '',
+            capabilities: deviceSummary.capabilities || [],
+            components: deviceSummary.components || [],
+          };
+        }
+      });
+
+      const devices = await Promise.all(devicePromises);
+      console.log('✅ Finished fetching detailed device information');
+      return devices;
     } catch (error) {
-      console.error('Error fetching devices:', error);
+      console.error('❌ Error fetching devices:', error);
       throw error;
     }
   }
@@ -58,12 +103,42 @@ export class SmartThingsAPI {
   async getFilteredDevices(): Promise<SmartThingsDevice[]> {
     const allDevices = await this.getAllDevices();
 
+    console.log('🔍 Analyzing all devices for HVAC capabilities:');
+    allDevices.forEach(device => {
+      const capabilities = this.extractThermostatCapabilities(device);
+      const capabilityList = device.capabilities.map(cap => cap.id).join(', ');
+      console.log(`📱 ${device.name}:`);
+      console.log(`   ID: ${device.deviceId}`);
+      console.log(`   Capabilities: ${capabilityList}`);
+      console.log(`   HVAC Analysis:`, capabilities);
+
+      const hasStandardThermostat = capabilities.temperatureMeasurement ||
+                                    capabilities.thermostat ||
+                                    capabilities.thermostatCoolingSetpoint ||
+                                    capabilities.thermostatHeatingSetpoint;
+
+      const hasSamsungAC = capabilities.airConditionerMode ||
+                           capabilities.customThermostatSetpointControl;
+
+      console.log(`   Standard Thermostat: ${hasStandardThermostat}`);
+      console.log(`   Samsung AC: ${hasSamsungAC}`);
+      console.log(`   Is HVAC: ${hasStandardThermostat || hasSamsungAC}`);
+      console.log('');
+    });
+
     return allDevices.filter(device => {
       const capabilities = this.extractThermostatCapabilities(device);
-      return capabilities.temperatureMeasurement ||
-             capabilities.thermostat ||
-             capabilities.thermostatCoolingSetpoint ||
-             capabilities.thermostatHeatingSetpoint;
+      // Standard thermostat capabilities
+      const hasStandardThermostat = capabilities.temperatureMeasurement ||
+                                    capabilities.thermostat ||
+                                    capabilities.thermostatCoolingSetpoint ||
+                                    capabilities.thermostatHeatingSetpoint;
+
+      // Samsung air conditioner capabilities
+      const hasSamsungAC = capabilities.airConditionerMode ||
+                           capabilities.customThermostatSetpointControl;
+
+      return hasStandardThermostat || hasSamsungAC;
     });
   }
 
@@ -78,6 +153,10 @@ export class SmartThingsAPI {
       thermostatMode: allCapabilities.includes('thermostatMode'),
       thermostatOperatingState: allCapabilities.includes('thermostatOperatingState'),
       switch: allCapabilities.includes('switch'),
+      // Samsung air conditioner specific capabilities
+      airConditionerMode: allCapabilities.includes('airConditionerMode'),
+      airConditionerFanMode: allCapabilities.includes('airConditionerFanMode'),
+      customThermostatSetpointControl: allCapabilities.includes('custom.thermostatSetpointControl'),
     };
   }
 
@@ -91,13 +170,25 @@ export class SmartThingsAPI {
       const status = await client.devices.getStatus(deviceId);
       const device = await client.devices.get(deviceId);
 
+      // Get temperature measurement
       const temperature = Number(status.components?.main?.temperatureMeasurement?.temperature?.value) || 0;
-      const coolingSetpoint = Number(status.components?.main?.thermostatCoolingSetpoint?.coolingSetpoint?.value) || 0;
+
+      // Try standard thermostat setpoints first
+      let coolingSetpoint = Number(status.components?.main?.thermostatCoolingSetpoint?.coolingSetpoint?.value) || 0;
       const heatingSetpoint = Number(status.components?.main?.thermostatHeatingSetpoint?.heatingSetpoint?.value) || 0;
-      const mode = status.components?.main?.thermostatMode?.thermostatMode?.value || 'off';
+
+      // Get mode - try thermostat mode first, then air conditioner mode
+      let mode = status.components?.main?.thermostatMode?.thermostatMode?.value ||
+                 status.components?.main?.airConditionerMode?.airConditionerMode?.value || 'off';
+
+      // For Samsung air conditioners, convert modes
+      if (mode === 'wind') mode = 'cool'; // Samsung uses 'wind' for fan mode, treat as cool
+      if (mode === 'dry') mode = 'cool';  // Samsung dry mode, treat as cool
+
       const switchStatus = status.components?.main?.switch?.switch?.value || 'off';
 
-      const temperatureSetpoint = mode === 'cool' ? coolingSetpoint : heatingSetpoint;
+      // If no standard setpoints, use the cooling setpoint (Samsung units primarily use cooling)
+      const temperatureSetpoint = mode === 'cool' ? coolingSetpoint : (heatingSetpoint || coolingSetpoint);
 
       return {
         id: deviceId,
@@ -146,15 +237,29 @@ export class SmartThingsAPI {
     }
 
     try {
-      await client.devices.executeCommand(deviceId, {
-        component: 'main',
-        capability: 'thermostatMode',
-        command: 'setThermostatMode',
-        arguments: [mode],
-      });
+      // Try standard thermostat mode first
+      try {
+        await client.devices.executeCommand(deviceId, {
+          component: 'main',
+          capability: 'thermostatMode',
+          command: 'setThermostatMode',
+          arguments: [mode],
+        });
+        console.log(`Set thermostat mode to ${mode} for device ${deviceId}`);
+        return true;
+      } catch (thermostatError) {
+        // If thermostat mode fails, try air conditioner mode for Samsung devices
+        console.log(`Thermostat mode failed, trying air conditioner mode for device ${deviceId}`);
 
-      console.log(`Set mode to ${mode} for device ${deviceId}`);
-      return true;
+        await client.devices.executeCommand(deviceId, {
+          component: 'main',
+          capability: 'airConditionerMode',
+          command: 'setAirConditionerMode',
+          arguments: [mode],
+        });
+        console.log(`Set air conditioner mode to ${mode} for device ${deviceId}`);
+        return true;
+      }
     } catch (error) {
       console.error(`Error setting mode for device ${deviceId}:`, error);
       return false;

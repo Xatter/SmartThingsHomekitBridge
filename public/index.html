@@ -262,18 +262,30 @@
             const [error, setError] = useState(null);
 
             useEffect(() => {
-                checkAuthStatus();
-                if (currentPage === 'devices') {
-                    fetchDevices();
-                } else if (currentPage === 'setup') {
-                    fetchMatterInfo();
-                }
+                const initializePage = async () => {
+                    await checkAuthStatus();
+                    if (currentPage === 'devices') {
+                        fetchDevices();
+                    } else if (currentPage === 'setup') {
+                        fetchMatterInfo();
+                    }
+                };
+                initializePage();
             }, [currentPage]);
+
+            // Add separate useEffect for when authStatus changes
+            useEffect(() => {
+                if (authStatus?.authenticated && currentPage === 'devices') {
+                    fetchDevices();
+                }
+            }, [authStatus]);
 
             const checkAuthStatus = async () => {
                 try {
+                    console.log('Checking auth status...');
                     const response = await fetch('/api/auth/status');
                     const data = await response.json();
+                    console.log('Auth status response:', data);
                     setAuthStatus(data);
                 } catch (error) {
                     console.error('Error checking auth status:', error);
@@ -281,12 +293,18 @@
             };
 
             const fetchDevices = async () => {
-                if (!authStatus?.authenticated) return;
+                if (!authStatus?.authenticated) {
+                    console.log('Not authenticated, skipping device fetch');
+                    return;
+                }
 
+                console.log('Fetching devices...');
                 setLoading(true);
                 try {
                     const response = await fetch('/api/devices/paired');
+                    console.log('Devices response status:', response.status);
                     const data = await response.json();
+                    console.log('Devices data:', data);
                     setDevices(data.deviceStates || []);
                 } catch (error) {
                     setError('Failed to fetch devices');

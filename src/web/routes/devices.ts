@@ -26,7 +26,22 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
       }
 
       const devices = await api.getAllDevices();
-      res.json(devices);
+
+      // Add capability analysis for debugging
+      const devicesWithAnalysis = devices.map(device => ({
+        ...device,
+        capabilityIds: device.capabilities.map(cap => cap.id),
+        isHVAC: device.capabilities.some(cap =>
+          ['temperatureMeasurement', 'thermostat', 'thermostatCoolingSetpoint', 'thermostatHeatingSetpoint'].includes(cap.id)
+        )
+      }));
+
+      console.log(`Found ${devices.length} total devices:`);
+      devicesWithAnalysis.forEach(device => {
+        console.log(`- ${device.name}: ${device.capabilityIds.join(', ')} (HVAC: ${device.isHVAC})`);
+      });
+
+      res.json(devicesWithAnalysis);
     } catch (error) {
       console.error('Error fetching all devices:', error);
       res.status(500).json({ error: 'Failed to fetch all devices' });
