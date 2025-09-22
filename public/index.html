@@ -502,8 +502,8 @@
 
                     <div className="device-info">
                         <div className="temperature">{Math.round(device.currentTemperature)}°F</div>
-                        <div className={`mode ${device.mode}`}>
-                            {device.mode.toUpperCase()}
+                        <div className={`mode ${localMode}`}>
+                            {localMode.toUpperCase()}
                         </div>
                     </div>
 
