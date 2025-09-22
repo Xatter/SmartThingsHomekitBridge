@@ -63,3 +63,26 @@ export interface MatterThermostatEvent {
   temperature?: number;
   mode?: 'heat' | 'cool' | 'auto' | 'off';
 }
+
+export interface UnifiedDevice {
+  deviceId: string;
+  name: string;
+  label: string;
+  manufacturerName: string;
+  presentationId: string;
+  deviceTypeName: string;
+  capabilities: Array<{
+    id: string;
+    version: number;
+  }>;
+  components: Array<{
+    id: string;
+    capabilities: Array<{
+      id: string;
+      version: number;
+    }>;
+  }>;
+  thermostatCapabilities: ThermostatCapabilities;
+  currentState?: DeviceState;
+  isPaired: boolean;
+}

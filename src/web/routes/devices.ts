@@ -11,7 +11,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         return res.status(401).json({ error: 'Not authenticated' });
       }
 
-      const devices = await api.getFilteredDevices();
+      const devices = await coordinator.getDevices();
       res.json(devices);
     } catch (error) {
       console.error('Error fetching devices:', error);
@@ -25,20 +25,18 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         return res.status(401).json({ error: 'Not authenticated' });
       }
 
-      const devices = await api.getAllDevices();
+      const devices = await api.getDevices([]);
 
       // Add capability analysis for debugging
       const devicesWithAnalysis = devices.map(device => ({
         ...device,
         capabilityIds: device.capabilities.map(cap => cap.id),
-        isHVAC: device.capabilities.some(cap =>
-          ['temperatureMeasurement', 'thermostat', 'thermostatCoolingSetpoint', 'thermostatHeatingSetpoint'].includes(cap.id)
-        )
+        isHVAC: Object.values(device.thermostatCapabilities).some(Boolean)
       }));
 
-      console.log(`Found ${devices.length} total devices:`);
+      console.log(`Found ${devices.length} filtered devices:`);
       devicesWithAnalysis.forEach(device => {
-        console.log(`- ${device.name}: ${device.capabilityIds.join(', ')} (HVAC: ${device.isHVAC})`);
+        console.log(`- ${device.name}: ${device.capabilityIds.join(', ')} (HVAC: ${device.isHVAC}) (Paired: ${device.isPaired})`);
       });
 
       res.json(devicesWithAnalysis);
@@ -51,14 +49,23 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
   router.get('/paired', (req: Request, res: Response) => {
     try {
       const state = coordinator.getState();
-      const pairedDevicesWithState = Array.from(state.deviceStates.entries()).map(([deviceId, deviceState]) => ({
-        ...deviceState,
-        id: deviceId,
-        lastUpdated: deviceState.lastUpdated.toISOString(),
-      }));
+      const pairedDevicesWithState = Array.from(state.deviceStates.entries())
+        .filter(([deviceId, deviceState]) => !deviceState.name.toLowerCase().includes('ecobee'))
+        .map(([deviceId, deviceState]) => ({
+          ...deviceState,
+          id: deviceId,
+          lastUpdated: deviceState.lastUpdated instanceof Date
+            ? deviceState.lastUpdated.toISOString()
+            : new Date(deviceState.lastUpdated).toISOString(),
+        }));
+
+      const filteredPairedDevices = state.pairedDevices.filter(deviceId => {
+        const deviceState = state.deviceStates.get(deviceId);
+        return deviceState && !deviceState.name.toLowerCase().includes('ecobee');
+      });
 
       res.json({
-        pairedDevices: state.pairedDevices,
+        pairedDevices: filteredPairedDevices,
         deviceStates: pairedDevicesWithState,
         averageTemperature: state.averageTemperature,
         currentMode: state.currentMode,
@@ -84,7 +91,9 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
 
       res.json({
         ...deviceState,
-        lastUpdated: deviceState.lastUpdated.toISOString(),
+        lastUpdated: deviceState.lastUpdated instanceof Date 
+          ? deviceState.lastUpdated.toISOString() 
+          : new Date(deviceState.lastUpdated).toISOString(),
       });
     } catch (error) {
       console.error(`Error fetching device ${req.params.deviceId}:`, error);

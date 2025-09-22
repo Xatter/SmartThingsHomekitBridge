@@ -2,7 +2,7 @@ import * as cron from 'node-cron';
 import { promises as fs } from 'fs';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { LightingMonitor } from '@/monitoring/LightingMonitor';
-import { CoordinatorState, DeviceState, MatterThermostatEvent } from '@/types';
+import { CoordinatorState, DeviceState, MatterThermostatEvent, UnifiedDevice } from '@/types';
 
 export class Coordinator {
   private readonly api: SmartThingsAPI;
@@ -50,11 +50,22 @@ export class Coordinator {
       const stateData = await fs.readFile(this.stateFilePath, 'utf-8');
       const parsedState = JSON.parse(stateData);
 
+      // Convert deviceStates and ensure lastUpdated is a Date object
+      const deviceStates = new Map();
+      if (parsedState.deviceStates) {
+        for (const [deviceId, deviceState] of parsedState.deviceStates) {
+          deviceStates.set(deviceId, {
+            ...deviceState,
+            lastUpdated: new Date(deviceState.lastUpdated),
+          });
+        }
+      }
+
       this.state = {
         pairedDevices: parsedState.pairedDevices || [],
         averageTemperature: parsedState.averageTemperature || 70,
         currentMode: parsedState.currentMode || 'off',
-        deviceStates: new Map(parsedState.deviceStates || []),
+        deviceStates,
       };
 
       console.log(`Loaded coordinator state: ${this.state.pairedDevices.length} paired devices`);
@@ -91,16 +102,15 @@ export class Coordinator {
 
     try {
       console.log('🔍 Reloading devices from SmartThings...');
-      const allDevices = await this.api.getAllDevices();
-      console.log(`📱 Found ${allDevices.length} total devices`);
-
-      const filteredDevices = await this.api.getFilteredDevices();
+      const filteredDevices = await this.api.getDevices([]);
       const deviceIds = filteredDevices.map(device => device.deviceId);
 
+      console.log(`📱 Found ${filteredDevices.length} HVAC devices`);
       console.log('🏠 HVAC devices found:');
       filteredDevices.forEach(device => {
         console.log(`  - ${device.name} (${device.deviceId})`);
         console.log(`    Capabilities: ${device.capabilities.map(cap => cap.id).join(', ')}`);
+        console.log(`    Thermostat capabilities: ${Object.entries(device.thermostatCapabilities).filter(([_, value]) => value).map(([key, _]) => key).join(', ')}`);
       });
 
       this.state.pairedDevices = deviceIds;
@@ -297,6 +307,20 @@ export class Coordinator {
       ...this.state,
       deviceStates: new Map(this.state.deviceStates),
     };
+  }
+
+  async getDevices(): Promise<UnifiedDevice[]> {
+    if (!this.api.hasAuth()) {
+      console.warn('Cannot get devices: No SmartThings authentication');
+      return [];
+    }
+
+    try {
+      return await this.api.getDevices(this.state.pairedDevices);
+    } catch (error) {
+      console.error('Error getting unified devices:', error);
+      return [];
+    }
   }
 
   async handleMatterThermostatEvent(event: MatterThermostatEvent): Promise<void> {

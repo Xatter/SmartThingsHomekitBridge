@@ -1,6 +1,6 @@
 import { SmartThingsClient, BearerTokenAuthenticator } from '@smartthings/core-sdk';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
-import { SmartThingsDevice, DeviceState, ThermostatCapabilities } from '@/types';
+import { SmartThingsDevice, DeviceState, ThermostatCapabilities, UnifiedDevice } from '@/types';
 
 export class SmartThingsAPI {
   private client: SmartThingsClient | null = null;
@@ -48,18 +48,18 @@ export class SmartThingsAPI {
           console.log(`🔍 Fetching details for device: ${deviceSummary.name || deviceSummary.deviceId}`);
           const deviceDetails = await client.devices.get(deviceSummary.deviceId);
           console.log(`🔍 Device ${deviceSummary.deviceId} details:`, {
-            capabilities: deviceDetails.capabilities?.length || 0,
-            components: deviceDetails.components?.length || 0,
-            rawCapabilities: deviceDetails.capabilities?.map(cap => cap.id).join(', ') || 'none',
-            componentCapabilities: deviceDetails.components?.map(comp =>
-              `${comp.id}: [${comp.capabilities?.map(cap => cap.id).join(', ') || 'none'}]`
+            capabilities: (deviceDetails as any).capabilities?.length || 0,
+            components: (deviceDetails as any).components?.length || 0,
+            rawCapabilities: (deviceDetails as any).capabilities?.map((cap: any) => cap.id).join(', ') || 'none',
+            componentCapabilities: (deviceDetails as any).components?.map((comp: any) =>
+              `${comp.id}: [${comp.capabilities?.map((cap: any) => cap.id).join(', ') || 'none'}]`
             ).join(' | ') || 'none'
           });
           // Extract capabilities from components if top-level capabilities are empty
-          let capabilities = deviceDetails.capabilities || [];
-          if (capabilities.length === 0 && deviceDetails.components) {
+          let capabilities = (deviceDetails as any).capabilities || [];
+          if (capabilities.length === 0 && (deviceDetails as any).components) {
             // Flatten all capabilities from all components
-            capabilities = deviceDetails.components.reduce((allCaps: any[], component: any) => {
+            capabilities = (deviceDetails as any).components.reduce((allCaps: any[], component: any) => {
               const componentCaps = component.capabilities || [];
               return allCaps.concat(componentCaps);
             }, []);
@@ -71,9 +71,9 @@ export class SmartThingsAPI {
             label: deviceDetails.label!,
             manufacturerName: deviceDetails.manufacturerName || '',
             presentationId: deviceDetails.presentationId || '',
-            deviceTypeName: deviceDetails.deviceTypeName || '',
+            deviceTypeName: (deviceDetails as any).deviceTypeName || '',
             capabilities: capabilities,
-            components: deviceDetails.components || [],
+            components: (deviceDetails as any).components || [],
           };
         } catch (error) {
           console.error(`❌ Error fetching details for device ${deviceSummary.deviceId}:`, error);
@@ -127,6 +127,9 @@ export class SmartThingsAPI {
     });
 
     return allDevices.filter(device => {
+      // Exclude ecobee devices
+      if (device.name.toLowerCase().includes('ecobee')) return false;
+
       const capabilities = this.extractThermostatCapabilities(device);
       // Standard thermostat capabilities
       const hasStandardThermostat = capabilities.temperatureMeasurement ||
@@ -347,5 +350,54 @@ export class SmartThingsAPI {
 
   invalidateClient(): void {
     this.client = null;
+  }
+
+  async getDevices(pairedDeviceIds: string[] = []): Promise<UnifiedDevice[]> {
+    const allDevices = await this.getAllDevices();
+
+    const devicePromises = allDevices.map(async (device) => {
+      const thermostatCapabilities = this.extractThermostatCapabilities(device);
+      const isPaired = pairedDeviceIds.includes(device.deviceId);
+
+      let currentState: DeviceState | undefined;
+      if (isPaired) {
+        try {
+          currentState = await this.getDeviceStatus(device.deviceId) || undefined;
+        } catch (error) {
+          console.error(`Error getting state for device ${device.deviceId}:`, error);
+        }
+      }
+
+      const unifiedDevice: UnifiedDevice = {
+        deviceId: device.deviceId,
+        name: device.name,
+        label: device.label,
+        manufacturerName: device.manufacturerName,
+        presentationId: device.presentationId,
+        deviceTypeName: device.deviceTypeName,
+        capabilities: device.capabilities,
+        components: device.components,
+        thermostatCapabilities,
+        currentState,
+        isPaired,
+      };
+
+      return unifiedDevice;
+    });
+
+    const devices = await Promise.all(devicePromises);
+
+    const hasStandardThermostat = (caps: ThermostatCapabilities) =>
+      caps.temperatureMeasurement || caps.thermostat ||
+      caps.thermostatCoolingSetpoint || caps.thermostatHeatingSetpoint;
+
+    const hasSamsungAC = (caps: ThermostatCapabilities) =>
+      caps.airConditionerMode || caps.customThermostatSetpointControl;
+
+    return devices.filter(device => {
+      if (device.name.toLowerCase().includes('ecobee')) return false;
+      const caps = device.thermostatCapabilities;
+      return hasStandardThermostat(caps) || hasSamsungAC(caps);
+    });
   }
 }
