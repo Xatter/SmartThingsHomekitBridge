@@ -156,7 +156,20 @@ export class Coordinator {
       try {
         const deviceState = await this.api.getDeviceStatus(deviceId);
         if (deviceState) {
+          const previousState = this.state.deviceStates.get(deviceId);
           this.state.deviceStates.set(deviceId, deviceState);
+
+          // Update HAP if state changed
+          if (previousState) {
+            const stateChanged =
+              previousState.mode !== deviceState.mode ||
+              Math.abs(previousState.temperatureSetpoint - deviceState.temperatureSetpoint) > 0.5 ||
+              Math.abs(previousState.currentTemperature - deviceState.currentTemperature) > 0.5;
+
+            if (stateChanged) {
+              await this.hapServer.updateDeviceState(deviceId, deviceState);
+            }
+          }
         }
       } catch (error) {
         console.error(`Error updating state for device ${deviceId}:`, error);
@@ -325,6 +338,9 @@ export class Coordinator {
           currentState.mode = newMode;
           currentState.lastUpdated = new Date();
           this.state.deviceStates.set(deviceId, currentState);
+
+          // Update HAP server with the new state
+          await this.hapServer.updateDeviceState(deviceId, currentState);
         }
       } catch (error) {
         console.error(`Error synchronizing mode for device ${deviceId}:`, error);
