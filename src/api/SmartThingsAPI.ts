@@ -143,7 +143,16 @@ export class SmartThingsAPI {
   }
 
   private extractThermostatCapabilities(device: SmartThingsDevice): ThermostatCapabilities {
-    const allCapabilities = device.capabilities.map(cap => cap.id);
+    // Collect capabilities from both top-level and components
+    let allCapabilities = device.capabilities.map(cap => cap.id);
+
+    // If top-level capabilities are empty, collect from components
+    if (allCapabilities.length === 0 && device.components) {
+      allCapabilities = device.components.reduce((allCaps: string[], component: any) => {
+        const componentCaps = component.capabilities?.map((cap: any) => cap.id) || [];
+        return allCaps.concat(componentCaps);
+      }, []);
+    }
 
     return {
       temperatureMeasurement: allCapabilities.includes('temperatureMeasurement'),
@@ -186,6 +195,11 @@ export class SmartThingsAPI {
       if (mode === 'dry') mode = 'cool';  // Samsung dry mode, treat as cool
 
       const switchStatus = status.components?.main?.switch?.switch?.value || 'off';
+
+      // For Samsung ACs: if switch is off, the device mode should be 'off' regardless of airConditionerMode
+      if (switchStatus === 'off' && status.components?.main?.airConditionerMode) {
+        mode = 'off';
+      }
 
       // If no standard setpoints, use the cooling setpoint (Samsung units primarily use cooling)
       const temperatureSetpoint = mode === 'cool' ? coolingSetpoint : (heatingSetpoint || coolingSetpoint);
@@ -251,14 +265,35 @@ export class SmartThingsAPI {
         // If thermostat mode fails, try air conditioner mode for Samsung devices
         console.log(`Thermostat mode failed, trying air conditioner mode for device ${deviceId}`);
 
-        await client.devices.executeCommand(deviceId, {
-          component: 'main',
-          capability: 'airConditionerMode',
-          command: 'setAirConditionerMode',
-          arguments: [mode],
-        });
-        console.log(`Set air conditioner mode to ${mode} for device ${deviceId}`);
-        return true;
+        // Handle Samsung AC "off" mode specially - use switch capability
+        if (mode === 'off') {
+          await client.devices.executeCommand(deviceId, {
+            component: 'main',
+            capability: 'switch',
+            command: 'off',
+            arguments: [],
+          });
+          console.log(`Turned Samsung AC off using switch capability for device ${deviceId}`);
+          return true;
+        } else {
+          // For heat/cool/auto modes, use airConditionerMode
+          // First turn the device on if it's not already on
+          await client.devices.executeCommand(deviceId, {
+            component: 'main',
+            capability: 'switch',
+            command: 'on',
+            arguments: [],
+          });
+
+          await client.devices.executeCommand(deviceId, {
+            component: 'main',
+            capability: 'airConditionerMode',
+            command: 'setAirConditionerMode',
+            arguments: [mode],
+          });
+          console.log(`Set Samsung AC mode to ${mode} for device ${deviceId}`);
+          return true;
+        }
       }
     } catch (error) {
       console.error(`Error setting mode for device ${deviceId}:`, error);

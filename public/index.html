@@ -89,12 +89,14 @@
             padding: 20px;
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.07);
             transition: transform 0.2s, box-shadow 0.2s;
+            position: relative;
         }
 
         .device-card:hover {
             transform: translateY(-2px);
             box-shadow: 0 8px 12px rgba(0, 0, 0, 0.1);
         }
+
 
         .device-name {
             font-size: 1.25rem;
@@ -254,12 +256,25 @@
         const { useState, useEffect } = React;
 
         function App() {
-            const [currentPage, setCurrentPage] = useState('devices');
+            const [currentPage, setCurrentPage] = useState(() => {
+                const hash = window.location.hash.slice(1);
+                return hash === 'setup' ? 'setup' : 'devices';
+            });
             const [authStatus, setAuthStatus] = useState(null);
             const [devices, setDevices] = useState([]);
             const [matterInfo, setMatterInfo] = useState(null);
             const [loading, setLoading] = useState(true);
             const [error, setError] = useState(null);
+
+            useEffect(() => {
+                const handleHashChange = () => {
+                    const hash = window.location.hash.slice(1);
+                    setCurrentPage(hash === 'setup' ? 'setup' : 'devices');
+                };
+
+                window.addEventListener('hashchange', handleHashChange);
+                return () => window.removeEventListener('hashchange', handleHashChange);
+            }, []);
 
             useEffect(() => {
                 const initializePage = async () => {
@@ -362,13 +377,17 @@
                     <div className="nav">
                         <button
                             className={`nav-button ${currentPage === 'devices' ? 'active' : ''}`}
-                            onClick={() => setCurrentPage('devices')}
+                            onClick={() => {
+                                window.location.hash = 'devices';
+                            }}
                         >
                             Devices
                         </button>
                         <button
                             className={`nav-button ${currentPage === 'setup' ? 'active' : ''}`}
-                            onClick={() => setCurrentPage('setup')}
+                            onClick={() => {
+                                window.location.hash = 'setup';
+                            }}
                         >
                             Matter Setup
                         </button>
@@ -438,17 +457,43 @@
             const [localTemp, setLocalTemp] = useState(device.temperatureSetpoint);
             const [localMode, setLocalMode] = useState(device.mode);
 
-            const handleTempChange = (delta) => {
+            const handleTempChange = async (delta) => {
                 const newTemp = localTemp + delta;
                 if (newTemp >= 45 && newTemp <= 95) {
-                    setLocalTemp(newTemp);
-                    onControl(device.id, 'temperature', { temperature: newTemp });
+                    try {
+                        const response = await fetch(`/api/devices/${device.id}/temperature`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ temperature: newTemp })
+                        });
+
+                        if (response.ok) {
+                            setLocalTemp(newTemp);
+                        } else {
+                            console.error('Failed to change temperature');
+                        }
+                    } catch (error) {
+                        console.error('Error changing temperature:', error);
+                    }
                 }
             };
 
-            const handleModeChange = (mode) => {
-                setLocalMode(mode);
-                onControl(device.id, 'mode', { mode });
+            const handleModeChange = async (mode) => {
+                try {
+                    const response = await fetch(`/api/devices/${device.id}/mode`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ mode })
+                    });
+
+                    if (response.ok) {
+                        setLocalMode(mode);
+                    } else {
+                        console.error('Failed to change mode');
+                    }
+                } catch (error) {
+                    console.error('Error changing mode:', error);
+                }
             };
 
             return (
@@ -533,7 +578,7 @@
                     {matterInfo.qrCode && (
                         <div className="qr-code">
                             <h3>Scan QR Code</h3>
-                            <img src={`data:image/svg+xml;base64,${btoa(matterInfo.qrCode)}`} alt="Matter QR Code" />
+                            <div dangerouslySetInnerHTML={{ __html: matterInfo.qrCode }} />
                         </div>
                     )}
 
