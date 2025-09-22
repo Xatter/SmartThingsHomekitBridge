@@ -1,0 +1,100 @@
+We are going to be creating a new project to expose Smartthings HVAC (in this case Samsung Mini-splits) to Matter so they can be controlled by HomeKit as thermostats.
+
+Important Context:
+Matter.js uses behavioral events, the only one we're interested in is 'Thermostat'.
+We need a web UI to do oauth with Smartthings in order for the API to work
+We want 2 UI screens: 
+* A devices screen that enumerates all the devices discovered by the Smartthings API
+    * Clicking on a device card should bring us to a screen that allows us to manually control the device via the SmartThings API directly from this screen
+* A matter setup screen that includes the QR code needed to pair this matter server with HomeKit
+
+Spec:
+
+SmartThingsAuthentication {
+    SmartThingsAuthentication(path) {
+        load(path);
+    }
+
+    def load(path):
+        loads the auth token into memory
+
+    def has_auth(): true if we have an auth token in memory, otherwise false
+
+    def save(path):
+        saves the token to the path
+}
+
+SmartThingsAPI(smartThingsAuthentication) {
+    def has_auth(): smartThingsAuthentication->has_auth();
+}
+
+LightingMonitor {
+    LightingMonitor(SmartThingsAPI) {
+        every 1 minute, query the devices from the SmartThingsAPI. For each of the HVAC devices we care about, check if the light is on, if it is use the API to turn it off
+    }
+}
+
+Coordinator {
+    State {
+        pairedDevices: list of paired devices
+        averageTemperature: average temperature of all paired devices
+        currentMode: current mode of all paired devices
+        deviceStates: map of device ID to last known state (temperatureSetpoint, mode, light on/off)
+    }
+
+    Coordinator(SmartThingsAPI, lightingMonitor) {
+        reloadDevices();
+
+        every 5 minutes, query the devices from the SmartThingsAPI. 
+        check if the temperature has changed, if it has update the average temperature and use the API to change all devices to that temperature
+    }
+
+    def changeTemperature(device, temperature):
+        uses SmartThingsAPI to change the temperature of the device
+    
+    def changeMode(device, mode):
+        uses SmartThingsAPI to change the mode of the device
+        ensures all devices are in the same mode, if one changes from heat to cool all change to cool and vis-versa
+    
+    def getDeviceStates():
+        returns the current state of all paired devices from memory, not from the API
+    
+    def reloadDevices():
+        pairedDevices = smartThingsAPI->getAllDevices() |> filter(device.capabilities.includes("temperatureMeasurement" || "thermostat" || "thermostatCoolingSetpoint" || "thermostatHeatingSetpoint")) |> map(device.id); //singleton scoped, list of device IDs we care about
+        lightingMonitor->setDevices(pairedDevices); //singleton scoped
+    
+    matterServer.onMatterThermostat(deviceId, event):
+        compare the event state with deviceStates[deviceId] to determine what changed (temperature, mode, both)
+        use smartThingsAPI to update setTemperature() and/or setMode() as needed
+        on success update deviceStates
+}
+
+MatterServer {
+    Standard Matter server that exposes 1 thermostat per paired device
+    every 1 second queries Coordinator->getDeviceStates() to get the current state of all paired devices and sends matter updates to homekit with the current state if it needs to be updated
+    when a thermostat is changed in homekit, calls Coordinator->changeTemperature(device, temperature) or Coordinator->changeMode(device, mode)
+}
+
+Webserver {
+    Standard web server that serves a React UI and exposes a REST API
+    React UI allows user to authenticate with SmartThings, view paired devices, pair/unpair devices
+    REST API exposes endpoints to get paired devices, pair/unpair devices
+
+    onOauthCallback(code):
+        uses SmartThingsAuthentication->save(path) to save the auth token
+        uses Coordinator->reloadDevices() to reload the devices from the API
+}
+
+def Startup() {
+    var smartThingsAuth = new SmartThingsAuthentication(path) //singleton scoped;
+    var smartThingsAPI = new SmartThingsAPI(smartThingsAuth); //singleton scoped to coordinate API usage limits/retries, etc.
+
+    if smartThingsAPI->has_auth() == false {
+        print("No auth token found, please authenticate with SmartThings in the web UI");
+    } 
+
+    var webServer = new WebServer(); //singleton scoped, React UI + API
+    var matterServer = new MatterServer(); //singleton scoped
+
+    var coordinator = new Coordinator(smartThingsAPI, matterServer, webServer); //singleton scoped, handles pairing/unpairing devices
+}

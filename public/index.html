@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartThings Matter Bridge</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            background-color: #f5f5f7;
+            color: #1d1d1f;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            color: #6e6e73;
+        }
+
+        .nav {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        .nav-button {
+            padding: 12px 24px;
+            background: #007aff;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .nav-button:hover {
+            background: #0051d0;
+        }
+
+        .nav-button.active {
+            background: #34c759;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.07);
+        }
+
+        .device-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .device-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.07);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .device-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 12px rgba(0, 0, 0, 0.1);
+        }
+
+        .device-name {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .device-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .temperature {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #007aff;
+        }
+
+        .mode {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .mode.heat {
+            background: #ff6b35;
+            color: white;
+        }
+
+        .mode.cool {
+            background: #007aff;
+            color: white;
+        }
+
+        .mode.auto {
+            background: #34c759;
+            color: white;
+        }
+
+        .mode.off {
+            background: #8e8e93;
+            color: white;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .control-button {
+            flex: 1;
+            padding: 8px 16px;
+            border: 1px solid #d1d1d6;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+
+        .control-button:hover {
+            background: #f5f5f7;
+        }
+
+        .control-button.active {
+            background: #007aff;
+            color: white;
+            border-color: #007aff;
+        }
+
+        .qr-code {
+            text-align: center;
+            padding: 20px;
+        }
+
+        .qr-code img {
+            max-width: 300px;
+            height: auto;
+        }
+
+        .pairing-code {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 1.5rem;
+            font-weight: 600;
+            background: #f5f5f7;
+            padding: 16px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+        }
+
+        .instructions {
+            text-align: left;
+            margin-top: 20px;
+        }
+
+        .instructions h3 {
+            margin-bottom: 10px;
+            color: #007aff;
+        }
+
+        .instructions ol {
+            margin-left: 20px;
+        }
+
+        .instructions li {
+            margin-bottom: 5px;
+        }
+
+        .error {
+            background: #ff3b30;
+            color: white;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .success {
+            background: #34c759;
+            color: white;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #8e8e93;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .status-indicator.connected {
+            background: #34c759;
+        }
+
+        .status-indicator.disconnected {
+            background: #ff3b30;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        function App() {
+            const [currentPage, setCurrentPage] = useState('devices');
+            const [authStatus, setAuthStatus] = useState(null);
+            const [devices, setDevices] = useState([]);
+            const [matterInfo, setMatterInfo] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState(null);
+
+            useEffect(() => {
+                checkAuthStatus();
+                if (currentPage === 'devices') {
+                    fetchDevices();
+                } else if (currentPage === 'setup') {
+                    fetchMatterInfo();
+                }
+            }, [currentPage]);
+
+            const checkAuthStatus = async () => {
+                try {
+                    const response = await fetch('/api/auth/status');
+                    const data = await response.json();
+                    setAuthStatus(data);
+                } catch (error) {
+                    console.error('Error checking auth status:', error);
+                }
+            };
+
+            const fetchDevices = async () => {
+                if (!authStatus?.authenticated) return;
+
+                setLoading(true);
+                try {
+                    const response = await fetch('/api/devices/paired');
+                    const data = await response.json();
+                    setDevices(data.deviceStates || []);
+                } catch (error) {
+                    setError('Failed to fetch devices');
+                    console.error('Error fetching devices:', error);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const fetchMatterInfo = async () => {
+                setLoading(true);
+                try {
+                    const response = await fetch('/api/matter/pairing');
+                    const data = await response.json();
+                    setMatterInfo(data);
+                } catch (error) {
+                    setError('Failed to fetch Matter info');
+                    console.error('Error fetching Matter info:', error);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleDeviceControl = async (deviceId, action, value) => {
+                try {
+                    const response = await fetch(`/api/devices/${deviceId}/${action}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(value)
+                    });
+
+                    if (response.ok) {
+                        fetchDevices(); // Refresh devices
+                    }
+                } catch (error) {
+                    console.error('Error controlling device:', error);
+                }
+            };
+
+            const initiateAuth = () => {
+                window.location.href = '/api/auth/smartthings';
+            };
+
+            if (!authStatus) {
+                return <div className="container"><div className="loading">Loading...</div></div>;
+            }
+
+            return (
+                <div className="container">
+                    <div className="header">
+                        <h1>SmartThings Matter Bridge</h1>
+                        <p>Bridge your SmartThings HVAC devices to Matter/HomeKit</p>
+                    </div>
+
+                    <div className="nav">
+                        <button
+                            className={`nav-button ${currentPage === 'devices' ? 'active' : ''}`}
+                            onClick={() => setCurrentPage('devices')}
+                        >
+                            Devices
+                        </button>
+                        <button
+                            className={`nav-button ${currentPage === 'setup' ? 'active' : ''}`}
+                            onClick={() => setCurrentPage('setup')}
+                        >
+                            Matter Setup
+                        </button>
+                    </div>
+
+                    {error && <div className="error">{error}</div>}
+
+                    {!authStatus.authenticated && (
+                        <div className="card">
+                            <h2>Authentication Required</h2>
+                            <p>You need to authenticate with SmartThings to access your devices.</p>
+                            <button className="nav-button" onClick={initiateAuth} style={{marginTop: '16px'}}>
+                                Connect to SmartThings
+                            </button>
+                        </div>
+                    )}
+
+                    {authStatus.authenticated && currentPage === 'devices' && (
+                        <DevicesPage devices={devices} loading={loading} onDeviceControl={handleDeviceControl} />
+                    )}
+
+                    {currentPage === 'setup' && (
+                        <SetupPage matterInfo={matterInfo} loading={loading} />
+                    )}
+                </div>
+            );
+        }
+
+        function DevicesPage({ devices, loading, onDeviceControl }) {
+            if (loading) {
+                return <div className="loading">Loading devices...</div>;
+            }
+
+            if (devices.length === 0) {
+                return (
+                    <div className="card">
+                        <h2>No Devices Found</h2>
+                        <p>No HVAC devices were found in your SmartThings account.</p>
+                    </div>
+                );
+            }
+
+            return (
+                <>
+                    <div className="card">
+                        <h2>Connected Devices ({devices.length})</h2>
+                        <p>
+                            <span className="status-indicator connected"></span>
+                            SmartThings Connected
+                        </p>
+                    </div>
+
+                    <div className="device-grid">
+                        {devices.map(device => (
+                            <DeviceCard
+                                key={device.id}
+                                device={device}
+                                onControl={onDeviceControl}
+                            />
+                        ))}
+                    </div>
+                </>
+            );
+        }
+
+        function DeviceCard({ device, onControl }) {
+            const [localTemp, setLocalTemp] = useState(device.temperatureSetpoint);
+            const [localMode, setLocalMode] = useState(device.mode);
+
+            const handleTempChange = (delta) => {
+                const newTemp = localTemp + delta;
+                if (newTemp >= 45 && newTemp <= 95) {
+                    setLocalTemp(newTemp);
+                    onControl(device.id, 'temperature', { temperature: newTemp });
+                }
+            };
+
+            const handleModeChange = (mode) => {
+                setLocalMode(mode);
+                onControl(device.id, 'mode', { mode });
+            };
+
+            return (
+                <div className="device-card">
+                    <div className="device-name">{device.name}</div>
+
+                    <div className="device-info">
+                        <div className="temperature">{Math.round(device.currentTemperature)}°F</div>
+                        <div className={`mode ${device.mode}`}>
+                            {device.mode.toUpperCase()}
+                        </div>
+                    </div>
+
+                    <div style={{textAlign: 'center', marginBottom: '16px'}}>
+                        <div style={{fontSize: '1.1rem', marginBottom: '8px'}}>
+                            Set to: {localTemp}°F
+                        </div>
+                        <div style={{display: 'flex', justifyContent: 'center', gap: '8px'}}>
+                            <button
+                                className="control-button"
+                                onClick={() => handleTempChange(-1)}
+                            >
+                                -
+                            </button>
+                            <button
+                                className="control-button"
+                                onClick={() => handleTempChange(1)}
+                            >
+                                +
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="controls">
+                        {['heat', 'cool', 'auto', 'off'].map(mode => (
+                            <button
+                                key={mode}
+                                className={`control-button ${localMode === mode ? 'active' : ''}`}
+                                onClick={() => handleModeChange(mode)}
+                            >
+                                {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                            </button>
+                        ))}
+                    </div>
+
+                    <div className="controls" style={{marginTop: '8px'}}>
+                        <button
+                            className="control-button"
+                            onClick={() => onControl(device.id, 'light/on', {})}
+                        >
+                            Light On
+                        </button>
+                        <button
+                            className="control-button"
+                            onClick={() => onControl(device.id, 'light/off', {})}
+                        >
+                            Light Off
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        function SetupPage({ matterInfo, loading }) {
+            if (loading) {
+                return <div className="loading">Loading Matter setup...</div>;
+            }
+
+            if (!matterInfo) {
+                return (
+                    <div className="card">
+                        <h2>Matter Setup Unavailable</h2>
+                        <p>Could not load Matter pairing information.</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="card">
+                    <h2>Matter/HomeKit Setup</h2>
+
+                    {matterInfo.qrCode && (
+                        <div className="qr-code">
+                            <h3>Scan QR Code</h3>
+                            <img src={`data:image/svg+xml;base64,${btoa(matterInfo.qrCode)}`} alt="Matter QR Code" />
+                        </div>
+                    )}
+
+                    {matterInfo.pairingCode && (
+                        <div>
+                            <h3>Manual Pairing Code</h3>
+                            <div className="pairing-code">{matterInfo.pairingCode}</div>
+                        </div>
+                    )}
+
+                    {matterInfo.instructions && (
+                        <div className="instructions">
+                            <h3>HomeKit Instructions</h3>
+                            <ol>
+                                {matterInfo.instructions.homekit.map((step, index) => (
+                                    <li key={index}>{step}</li>
+                                ))}
+                            </ol>
+
+                            <h3>General Matter Controller Instructions</h3>
+                            <ol>
+                                {matterInfo.instructions.general.map((step, index) => (
+                                    <li key={index}>{step}</li>
+                                ))}
+                            </ol>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
