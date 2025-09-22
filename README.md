@@ -33,7 +33,7 @@ npm run build
 
 ### 1. Setting up ngrok for OAuth
 
-During development, you'll need a public URL for the SmartThings OAuth callback. Use ngrok to create a tunnel to your local server:
+You'll need a public URL for the SmartThings OAuth callback. Use `ngrok` to create a tunnel to your local server. You can shut it down once you've done the oauth handshake:
 
 1. Install ngrok if you haven't already:
 ```bash
