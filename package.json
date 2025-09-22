@@ -21,7 +21,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@project-chip/matter-node.js": "^0.12.6",
+    "@matter/main": "^0.12.6",
+    "@matter/nodejs": "^0.12.6",
     "@smartthings/core-sdk": "^8.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",

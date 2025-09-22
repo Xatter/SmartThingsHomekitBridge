@@ -42,14 +42,15 @@ async function startup(): Promise<void> {
 
     const lightingMonitor = new LightingMonitor(smartThingsAPI, lightingInterval);
 
+    const matterServer = new MatterServer(matterPort);
+
     const coordinator = new Coordinator(
       smartThingsAPI,
       lightingMonitor,
+      matterServer,
       statePath,
       pollInterval
     );
-
-    const matterServer = new MatterServer(matterPort);
 
     const webServer = new WebServer(webPort);
 

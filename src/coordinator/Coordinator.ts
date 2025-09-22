@@ -2,11 +2,13 @@ import * as cron from 'node-cron';
 import { promises as fs } from 'fs';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { LightingMonitor } from '@/monitoring/LightingMonitor';
+import { MatterServer } from '@/matter/MatterServer';
 import { CoordinatorState, DeviceState, MatterThermostatEvent, UnifiedDevice } from '@/types';
 
 export class Coordinator {
   private readonly api: SmartThingsAPI;
   private readonly lightingMonitor: LightingMonitor;
+  private readonly matterServer: MatterServer;
   private readonly stateFilePath: string;
   private state: CoordinatorState;
   private pollTask: cron.ScheduledTask | null = null;
@@ -15,11 +17,13 @@ export class Coordinator {
   constructor(
     api: SmartThingsAPI,
     lightingMonitor: LightingMonitor,
+    matterServer: MatterServer,
     stateFilePath: string,
     pollIntervalSeconds: number = 300
   ) {
     this.api = api;
     this.lightingMonitor = lightingMonitor;
+    this.matterServer = matterServer;
     this.stateFilePath = stateFilePath;
     this.pollInterval = this.convertSecondsToInterval(pollIntervalSeconds);
 
@@ -115,6 +119,19 @@ export class Coordinator {
 
       this.state.pairedDevices = deviceIds;
       this.lightingMonitor.setDevices(deviceIds);
+
+      // Add devices to Matter server as thermostat endpoints
+      for (const device of filteredDevices) {
+        const deviceState = await this.getDeviceStateByDevice(device);
+        if (deviceState) {
+          try {
+            await this.matterServer.addDevice(device.deviceId, deviceState);
+            console.log(`✅ Added ${device.name} to Matter bridge`);
+          } catch (error) {
+            console.error(`❌ Failed to add ${device.name} to Matter bridge:`, error);
+          }
+        }
+      }
 
       console.log(`✅ Reloaded devices: Found ${deviceIds.length} HVAC devices`);
 
@@ -357,6 +374,21 @@ export class Coordinator {
       }
     } catch (error) {
       console.error(`Error handling Matter event for device ${event.deviceId}:`, error);
+    }
+  }
+
+  private async getDeviceStateByDevice(device: UnifiedDevice): Promise<DeviceState | null> {
+    try {
+      const status = await this.api.getDeviceStatus(device.deviceId);
+      return {
+        name: device.name,
+        currentTemperature: status.temperature || 70,
+        temperatureSetpoint: status.targetTemperature || status.coolingSetpoint || 72,
+        mode: status.mode || 'off',
+      };
+    } catch (error) {
+      console.error(`Failed to get device state for ${device.name}:`, error);
+      return null;
     }
   }
 
