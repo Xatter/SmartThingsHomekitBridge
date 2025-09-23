@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  smartthings-bridge:
+    build: .
+    container_name: smartthings-homekit-bridge
+    restart: unless-stopped
+    ports:
+      - "3000:3000"    # Web interface
+      - "5353:5353/udp" # mDNS for HomeKit discovery
+    environment:
+      - NODE_ENV=production
+      # SmartThings credentials (set these in .env file)
+      - SMARTTHINGS_CLIENT_ID=${SMARTTHINGS_CLIENT_ID}
+      - SMARTTHINGS_CLIENT_SECRET=${SMARTTHINGS_CLIENT_SECRET}
+      - SMARTTHINGS_REDIRECT_URI=${SMARTTHINGS_REDIRECT_URI:-http://localhost:3000/auth/callback}
+    volumes:
+      # Persist HomeKit pairing data
+      - homekit_data:/app/homekit
+      # Optional: bind mount for configuration
+      - ./config:/app/config:ro
+    networks:
+      - bridge_network
+    # Enable host networking for better mDNS support
+    # network_mode: host  # Uncomment if you have HomeKit discovery issues
+
+volumes:
+  homekit_data:
+    driver: local
+
+networks:
+  bridge_network:
+    driver: bridge

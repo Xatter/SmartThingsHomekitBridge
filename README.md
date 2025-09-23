@@ -155,7 +155,64 @@ Replace the ngrok URL with your production domain.
 
 ## Usage
 
-### Start the Bridge
+### Docker Deployment (Recommended)
+
+The easiest way to run the SmartThings HomeKit Bridge is using Docker:
+
+#### Quick Start with Docker Compose
+
+1. Create a `.env` file with your SmartThings credentials:
+```bash
+SMARTTHINGS_CLIENT_ID=your_client_id_from_cli
+SMARTTHINGS_CLIENT_SECRET=your_client_secret_from_cli
+SMARTTHINGS_REDIRECT_URI=http://your-domain:3000/auth/callback
+```
+
+2. Start the application:
+```bash
+docker-compose up -d
+```
+
+3. Access the web interface at `http://localhost:3000`
+
+#### Manual Docker Build
+
+```bash
+# Build the Docker image
+docker build -t smartthings-bridge .
+
+# Run the container
+docker run -d \
+  --name smartthings-homekit-bridge \
+  -p 3000:3000 \
+  -p 5353:5353/udp \
+  -e SMARTTHINGS_CLIENT_ID=your_client_id \
+  -e SMARTTHINGS_CLIENT_SECRET=your_client_secret \
+  -v homekit_data:/app/homekit \
+  smartthings-bridge
+```
+
+#### Docker Environment Variables
+
+- `SMARTTHINGS_CLIENT_ID` - Your SmartThings OAuth client ID
+- `SMARTTHINGS_CLIENT_SECRET` - Your SmartThings OAuth client secret
+- `SMARTTHINGS_REDIRECT_URI` - OAuth redirect URI (defaults to `http://localhost:3000/auth/callback`)
+- `NODE_ENV` - Set to `production` for production deployments
+
+#### Docker Volumes
+
+- `/app/homekit` - Persists HomeKit pairing data across container restarts
+- `/app/config` - Optional configuration directory (read-only)
+
+#### Docker Networking Notes
+
+- Port `3000` is used for the web interface
+- Port `5353/udp` is used for mDNS HomeKit discovery
+- If you experience HomeKit discovery issues, uncomment the `network_mode: host` line in `docker-compose.yml`
+
+### Native Node.js Deployment
+
+#### Start the Bridge
 
 ```bash
 # Development mode
