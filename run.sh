@@ -6,7 +6,7 @@ echo "Starting SmartThings HomeKit Bridge container..."
 # Configuration
 REGISTRY="docker.revealedpreferences.com"
 IMAGE_NAME="smartthings-homekit-bridge"
-FULL_IMAGE="${REGISTRY}/${IMAGE_NAME}:latest"
+FULL_IMAGE="smartthings-homekit-bridge:test"  # Using local test image
 CONTAINER_NAME="smartthings-homekit-bridge"
 
 # Port configuration (avoiding conflicts with Homebridge on 51826)
