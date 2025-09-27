@@ -35,7 +35,7 @@ docker run -d \
     -e WEB_PORT=3000 \
     -v "${DATA_DIR}:/app/data" \
     -v "${PWD}/oauth-settings.json:/app/oauth-settings.json:ro" \
-    --env-file .env \
+    -v "${PWD}/.env:/app/.env:ro" \
     ${FULL_IMAGE}
 
 echo "Container started successfully!"
