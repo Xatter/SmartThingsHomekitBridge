@@ -25,18 +25,28 @@ fi
 DATA_DIR="${HOME}/.smartthings-bridge"
 mkdir -p "${DATA_DIR}"
 
-echo "Starting new container..."
-docker run -d \
+# Build docker run command with conditional volume mounts
+DOCKER_CMD="docker run -d \
     --name ${CONTAINER_NAME} \
     --restart=always \
     -p ${WEB_PORT}:3000 \
     -p ${HAP_PORT}:51826 \
     -e HAP_PORT=51826 \
     -e WEB_PORT=3000 \
-    -v "${DATA_DIR}:/app/data" \
-    -v "${PWD}/oauth-settings.json:/app/oauth-settings.json:ro" \
-    -v "${PWD}/.env:/app/.env:ro" \
-    ${FULL_IMAGE}
+    -v \"${DATA_DIR}:/app/data\""
+
+# Add .env file mount if file exists
+if [ -f "${PWD}/.env" ]; then
+    DOCKER_CMD="${DOCKER_CMD} -v \"${PWD}/.env:/app/.env:ro\""
+    echo "Found .env file - mounting into container"
+else
+    echo "Warning: .env file not found - you may need to set environment variables manually"
+fi
+
+DOCKER_CMD="${DOCKER_CMD} ${FULL_IMAGE}"
+
+echo "Starting new container..."
+eval ${DOCKER_CMD}
 
 echo "Container started successfully!"
 echo "Web interface available at: http://localhost:${WEB_PORT}"
