@@ -230,14 +230,28 @@ export class SmartThingsAPI {
 
   private async turnOffLightSilently(client: any, deviceId: string): Promise<void> {
     try {
-      await client.devices.executeCommand(deviceId, {
+      // Note: "Light_On" actually turns the display OFF (counterintuitive naming from Samsung)
+      const command = {
         component: 'main',
-        capability: 'samsungce.airConditionerLighting',
-        command: 'setLighting',
-        arguments: ['off'],
-      });
-    } catch (error) {
-      // Silently ignore errors - not all devices may support this capability
+        capability: 'execute',
+        command: 'execute',
+        arguments: [
+          'mode/vs/0',
+          {
+            'x.com.samsung.da.options': ['Light_On']
+          }
+        ],
+      };
+      console.log(`[turnOffLightSilently] Sending command to ${deviceId}:`, JSON.stringify(command, null, 2));
+
+      const response = await client.devices.executeCommand(deviceId, command);
+      console.log(`[turnOffLightSilently] Response from ${deviceId}:`, JSON.stringify(response, null, 2));
+    } catch (error: any) {
+      // Log error but don't fail - not all devices may support this capability
+      console.log(`[turnOffLightSilently] Error for ${deviceId}:`, error.message || error);
+      if (error.response) {
+        console.log(`[turnOffLightSilently] Error response details:`, JSON.stringify(error.response, null, 2));
+      }
     }
   }
 
@@ -352,17 +366,36 @@ export class SmartThingsAPI {
     }
 
     try {
-      await client.devices.executeCommand(deviceId, {
+      // 🚨 DO NOT "FIX" THIS - IT IS CORRECT! 🚨
+      // Samsung's API naming is BACKWARDS:
+      // "Light_On" = turns display OFF (yes, really!)
+      // See tests in SmartThingsAPI.test.ts for full explanation
+      // Confirmed at: https://community.smartthings.com/t/rest-api-for-display-light-on-samsung-windfree-ac/195928
+      const command = {
         component: 'main',
-        capability: 'samsungce.airConditionerLighting',
-        command: 'off',
-        arguments: [],
-      });
+        capability: 'execute',
+        command: 'execute',
+        arguments: [
+          'mode/vs/0',
+          {
+            'x.com.samsung.da.options': ['Light_On']
+          }
+        ],
+      };
+      console.log(`[turnLightOff] Sending command to ${deviceId}:`, JSON.stringify(command, null, 2));
 
-      console.log(`Turned off light for device ${deviceId}`);
+      const response = await client.devices.executeCommand(deviceId, command);
+      console.log(`[turnLightOff] Response from ${deviceId}:`, JSON.stringify(response, null, 2));
+      console.log(`[turnLightOff] Successfully turned off light for device ${deviceId}`);
       return true;
-    } catch (error) {
-      console.error(`Error turning off light for device ${deviceId}:`, error);
+    } catch (error: any) {
+      console.error(`[turnLightOff] Error turning off light for device ${deviceId}:`, error.message || error);
+      if (error.response) {
+        console.error(`[turnLightOff] Error response details:`, JSON.stringify(error.response, null, 2));
+      }
+      if (error.statusCode) {
+        console.error(`[turnLightOff] Status code:`, error.statusCode);
+      }
       return false;
     }
   }
@@ -374,17 +407,36 @@ export class SmartThingsAPI {
     }
 
     try {
-      await client.devices.executeCommand(deviceId, {
+      // 🚨 DO NOT "FIX" THIS - IT IS CORRECT! 🚨
+      // Samsung's API naming is BACKWARDS:
+      // "Light_Off" = turns display ON (yes, really!)
+      // See tests in SmartThingsAPI.test.ts for full explanation
+      // Confirmed at: https://community.smartthings.com/t/rest-api-for-display-light-on-samsung-windfree-ac/195928
+      const command = {
         component: 'main',
-        capability: 'samsungce.airConditionerLighting',
-        command: 'on',
-        arguments: [],
-      });
+        capability: 'execute',
+        command: 'execute',
+        arguments: [
+          'mode/vs/0',
+          {
+            'x.com.samsung.da.options': ['Light_Off']
+          }
+        ],
+      };
+      console.log(`[turnLightOn] Sending command to ${deviceId}:`, JSON.stringify(command, null, 2));
 
-      console.log(`Turned on light for device ${deviceId}`);
+      const response = await client.devices.executeCommand(deviceId, command);
+      console.log(`[turnLightOn] Response from ${deviceId}:`, JSON.stringify(response, null, 2));
+      console.log(`[turnLightOn] Successfully turned on light for device ${deviceId}`);
       return true;
-    } catch (error) {
-      console.error(`Error turning on light for device ${deviceId}:`, error);
+    } catch (error: any) {
+      console.error(`[turnLightOn] Error turning on light for device ${deviceId}:`, error.message || error);
+      if (error.response) {
+        console.error(`[turnLightOn] Error response details:`, JSON.stringify(error.response, null, 2));
+      }
+      if (error.statusCode) {
+        console.error(`[turnLightOn] Status code:`, error.statusCode);
+      }
       return false;
     }
   }
@@ -396,17 +448,35 @@ export class SmartThingsAPI {
     }
 
     try {
-      await client.devices.executeCommand(deviceId, {
-        component: 'main',
-        capability: 'samsungce.airConditionerLighting',
-        command: 'setLightingLevel',
-        arguments: [level],
-      });
+      // Map levels to Samsung's counterintuitive naming:
+      // "Light_On" = display OFF, "Light_Off" = display ON
+      const lightCommand = (level === 'off') ? 'Light_On' : 'Light_Off';
 
-      console.log(`Set lighting level to ${level} for device ${deviceId}`);
+      const command = {
+        component: 'main',
+        capability: 'execute',
+        command: 'execute',
+        arguments: [
+          'mode/vs/0',
+          {
+            'x.com.samsung.da.options': [lightCommand]
+          }
+        ],
+      };
+      console.log(`[setLightingLevel] Sending command to ${deviceId}:`, JSON.stringify(command, null, 2));
+
+      const response = await client.devices.executeCommand(deviceId, command);
+      console.log(`[setLightingLevel] Response from ${deviceId}:`, JSON.stringify(response, null, 2));
+      console.log(`[setLightingLevel] Successfully set lighting level to ${level} for device ${deviceId}`);
       return true;
-    } catch (error) {
-      console.error(`Error setting lighting level for device ${deviceId}:`, error);
+    } catch (error: any) {
+      console.error(`[setLightingLevel] Error setting lighting level for device ${deviceId}:`, error.message || error);
+      if (error.response) {
+        console.error(`[setLightingLevel] Error response details:`, JSON.stringify(error.response, null, 2));
+      }
+      if (error.statusCode) {
+        console.error(`[setLightingLevel] Status code:`, error.statusCode);
+      }
       return false;
     }
   }
