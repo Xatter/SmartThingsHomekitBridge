@@ -355,8 +355,8 @@ export class SmartThingsAPI {
       await client.devices.executeCommand(deviceId, {
         component: 'main',
         capability: 'samsungce.airConditionerLighting',
-        command: 'setLighting',
-        arguments: ['off'],
+        command: 'off',
+        arguments: [],
       });
 
       console.log(`Turned off light for device ${deviceId}`);
@@ -377,14 +377,36 @@ export class SmartThingsAPI {
       await client.devices.executeCommand(deviceId, {
         component: 'main',
         capability: 'samsungce.airConditionerLighting',
-        command: 'setLighting',
-        arguments: ['on'],
+        command: 'on',
+        arguments: [],
       });
 
       console.log(`Turned on light for device ${deviceId}`);
       return true;
     } catch (error) {
       console.error(`Error turning on light for device ${deviceId}:`, error);
+      return false;
+    }
+  }
+
+  async setLightingLevel(deviceId: string, level: 'on' | 'dim' | 'bright' | 'off' | 'smart' | 'high' | 'low'): Promise<boolean> {
+    const client = await this.getClient();
+    if (!client) {
+      return false;
+    }
+
+    try {
+      await client.devices.executeCommand(deviceId, {
+        component: 'main',
+        capability: 'samsungce.airConditionerLighting',
+        command: 'setLightingLevel',
+        arguments: [level],
+      });
+
+      console.log(`Set lighting level to ${level} for device ${deviceId}`);
+      return true;
+    } catch (error) {
+      console.error(`Error setting lighting level for device ${deviceId}:`, error);
       return false;
     }
   }
