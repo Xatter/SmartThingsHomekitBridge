@@ -126,23 +126,26 @@ export class Coordinator {
         console.log(`    Thermostat capabilities: ${Object.entries(device.thermostatCapabilities).filter(([_, value]) => value).map(([key, _]) => key).join(', ')}`);
       });
 
+      // Don't remove devices during reload - this preserves HomeKit stability
+      // Devices should only be removed explicitly by user action
+
       this.state.pairedDevices = deviceIds;
       this.lightingMonitor.setDevices(deviceIds);
 
-      // Add devices to Matter server as thermostat endpoints
+      // Add or update devices in HAP server
       for (const device of filteredDevices) {
         const deviceState = await this.getDeviceStateByDevice(device);
         if (deviceState) {
           try {
+            // addDevice will check if device was already bridged and skip if so
             await this.hapServer.addDevice(device.deviceId, deviceState);
-            console.log(`✅ Added ${device.name} to HomeKit bridge`);
           } catch (error) {
             console.error(`❌ Failed to add ${device.name} to HomeKit bridge:`, error);
           }
         }
       }
 
-      console.log(`✅ Reloaded devices: Found ${deviceIds.length} HVAC devices`);
+      console.log(`✅ Reloaded devices: ${deviceIds.length} HVAC devices synchronized`);
 
       await this.updateDeviceStates();
       await this.saveState();
@@ -152,6 +155,8 @@ export class Coordinator {
   }
 
   private async updateDeviceStates(): Promise<void> {
+    console.log(`📊 Coordinator: Updating device states at ${new Date().toISOString()}`);
+
     const promises = this.state.pairedDevices.map(async (deviceId) => {
       try {
         const deviceState = await this.api.getDeviceStatus(deviceId);
@@ -161,14 +166,22 @@ export class Coordinator {
 
           // Update HAP if state changed
           if (previousState) {
-            const stateChanged =
-              previousState.mode !== deviceState.mode ||
-              Math.abs(previousState.temperatureSetpoint - deviceState.temperatureSetpoint) > 0.5 ||
-              Math.abs(previousState.currentTemperature - deviceState.currentTemperature) > 0.5;
+            const tempDiff = Math.abs(previousState.currentTemperature - deviceState.currentTemperature);
+            const setpointDiff = Math.abs(previousState.temperatureSetpoint - deviceState.temperatureSetpoint);
+            const modeChanged = previousState.mode !== deviceState.mode;
+
+            const stateChanged = modeChanged || setpointDiff > 0.5 || tempDiff > 0.5;
 
             if (stateChanged) {
+              console.log(`📈 State change detected for ${deviceState.name}:`);
+              console.log(`   Temp: ${tempDiff.toFixed(1)}°F diff, Setpoint: ${setpointDiff.toFixed(1)}°F diff, Mode: ${modeChanged ? `${previousState.mode} -> ${deviceState.mode}` : 'unchanged'}`);
               await this.hapServer.updateDeviceState(deviceId, deviceState);
+            } else {
+              console.log(`   No significant changes for ${deviceState.name}`);
             }
+          } else {
+            console.log(`   First state update for ${deviceState.name}`);
+            await this.hapServer.updateDeviceState(deviceId, deviceState);
           }
         }
       } catch (error) {
@@ -242,7 +255,7 @@ export class Coordinator {
       return;
     }
 
-    console.log('Coordinator: Polling devices for state changes');
+    console.log(`⏰ Coordinator: Polling devices at ${new Date().toISOString()}`);
 
     const previousAverageTemp = this.state.averageTemperature;
     await this.updateDeviceStates();
@@ -253,6 +266,7 @@ export class Coordinator {
     }
 
     await this.saveState();
+    console.log(`✅ Coordinator: Polling complete at ${new Date().toISOString()}`);
   }
 
   private async synchronizeTemperatures(): Promise<void> {
