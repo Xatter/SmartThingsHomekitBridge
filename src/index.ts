@@ -90,9 +90,17 @@ async function startup(): Promise<void> {
     console.log('🌐 Starting web server...');
     await webServer.start();
 
-    if (smartThingsAPI.hasAuth()) {
+    // Check auth status and refresh token if needed before starting monitor
+    console.log('🔍 Checking auth status for lighting monitor...');
+    const hasValidToken = await smartThingsAuth.ensureValidToken();
+    console.log(`- ensureValidToken() returned: ${hasValidToken}`);
+
+    if (hasValidToken) {
       console.log('🔍 Starting lighting monitor...');
       lightingMonitor.start();
+    } else {
+      console.log('⚠️  Skipping lighting monitor start - no valid auth available');
+      console.log('    (Monitor will start after successful auth via web UI)');
     }
 
     console.log('✅ SmartThings HomeKit Bridge is running!');
