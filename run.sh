@@ -6,7 +6,7 @@ echo "Starting SmartThings HomeKit Bridge container..."
 # Configuration
 REGISTRY="docker.revealedpreferences.com"
 IMAGE_NAME="smartthings-homekit-bridge"
-FULL_IMAGE="smartthings-homekit-bridge:test"  # Using local test image
+FULL_IMAGE="${REGISTRY}/${IMAGE_NAME}:latest"  # Using local test image
 CONTAINER_NAME="smartthings-homekit-bridge"
 
 # Port configuration (avoiding conflicts with Homebridge on 51826)
@@ -25,10 +25,14 @@ fi
 DATA_DIR="${HOME}/.smartthings-bridge"
 mkdir -p "${DATA_DIR}"
 
+# Set permissions to allow container user (UID 1001) to write
+# This makes the directory world-writable which allows the container user to write
+chmod 777 "${DATA_DIR}"
+
 # Build docker run command with conditional volume mounts
 DOCKER_CMD="docker run -d \
     --name ${CONTAINER_NAME} \
-    --restart=always \
+    --restart=unless-stopped \
     -p ${WEB_PORT}:3000 \
     -p ${HAP_PORT}:51826 \
     -e HAP_PORT=51826 \
