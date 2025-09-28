@@ -21,6 +21,8 @@ if docker ps -a --format 'table {{.Names}}' | grep -q "^${CONTAINER_NAME}$"; the
     docker rm ${CONTAINER_NAME} || true
 fi
 
+docker pull ${FULL_IMAGE} || true
+
 # Create data directory for persistent storage if it doesn't exist
 DATA_DIR="${HOME}/.smartthings-bridge"
 mkdir -p "${DATA_DIR}"
