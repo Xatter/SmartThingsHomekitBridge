@@ -26,7 +26,10 @@ export class LightingMonitor {
   }
 
   start(): void {
+    console.log('LightingMonitor: start() method called');
+
     if (this.task) {
+      console.log('LightingMonitor: Stopping existing task before starting new one');
       this.stop();
     }
 
@@ -36,6 +39,7 @@ export class LightingMonitor {
     }
 
     console.log(`Starting LightingMonitor with interval: ${this.interval}`);
+    console.log(`LightingMonitor: Will monitor ${this.monitoredDevices.length} devices`);
 
     this.task = cron.schedule(this.interval, async () => {
       console.log(`[${new Date().toISOString()}] LightingMonitor cron triggered`);
@@ -47,6 +51,12 @@ export class LightingMonitor {
 
     this.task.start();
     console.log(`LightingMonitor started with cron pattern: ${this.interval}`);
+
+    // Immediately run a check on start
+    console.log('LightingMonitor: Running initial light check...');
+    this.checkAndTurnOffLights().catch(error => {
+      console.error('LightingMonitor: Error in initial light check:', error);
+    });
   }
 
   stop(): void {
