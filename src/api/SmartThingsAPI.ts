@@ -199,6 +199,9 @@ export class SmartThingsAPI {
 
       const switchStatus = status.components?.main?.switch?.switch?.value || 'off';
 
+      // Get the actual display light status from the Samsung-specific capability
+      const lightingStatus = status.components?.main?.['samsungce.airConditionerLighting']?.lighting?.value || 'off';
+
       // For Samsung ACs: if switch is off, the device mode should be 'off' regardless of airConditionerMode
       // However, during a mode change operation, there might be a brief period where the switch is still 'off'
       // but the airConditionerMode has been set. In this case, we should trust the airConditionerMode.
@@ -216,12 +219,25 @@ export class SmartThingsAPI {
         temperatureSetpoint,
         currentTemperature: temperature,
         mode: mode as 'heat' | 'cool' | 'auto' | 'off',
-        lightOn: switchStatus === 'on',
+        lightOn: lightingStatus === 'on',
         lastUpdated: new Date(),
       };
     } catch (error) {
       console.error(`Error getting device status for ${deviceId}:`, error);
       return null;
+    }
+  }
+
+  private async turnOffLightSilently(client: any, deviceId: string): Promise<void> {
+    try {
+      await client.devices.executeCommand(deviceId, {
+        component: 'main',
+        capability: 'samsungce.airConditionerLighting',
+        command: 'setLighting',
+        arguments: ['off'],
+      });
+    } catch (error) {
+      // Silently ignore errors - not all devices may support this capability
     }
   }
 
@@ -243,6 +259,10 @@ export class SmartThingsAPI {
       });
 
       console.log(`Set ${mode} setpoint to ${temperature}°F for device ${deviceId}`);
+
+      // Always turn off the light after any command
+      await this.turnOffLightSilently(client, deviceId);
+
       return true;
     } catch (error) {
       console.error(`Error setting temperature for device ${deviceId}:`, error);
@@ -266,6 +286,10 @@ export class SmartThingsAPI {
           arguments: [mode],
         });
         console.log(`Set thermostat mode to ${mode} for device ${deviceId}`);
+
+        // Always turn off the light after any command
+        await this.turnOffLightSilently(client, deviceId);
+
         return true;
       } catch (thermostatError) {
         // If thermostat mode fails, try air conditioner mode for Samsung devices
@@ -280,6 +304,10 @@ export class SmartThingsAPI {
             arguments: [],
           });
           console.log(`Turned Samsung AC off using switch capability for device ${deviceId}`);
+
+          // Always turn off the light after any command
+          await this.turnOffLightSilently(client, deviceId);
+
           return true;
         } else {
           // For heat/cool/auto modes, use airConditionerMode
@@ -304,6 +332,10 @@ export class SmartThingsAPI {
             arguments: [mode],
           });
           console.log(`Set Samsung AC mode to ${mode} for device ${deviceId}`);
+
+          // Always turn off the light after any command
+          await this.turnOffLightSilently(client, deviceId);
+
           return true;
         }
       }
@@ -322,9 +354,9 @@ export class SmartThingsAPI {
     try {
       await client.devices.executeCommand(deviceId, {
         component: 'main',
-        capability: 'switch',
-        command: 'off',
-        arguments: [],
+        capability: 'samsungce.airConditionerLighting',
+        command: 'setLighting',
+        arguments: ['off'],
       });
 
       console.log(`Turned off light for device ${deviceId}`);
@@ -344,9 +376,9 @@ export class SmartThingsAPI {
     try {
       await client.devices.executeCommand(deviceId, {
         component: 'main',
-        capability: 'switch',
-        command: 'on',
-        arguments: [],
+        capability: 'samsungce.airConditionerLighting',
+        command: 'setLighting',
+        arguments: ['on'],
       });
 
       console.log(`Turned on light for device ${deviceId}`);
