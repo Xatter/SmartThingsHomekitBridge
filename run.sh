@@ -30,13 +30,13 @@ mkdir -p "${DATA_DIR}"
 chmod 777 "${DATA_DIR}"
 
 # Build docker run command with conditional volume mounts
+# Use host network mode for proper HomeKit mDNS advertisement
 DOCKER_CMD="docker run -d \
     --name ${CONTAINER_NAME} \
     --restart=unless-stopped \
-    -p ${WEB_PORT}:3000 \
-    -p ${HAP_PORT}:51826 \
-    -e HAP_PORT=51826 \
-    -e WEB_PORT=3000 \
+    --network=host \
+    -e HAP_PORT=${HAP_PORT} \
+    -e WEB_PORT=${WEB_PORT} \
     -v \"${DATA_DIR}:/app/data\""
 
 # Add .env file mount if file exists
