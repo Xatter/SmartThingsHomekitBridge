@@ -24,10 +24,12 @@ fi
 # Create data directory for persistent storage if it doesn't exist
 DATA_DIR="${HOME}/.smartthings-bridge"
 mkdir -p "${DATA_DIR}"
+mkdir -p "${DATA_DIR}/persist"
 
 # Set permissions to allow container user (UID 1001) to write
-# This makes the directory world-writable which allows the container user to write
+# This makes the directories world-writable which allows the container user to write
 chmod 777 "${DATA_DIR}"
+chmod 777 "${DATA_DIR}/persist"
 
 # Build docker run command with conditional volume mounts
 # Use host network mode for proper HomeKit mDNS advertisement
