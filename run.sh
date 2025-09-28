@@ -37,7 +37,8 @@ DOCKER_CMD="docker run -d \
     --network=host \
     -e HAP_PORT=${HAP_PORT} \
     -e WEB_PORT=${WEB_PORT} \
-    -v \"${DATA_DIR}:/app/data\""
+    -v \"${DATA_DIR}:/app/data\" \
+    -v \"${DATA_DIR}/persist:/app/persist\""
 
 # Add .env file mount if file exists
 if [ -f "${PWD}/.env" ]; then
