@@ -59,7 +59,7 @@ async function startup(): Promise<void> {
       console.log('✅ SmartThings authentication successful, reloading devices...');
       try {
         await coordinator.reloadDevices();
-        lightingMonitor.start();
+        // LightingMonitor will be started automatically by setDevices() in reloadDevices()
       } catch (error) {
         console.error('❌ Error reloading devices after auth:', error);
       }
@@ -90,18 +90,9 @@ async function startup(): Promise<void> {
     console.log('🌐 Starting web server...');
     await webServer.start();
 
-    // Check auth status and refresh token if needed before starting monitor
-    console.log('🔍 Checking auth status for lighting monitor...');
-    const hasValidToken = await smartThingsAuth.ensureValidToken();
-    console.log(`- ensureValidToken() returned: ${hasValidToken}`);
-
-    if (hasValidToken) {
-      console.log('🔍 Starting lighting monitor...');
-      lightingMonitor.start();
-    } else {
-      console.log('⚠️  Skipping lighting monitor start - no valid auth available');
-      console.log('    (Monitor will start after successful auth via web UI)');
-    }
+    // The lighting monitor will be started automatically when devices are set via setDevices()
+    // in the coordinator's reloadDevices() method
+    console.log('🔍 Lighting monitor will start automatically when devices are loaded');
 
     console.log('✅ SmartThings HomeKit Bridge is running!');
     console.log('');

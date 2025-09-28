@@ -23,6 +23,16 @@ export class LightingMonitor {
   setDevices(deviceIds: string[]): void {
     this.monitoredDevices = [...deviceIds];
     console.log(`LightingMonitor set to monitor ${deviceIds.length} devices:`, deviceIds);
+
+    // If we now have devices and the monitor was previously started but stopped due to no devices,
+    // or if the task exists but needs to restart with new devices, restart it
+    if (deviceIds.length > 0) {
+      console.log('LightingMonitor: Devices updated, restarting monitor...');
+      this.start();
+    } else if (this.task) {
+      console.log('LightingMonitor: No devices to monitor, stopping monitor');
+      this.stop();
+    }
   }
 
   start(): void {
