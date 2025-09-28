@@ -1,6 +1,9 @@
 # Use Node.js 18 LTS as base image
 FROM node:18-alpine
 
+# Install timezone data for proper cron operation
+RUN apk add --no-cache tzdata
+
 # Set working directory
 WORKDIR /app
 

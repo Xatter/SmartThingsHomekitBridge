@@ -38,6 +38,7 @@ export class LightingMonitor {
     console.log(`Starting LightingMonitor with interval: ${this.interval}`);
 
     this.task = cron.schedule(this.interval, async () => {
+      console.log(`[${new Date().toISOString()}] LightingMonitor cron triggered`);
       await this.checkAndTurnOffLights();
     }, {
       scheduled: false,
@@ -45,7 +46,7 @@ export class LightingMonitor {
     });
 
     this.task.start();
-    console.log('LightingMonitor started');
+    console.log(`LightingMonitor started with cron pattern: ${this.interval}`);
   }
 
   stop(): void {
