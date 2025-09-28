@@ -2,6 +2,7 @@ import { Coordinator } from '@/coordinator/Coordinator';
 import { DeviceState } from '@/types';
 import * as QRCode from 'qrcode';
 import { v4 as uuid } from 'uuid';
+import * as path from 'path';
 
 // Import HAP-NodeJS components
 import {
@@ -13,7 +14,8 @@ import {
   CharacteristicGetCallback,
   Categories,
   Accessory,
-  uuid as HAP_uuid
+  uuid as HAP_uuid,
+  HAPStorage
 } from 'hap-nodejs';
 
 export interface HAPThermostatEvent {
@@ -50,8 +52,14 @@ export class SmartThingsHAPServer {
     try {
       console.log('HAP server initializing...');
 
-      // Create the bridge accessory
-      this.bridge = new Bridge('SmartThings Bridge', HAP_uuid.generate('SmartThings Bridge'));
+      // Set up HAP-NodeJS storage path to persist accessory data
+      const persistPath = process.env.HAP_PERSIST_PATH || path.join(process.cwd(), 'persist');
+      console.log(`📁 Setting HAP storage path to: ${persistPath}`);
+      HAPStorage.setCustomStoragePath(persistPath);
+
+      // Create the bridge accessory with a consistent UUID
+      const bridgeUUID = HAP_uuid.generate('SmartThings-Bridge-Main');
+      this.bridge = new Bridge('SmartThings Bridge', bridgeUUID);
 
       // Set up bridge information service
       this.bridge
@@ -97,9 +105,13 @@ export class SmartThingsHAPServer {
     }
 
     try {
+      // Use a consistent username (MAC address) for the bridge
+      // This should remain the same across restarts to maintain accessory identity
+      const bridgeUsername = process.env.HAP_BRIDGE_USERNAME || 'CC:22:3D:E3:CE:F6';
+
       // Publish the bridge to make it discoverable
       this.bridge.publish({
-        username: 'CC:22:3D:E3:CE:F6',
+        username: bridgeUsername,
         port: this.port,
         pincode: this.pincode,
         category: Categories.BRIDGE
@@ -153,9 +165,17 @@ export class SmartThingsHAPServer {
       return;
     }
 
+    // Check if device already exists to prevent duplicates
+    if (this.devices.has(deviceId)) {
+      console.log(`📋 HAP: Device ${deviceState.name} already exists, updating state instead`);
+      await this.updateDeviceState(deviceId, deviceState);
+      return;
+    }
+
     try {
-      // Create accessory for this thermostat
-      const accessoryUUID = HAP_uuid.generate(`smartthings-${deviceId}`);
+      // Create accessory for this thermostat with a consistent UUID
+      // Using the deviceId ensures the same accessory UUID across restarts
+      const accessoryUUID = HAP_uuid.generate(`smartthings-thermostat-${deviceId}`);
       const accessory = new Accessory(deviceState.name, accessoryUUID);
 
       // Set up accessory information
