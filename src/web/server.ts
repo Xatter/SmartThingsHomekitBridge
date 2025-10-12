@@ -88,8 +88,8 @@ export class WebServer {
 
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server = this.app.listen(this.port, () => {
-        logger.info({ port: this.port, url: `http://localhost:${this.port}` }, 'Web server started');
+      this.server = this.app.listen(this.port, '0.0.0.0', () => {
+        logger.info({ port: this.port, url: `http://0.0.0.0:${this.port}` }, 'Web server started');
         resolve();
       });
 

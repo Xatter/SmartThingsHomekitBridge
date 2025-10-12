@@ -34,15 +34,29 @@ chmod 777 "${DATA_DIR}"
 chmod 777 "${DATA_DIR}/persist"
 
 # Build docker run command with conditional volume mounts
-# Use host network mode for proper HomeKit mDNS advertisement
-DOCKER_CMD="docker run -d \
-    --name ${CONTAINER_NAME} \
-    --restart=unless-stopped \
-    --network=host \
-    -e HAP_PORT=${HAP_PORT} \
-    -e WEB_PORT=${WEB_PORT} \
-    -v \"${DATA_DIR}:/app/data\" \
-    -v \"${DATA_DIR}/persist:/app/persist\""
+# Detect OS and use appropriate networking
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "Detected macOS - using port mapping instead of host networking"
+    DOCKER_CMD="docker run -d \
+        --name ${CONTAINER_NAME} \
+        --restart=unless-stopped \
+        -p ${WEB_PORT}:${WEB_PORT} \
+        -p ${HAP_PORT}:${HAP_PORT} \
+        -e HAP_PORT=${HAP_PORT} \
+        -e WEB_PORT=${WEB_PORT} \
+        -v \"${DATA_DIR}:/app/data\" \
+        -v \"${DATA_DIR}/persist:/app/persist\""
+else
+    echo "Using host network mode for mDNS advertisement (Linux)"
+    DOCKER_CMD="docker run -d \
+        --name ${CONTAINER_NAME} \
+        --restart=unless-stopped \
+        --network=host \
+        -e HAP_PORT=${HAP_PORT} \
+        -e WEB_PORT=${WEB_PORT} \
+        -v \"${DATA_DIR}:/app/data\" \
+        -v \"${DATA_DIR}/persist:/app/persist\""
+fi
 
 # Add .env file mount if file exists
 if [ -f "${PWD}/.env" ]; then

@@ -44,9 +44,9 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 EXPOSE 3000
 EXPOSE 52826
 
-# Health check
+# Health check - use 127.0.0.1 explicitly since we bind to 0.0.0.0
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/api/health || exit 1
 
 # Set entrypoint to handle permissions
 ENTRYPOINT ["docker-entrypoint.sh"]

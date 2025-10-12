@@ -98,7 +98,8 @@ export class SmartThingsHAPServer {
         .setCharacteristic(Characteristic.SerialNumber, 'ST-BRIDGE-001')
         .setCharacteristic(Characteristic.FirmwareRevision, '1.0.0');
 
-      // QR code will be generated after bridge is published
+      // Initialize the setup code from pincode
+      this.setupCode = this.pincode;
 
       logger.info('✅ HAP server initialized successfully');
       logger.info(`🏠 HomeKit Bridge: Port ${this.port}`);
