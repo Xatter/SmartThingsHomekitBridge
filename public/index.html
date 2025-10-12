@@ -247,6 +247,105 @@
         .status-indicator.disconnected {
             background: #ff3b30;
         }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+
+        .stat-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.07);
+        }
+
+        .stat-label {
+            font-size: 0.9rem;
+            color: #6e6e73;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #1d1d1f;
+        }
+
+        .stat-value.heat {
+            color: #ff6b35;
+        }
+
+        .stat-value.cool {
+            color: #007aff;
+        }
+
+        .stat-value.off {
+            color: #8e8e93;
+        }
+
+        .demand-bar {
+            height: 8px;
+            background: #f5f5f7;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+
+        .demand-fill {
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+
+        .demand-fill.heat {
+            background: linear-gradient(90deg, #ff6b35, #ff9f1c);
+        }
+
+        .demand-fill.cool {
+            background: linear-gradient(90deg, #007aff, #5ac8fa);
+        }
+
+        .device-demand-card {
+            background: #f5f5f7;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+
+        .device-demand-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .device-demand-name {
+            font-weight: 600;
+            font-size: 1rem;
+        }
+
+        .device-demand-value {
+            font-size: 1.2rem;
+            font-weight: 700;
+        }
+
+        .warning {
+            background: #ff9500;
+            color: white;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .info-box {
+            background: #e3f2fd;
+            border-left: 4px solid #007aff;
+            padding: 16px;
+            border-radius: 4px;
+            margin: 16px 0;
+        }
     </style>
 </head>
 <body>
@@ -258,18 +357,24 @@
         function App() {
             const [currentPage, setCurrentPage] = useState(() => {
                 const hash = window.location.hash.slice(1);
-                return hash === 'setup' ? 'setup' : 'devices';
+                if (hash === 'setup') return 'setup';
+                if (hash === 'auto-mode') return 'auto-mode';
+                return 'devices';
             });
             const [authStatus, setAuthStatus] = useState(null);
             const [devices, setDevices] = useState([]);
             const [matterInfo, setMatterInfo] = useState(null);
+            const [autoModeStatus, setAutoModeStatus] = useState(null);
+            const [autoModeDecision, setAutoModeDecision] = useState(null);
             const [loading, setLoading] = useState(true);
             const [error, setError] = useState(null);
 
             useEffect(() => {
                 const handleHashChange = () => {
                     const hash = window.location.hash.slice(1);
-                    setCurrentPage(hash === 'setup' ? 'setup' : 'devices');
+                    if (hash === 'setup') setCurrentPage('setup');
+                    else if (hash === 'auto-mode') setCurrentPage('auto-mode');
+                    else setCurrentPage('devices');
                 };
 
                 window.addEventListener('hashchange', handleHashChange);
@@ -283,6 +388,8 @@
                         fetchDevices();
                     } else if (currentPage === 'setup') {
                         fetchMatterInfo();
+                    } else if (currentPage === 'auto-mode') {
+                        fetchAutoModeData();
                     }
                 };
                 initializePage();
@@ -343,6 +450,27 @@
                 }
             };
 
+            const fetchAutoModeData = async () => {
+                setLoading(true);
+                try {
+                    const [statusResponse, decisionResponse] = await Promise.all([
+                        fetch('/api/devices/auto-mode/status'),
+                        fetch('/api/devices/auto-mode/decision')
+                    ]);
+
+                    const statusData = await statusResponse.json();
+                    const decisionData = await decisionResponse.json();
+
+                    setAutoModeStatus(statusData);
+                    setAutoModeDecision(decisionData);
+                } catch (error) {
+                    setError('Failed to fetch auto-mode info');
+                    console.error('Error fetching auto-mode info:', error);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
             const handleDeviceControl = async (deviceId, action, value) => {
                 try {
                     const response = await fetch(`/api/devices/${deviceId}/${action}`, {
@@ -384,6 +512,14 @@
                             Devices
                         </button>
                         <button
+                            className={`nav-button ${currentPage === 'auto-mode' ? 'active' : ''}`}
+                            onClick={() => {
+                                window.location.hash = 'auto-mode';
+                            }}
+                        >
+                            Auto Mode
+                        </button>
+                        <button
                             className={`nav-button ${currentPage === 'setup' ? 'active' : ''}`}
                             onClick={() => {
                                 window.location.hash = 'setup';
@@ -407,6 +543,15 @@
 
                     {authStatus.authenticated && currentPage === 'devices' && (
                         <DevicesPage devices={devices} loading={loading} onDeviceControl={handleDeviceControl} />
+                    )}
+
+                    {currentPage === 'auto-mode' && (
+                        <AutoModePage
+                            status={autoModeStatus}
+                            decision={autoModeDecision}
+                            loading={loading}
+                            onRefresh={fetchAutoModeData}
+                        />
                     )}
 
                     {currentPage === 'setup' && (
@@ -601,6 +746,178 @@
                         </div>
                     )}
                 </div>
+            );
+        }
+
+        function AutoModePage({ status, decision, loading, onRefresh }) {
+            if (loading) {
+                return <div className="loading">Loading auto-mode status...</div>;
+            }
+
+            if (!decision || !decision.enrolled) {
+                return (
+                    <div className="card">
+                        <h2>Auto Mode</h2>
+                        <div className="info-box">
+                            <h3>No Devices Enrolled</h3>
+                            <p>Set any thermostat to AUTO mode in HomeKit to enroll it in auto-mode coordination.</p>
+                            <p style={{marginTop: '12px'}}>
+                                When multiple thermostats are in AUTO mode, the bridge will coordinate them to use the same
+                                compressor mode (HEAT or COOL) based on weighted demand calculations.
+                            </p>
+                        </div>
+                        <button className="nav-button" onClick={onRefresh} style={{marginTop: '16px'}}>
+                            Refresh
+                        </button>
+                    </div>
+                );
+            }
+
+            const currentMode = decision.decision?.mode || 'off';
+            const totalHeatDemand = decision.decision?.totalHeatDemand || 0;
+            const totalCoolDemand = decision.decision?.totalCoolDemand || 0;
+            const deviceDemands = decision.decision?.deviceDemands || [];
+            const reason = decision.decision?.reason || 'No decision available';
+            const switchSuppressed = decision.decision?.switchSuppressed || false;
+            const secondsUntilAllowed = decision.decision?.secondsUntilSwitchAllowed || 0;
+
+            const formatTime = (seconds) => {
+                if (seconds <= 0) return 'Ready';
+                const minutes = Math.floor(seconds / 60);
+                const secs = seconds % 60;
+                return `${minutes}m ${secs}s`;
+            };
+
+            return (
+                <>
+                    <div className="card">
+                        <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px'}}>
+                            <h2>Auto Mode Dashboard</h2>
+                            <button className="nav-button" onClick={onRefresh}>
+                                Refresh
+                            </button>
+                        </div>
+
+                        <div className="stats-grid">
+                            <div className="stat-card">
+                                <div className="stat-label">Current Mode</div>
+                                <div className={`stat-value ${currentMode}`}>
+                                    {currentMode.toUpperCase()}
+                                </div>
+                            </div>
+
+                            <div className="stat-card">
+                                <div className="stat-label">Enrolled Devices</div>
+                                <div className="stat-value">
+                                    {decision.deviceCount}
+                                </div>
+                            </div>
+
+                            <div className="stat-card">
+                                <div className="stat-label">Heat Demand</div>
+                                <div className="stat-value heat">
+                                    {totalHeatDemand.toFixed(2)}
+                                </div>
+                                <div className="demand-bar">
+                                    <div
+                                        className="demand-fill heat"
+                                        style={{width: `${Math.min(totalHeatDemand * 100, 100)}%`}}
+                                    ></div>
+                                </div>
+                            </div>
+
+                            <div className="stat-card">
+                                <div className="stat-label">Cool Demand</div>
+                                <div className="stat-value cool">
+                                    {totalCoolDemand.toFixed(2)}
+                                </div>
+                                <div className="demand-bar">
+                                    <div
+                                        className="demand-fill cool"
+                                        style={{width: `${Math.min(totalCoolDemand * 100, 100)}%`}}
+                                    ></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="info-box">
+                            <strong>Decision Reason:</strong> {reason}
+                        </div>
+
+                        {switchSuppressed && (
+                            <div className="warning">
+                                <strong>Mode Switch Suppressed</strong>
+                                <p>Time until mode switch allowed: {formatTime(secondsUntilAllowed)}</p>
+                            </div>
+                        )}
+                    </div>
+
+                    {deviceDemands.length > 0 && (
+                        <div className="card">
+                            <h3 style={{marginBottom: '16px'}}>Device Demands</h3>
+                            {deviceDemands.map(device => {
+                                const dominantDemand = device.heatDemand > device.coolDemand ? 'heat' : 'cool';
+                                const dominantValue = Math.max(device.heatDemand, device.coolDemand);
+
+                                return (
+                                    <div key={device.deviceId} className="device-demand-card">
+                                        <div className="device-demand-header">
+                                            <div className="device-demand-name">{device.deviceName}</div>
+                                            <div className={`device-demand-value ${dominantDemand}`}>
+                                                {dominantDemand === 'heat' ? '🔥' : '❄️'} {dominantValue.toFixed(2)}
+                                            </div>
+                                        </div>
+
+                                        <div style={{fontSize: '0.9rem', color: '#6e6e73', marginBottom: '8px'}}>
+                                            Heat: {device.heatDemand.toFixed(2)} ({device.rawHeatDelta > 0 ? '+' : ''}{device.rawHeatDelta.toFixed(1)}°F)
+                                            {' | '}
+                                            Cool: {device.coolDemand.toFixed(2)} ({device.rawCoolDelta > 0 ? '+' : ''}{device.rawCoolDelta.toFixed(1)}°F)
+                                        </div>
+
+                                        <div className="demand-bar">
+                                            <div
+                                                className={`demand-fill ${dominantDemand}`}
+                                                style={{width: `${Math.min(dominantValue * 100, 100)}%`}}
+                                            ></div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+
+                    {status && (
+                        <div className="card">
+                            <h3 style={{marginBottom: '16px'}}>Configuration</h3>
+                            <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px'}}>
+                                <div>
+                                    <div className="stat-label">Min On Time</div>
+                                    <div style={{fontSize: '1.2rem', fontWeight: '600'}}>
+                                        {Math.floor(status.config?.minOnTimeSeconds / 60) || 10} minutes
+                                    </div>
+                                </div>
+                                <div>
+                                    <div className="stat-label">Min Off Time</div>
+                                    <div style={{fontSize: '1.2rem', fontWeight: '600'}}>
+                                        {Math.floor(status.config?.minOffTimeSeconds / 60) || 5} minutes
+                                    </div>
+                                </div>
+                                <div>
+                                    <div className="stat-label">Min Lock Time</div>
+                                    <div style={{fontSize: '1.2rem', fontWeight: '600'}}>
+                                        {Math.floor(status.config?.minLockTimeSeconds / 60) || 30} minutes
+                                    </div>
+                                </div>
+                                <div>
+                                    <div className="stat-label">Flip Guard</div>
+                                    <div style={{fontSize: '1.2rem', fontWeight: '600'}}>
+                                        {status.config?.flipGuardEnabled ? 'Enabled' : 'Disabled'}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </>
             );
         }
 

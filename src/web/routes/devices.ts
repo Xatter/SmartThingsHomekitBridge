@@ -207,5 +207,89 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
     }
   });
 
+  // Auto-mode controller status
+  router.get('/auto-mode/status', (req: Request, res: Response) => {
+    try {
+      const autoController = coordinator.getAutoModeController();
+      const status = autoController.getStatus();
+      res.json(status);
+    } catch (error) {
+      console.error('Error fetching auto-mode status:', error);
+      res.status(500).json({ error: 'Failed to fetch auto-mode status' });
+    }
+  });
+
+  // Auto-mode decision with demand calculations
+  router.get('/auto-mode/decision', (req: Request, res: Response) => {
+    try {
+      const autoController = coordinator.getAutoModeController();
+      const state = coordinator.getState();
+      const enrolledIds = autoController.getEnrolledDeviceIds();
+
+      if (enrolledIds.length === 0) {
+        return res.json({
+          enrolled: false,
+          decision: null,
+          message: 'No devices enrolled in auto mode'
+        });
+      }
+
+      // Gather device information for evaluation
+      const autoModeDevices = enrolledIds
+        .map(deviceId => {
+          const deviceState = state.deviceStates.get(deviceId);
+          if (!deviceState) return null;
+
+          const lowerBound = deviceState.heatingSetpoint || (deviceState.temperatureSetpoint - 2);
+          const upperBound = deviceState.coolingSetpoint || (deviceState.temperatureSetpoint + 2);
+
+          return {
+            id: deviceId,
+            name: deviceState.name,
+            currentTemperature: deviceState.currentTemperature,
+            lowerBound,
+            upperBound,
+            weight: 1.0,
+          };
+        })
+        .filter(device => device !== null);
+
+      if (autoModeDevices.length === 0) {
+        return res.json({
+          enrolled: true,
+          deviceCount: enrolledIds.length,
+          decision: null,
+          message: 'Enrolled devices have no valid state'
+        });
+      }
+
+      const decision = autoController.evaluate(autoModeDevices);
+      res.json({
+        enrolled: true,
+        deviceCount: enrolledIds.length,
+        enrolledDeviceIds: enrolledIds,
+        decision: {
+          mode: decision.mode,
+          totalHeatDemand: decision.totalHeatDemand,
+          totalCoolDemand: decision.totalCoolDemand,
+          reason: decision.reason,
+          switchSuppressed: decision.switchSuppressed,
+          secondsUntilSwitchAllowed: decision.secondsUntilSwitchAllowed,
+          deviceDemands: decision.deviceDemands.map(d => ({
+            deviceId: d.deviceId,
+            deviceName: d.deviceName,
+            heatDemand: d.heatDemand,
+            coolDemand: d.coolDemand,
+            rawHeatDelta: d.rawHeatDelta,
+            rawCoolDelta: d.rawCoolDelta,
+          })),
+        },
+      });
+    } catch (error) {
+      console.error('Error fetching auto-mode decision:', error);
+      res.status(500).json({ error: 'Failed to fetch auto-mode decision' });
+    }
+  });
+
   return router;
 }
