@@ -2,6 +2,9 @@ import { Router, Request, Response } from 'express';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { Coordinator } from '@/coordinator/Coordinator';
 
+// Default temperature band margin when heating/cooling setpoints are not available
+const DEFAULT_TEMP_BAND_MARGIN = 2; // °F
+
 export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinator): Router {
   const router = Router();
 
@@ -240,8 +243,8 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
           const deviceState = state.deviceStates.get(deviceId);
           if (!deviceState) return null;
 
-          const lowerBound = deviceState.heatingSetpoint || (deviceState.temperatureSetpoint - 2);
-          const upperBound = deviceState.coolingSetpoint || (deviceState.temperatureSetpoint + 2);
+          const lowerBound = deviceState.heatingSetpoint || (deviceState.temperatureSetpoint - DEFAULT_TEMP_BAND_MARGIN);
+          const upperBound = deviceState.coolingSetpoint || (deviceState.temperatureSetpoint + DEFAULT_TEMP_BAND_MARGIN);
 
           return {
             id: deviceId,

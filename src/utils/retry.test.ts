@@ -296,8 +296,8 @@ describe('withRetry', () => {
     await Promise.resolve();
     expect(mockFn).toHaveBeenCalledTimes(1);
 
-    // With jitter, delay should be 1000 * 0.5 = 500ms
-    jest.advanceTimersByTime(500);
+    // With additive jitter: delay = 1000 + (0.5 * 1000 * 0.1) = 1050ms
+    jest.advanceTimersByTime(1050);
     await Promise.resolve();
     expect(mockFn).toHaveBeenCalledTimes(2);
 

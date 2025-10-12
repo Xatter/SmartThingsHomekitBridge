@@ -893,25 +893,25 @@
                                 <div>
                                     <div className="stat-label">Min On Time</div>
                                     <div style={{fontSize: '1.2rem', fontWeight: '600'}}>
-                                        {Math.floor(status.config?.minOnTimeSeconds / 60) || 10} minutes
+                                        {Math.floor((status.config?.minOnTime ?? 600) / 60)} minutes
                                     </div>
                                 </div>
                                 <div>
                                     <div className="stat-label">Min Off Time</div>
                                     <div style={{fontSize: '1.2rem', fontWeight: '600'}}>
-                                        {Math.floor(status.config?.minOffTimeSeconds / 60) || 5} minutes
+                                        {Math.floor((status.config?.minOffTime ?? 300) / 60)} minutes
                                     </div>
                                 </div>
                                 <div>
                                     <div className="stat-label">Min Lock Time</div>
                                     <div style={{fontSize: '1.2rem', fontWeight: '600'}}>
-                                        {Math.floor(status.config?.minLockTimeSeconds / 60) || 30} minutes
+                                        {Math.floor((status.config?.minLockTime ?? 1800) / 60)} minutes
                                     </div>
                                 </div>
                                 <div>
                                     <div className="stat-label">Flip Guard</div>
                                     <div style={{fontSize: '1.2rem', fontWeight: '600'}}>
-                                        {status.config?.flipGuardEnabled ? 'Enabled' : 'Disabled'}
+                                        {status.config?.flipGuard ? `${status.config.flipGuard}°F` : '2.0°F'}
                                     </div>
                                 </div>
                             </div>

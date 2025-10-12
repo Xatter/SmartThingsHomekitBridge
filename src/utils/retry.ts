@@ -73,8 +73,9 @@ function calculateDelay(attempt: number, options: Required<RetryOptions>): numbe
 
   // Add jitter to prevent thundering herd problem
   if (options.jitter) {
-    // Random jitter between 0 and delay
-    delay = Math.random() * delay;
+    // Additive jitter: add up to 10% of the delay
+    // This ensures meaningful backoff while preventing thundering herd
+    delay = delay + Math.random() * (delay * 0.1);
   }
 
   return Math.floor(delay);
@@ -148,6 +149,17 @@ export async function withRetry<T>(
     }
   }
 
-  // This should never be reached, but TypeScript requires it
-  throw lastError || new Error('Unexpected retry loop exit');
+  // This should never be reached due to the throw in the loop above,
+  // but TypeScript's control flow analysis requires a return/throw here
+  const errorMessage = lastError ? lastError.message : 'none';
+  logger.error({
+    operation: opts.operationName,
+    maxRetries: opts.maxRetries,
+    lastError: lastError,
+  }, `❗ Unexpected exit from retry loop for ${opts.operationName}. This indicates a bug. Please report with details.`);
+
+  throw lastError || new Error(
+    `Unexpected exit from retry loop for ${opts.operationName}. No result was returned and no error was thrown. ` +
+    `Last error: ${errorMessage}. This is a bug in the retry logic.`
+  );
 }
