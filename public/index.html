@@ -247,6 +247,43 @@
         .status-indicator.disconnected {
             background: #ff3b30;
         }
+
+        .danger-button {
+            background: #ff3b30;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin-top: 20px;
+        }
+
+        .danger-button:hover {
+            background: #d32f2f;
+        }
+
+        .danger-button:disabled {
+            background: #8e8e93;
+            cursor: not-allowed;
+        }
+
+        .reset-section {
+            border-top: 1px solid #d1d1d6;
+            margin-top: 30px;
+            padding-top: 30px;
+        }
+
+        .reset-section h3 {
+            color: #ff3b30;
+            margin-bottom: 10px;
+        }
+
+        .reset-section p {
+            color: #6e6e73;
+            margin-bottom: 15px;
+        }
     </style>
 </head>
 <body>
@@ -558,6 +595,62 @@
         }
 
         function SetupPage({ matterInfo, loading }) {
+            const [resetting, setResetting] = React.useState(false);
+            const [resetMessage, setResetMessage] = React.useState(null);
+
+            const handleResetPairing = async () => {
+                const confirmed = window.confirm(
+                    'Are you sure you want to reset HomeKit pairing?\n\n' +
+                    'This will:\n' +
+                    '• Remove the bridge from HomeKit\n' +
+                    '• Clear all cached accessories\n' +
+                    '• Require re-pairing with HomeKit\n' +
+                    '• Restart the bridge\n\n' +
+                    'You will need to scan the QR code again to reconnect.'
+                );
+
+                if (!confirmed) {
+                    return;
+                }
+
+                setResetting(true);
+                setResetMessage(null);
+
+                try {
+                    const response = await fetch('/api/homekit/reset-pairing', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        setResetMessage({
+                            type: 'success',
+                            text: data.message || 'Pairing reset successful. The bridge will restart shortly.'
+                        });
+
+                        // Reload the page after 3 seconds to show the new QR code
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 3000);
+                    } else {
+                        setResetMessage({
+                            type: 'error',
+                            text: data.error || 'Failed to reset pairing'
+                        });
+                        setResetting(false);
+                    }
+                } catch (error) {
+                    console.error('Error resetting pairing:', error);
+                    setResetMessage({
+                        type: 'error',
+                        text: 'Network error: Failed to reset pairing'
+                    });
+                    setResetting(false);
+                }
+            };
+
             if (loading) {
                 return <div className="loading">Loading HomeKit setup...</div>;
             }
@@ -574,6 +667,19 @@
             return (
                 <div className="card">
                     <h2>HomeKit Setup</h2>
+
+                    <div style={{marginBottom: '20px', padding: '12px', backgroundColor: '#f5f5f7', borderRadius: '8px'}}>
+                        <p style={{margin: 0}}>
+                            <span className={`status-indicator ${matterInfo.isPaired ? 'connected' : 'disconnected'}`}></span>
+                            <strong>Status:</strong> {matterInfo.isPaired ? 'Paired with HomeKit' : 'Not Paired'}
+                        </p>
+                    </div>
+
+                    {resetMessage && (
+                        <div className={resetMessage.type}>
+                            {resetMessage.text}
+                        </div>
+                    )}
 
                     {matterInfo.qrCode && (
                         <div className="qr-code">
@@ -597,9 +703,24 @@
                                     <li key={index}>{step}</li>
                                 ))}
                             </ol>
-
                         </div>
                     )}
+
+                    <div className="reset-section">
+                        <h3>Reset HomeKit Pairing</h3>
+                        <p>
+                            If you're experiencing issues with HomeKit pairing or want to start fresh,
+                            you can reset the pairing. This will remove the bridge from HomeKit and
+                            allow you to pair it again.
+                        </p>
+                        <button
+                            className="danger-button"
+                            onClick={handleResetPairing}
+                            disabled={resetting}
+                        >
+                            {resetting ? 'Resetting...' : 'Reset HomeKit Pairing'}
+                        </button>
+                    </div>
                 </div>
             );
         }

@@ -9,6 +9,7 @@ import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { createAuthRoutes } from './routes/auth';
 import { createDevicesRoutes } from './routes/devices';
 import { createHomeKitRoutes } from './routes/homekit';
+import { logger } from '@/utils/logger';
 
 export class WebServer {
   private app: express.Application;
@@ -36,7 +37,7 @@ export class WebServer {
     this.app.use(express.static(path.join(__dirname, '../../public')));
 
     this.app.use((req, res, next) => {
-      console.log(`${req.method} ${req.path}`);
+      logger.debug({ method: req.method, path: req.path }, 'HTTP request');
       next();
     });
   }
@@ -80,7 +81,7 @@ export class WebServer {
     });
 
     this.app.use((err: any, req: any, res: any, next: any) => {
-      console.error('Express error:', err);
+      logger.error({ err }, 'Express error');
       res.status(500).json({ error: 'Internal server error' });
     });
   }
@@ -88,13 +89,12 @@ export class WebServer {
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.server = this.app.listen(this.port, () => {
-        console.log(`Web server started on port ${this.port}`);
-        console.log(`Access the web interface at: http://localhost:${this.port}`);
+        logger.info({ port: this.port, url: `http://localhost:${this.port}` }, 'Web server started');
         resolve();
       });
 
       this.server.on('error', (error: any) => {
-        console.error('Web server error:', error);
+        logger.error({ err: error }, 'Web server error');
         reject(error);
       });
     });
@@ -104,7 +104,7 @@ export class WebServer {
     if (this.server) {
       return new Promise((resolve) => {
         this.server.close(() => {
-          console.log('Web server stopped');
+          logger.info('Web server stopped');
           resolve();
         });
       });

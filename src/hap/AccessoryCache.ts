@@ -1,5 +1,6 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
+import { logger } from '@/utils/logger';
 
 export interface CachedAccessory {
   deviceId: string;
@@ -23,11 +24,11 @@ export class AccessoryCache {
     try {
       const data = await fs.readFile(this.cacheFile, 'utf-8');
       this.accessories = JSON.parse(data);
-      console.log(`📥 Loaded ${this.accessories.length} cached accessories`);
+      logger.info({ count: this.accessories.length }, '📥 Loaded cached accessories');
       return this.accessories;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.error('Error loading cached accessories:', error);
+        logger.error({ err: error }, 'Error loading cached accessories');
       }
       return [];
     }
@@ -37,9 +38,9 @@ export class AccessoryCache {
     try {
       this.accessories = accessories;
       await fs.writeFile(this.cacheFile, JSON.stringify(accessories, null, 2));
-      console.log(`💾 Saved ${accessories.length} accessories to cache`);
+      logger.info({ count: accessories.length }, '💾 Saved accessories to cache');
     } catch (error) {
-      console.error('Error saving cached accessories:', error);
+      logger.error({ err: error }, 'Error saving cached accessories');
     }
   }
 

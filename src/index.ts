@@ -6,17 +6,19 @@ import { LightingMonitor } from '@/monitoring/LightingMonitor';
 import { Coordinator } from '@/coordinator/Coordinator';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { WebServer } from '@/web/server';
+import { logger } from '@/utils/logger';
 
 dotenv.config();
 
 async function startup(): Promise<void> {
-  console.log('🚀 Starting SmartThings HomeKit Bridge...');
+  logger.info('🚀 Starting SmartThings HomeKit Bridge...');
 
   // Debug environment variables
-  console.log('Environment check:');
-  console.log('- SMARTTHINGS_CLIENT_ID:', process.env.SMARTTHINGS_CLIENT_ID ? '✅ Set' : '❌ Missing');
-  console.log('- SMARTTHINGS_CLIENT_SECRET:', process.env.SMARTTHINGS_CLIENT_SECRET ? '✅ Set' : '❌ Missing');
-  console.log('- SMARTTHINGS_REDIRECT_URI:', process.env.SMARTTHINGS_REDIRECT_URI || '❌ Missing');
+  logger.info({
+    clientId: process.env.SMARTTHINGS_CLIENT_ID ? 'Set' : 'Missing',
+    clientSecret: process.env.SMARTTHINGS_CLIENT_SECRET ? 'Set' : 'Missing',
+    redirectUri: process.env.SMARTTHINGS_REDIRECT_URI || 'Missing'
+  }, 'Environment check');
 
   const tokenPath = process.env.AUTH_TOKEN_PATH || './data/smartthings_token.json';
   const statePath = process.env.DEVICE_STATE_PATH || './data/device_state.json';
@@ -27,14 +29,12 @@ async function startup(): Promise<void> {
   const pollInterval = parseInt(process.env.DEVICE_POLL_INTERVAL || '300');
 
   if (!process.env.SMARTTHINGS_CLIENT_ID || !process.env.SMARTTHINGS_CLIENT_SECRET) {
-    console.error('❌ Missing required environment variables:');
-    console.error('   SMARTTHINGS_CLIENT_ID and SMARTTHINGS_CLIENT_SECRET must be set');
-    console.error('   Copy .env.example to .env and fill in your SmartThings OAuth credentials');
+    logger.error('❌ Missing required environment variables: SMARTTHINGS_CLIENT_ID and SMARTTHINGS_CLIENT_SECRET must be set. Copy .env.example to .env and fill in your SmartThings OAuth credentials');
     process.exit(1);
   }
 
   try {
-    console.log('📦 Initializing services...');
+    logger.info('📦 Initializing services...');
 
     const smartThingsAuth = new SmartThingsAuthentication(tokenPath);
     await smartThingsAuth.load();
@@ -56,12 +56,12 @@ async function startup(): Promise<void> {
     const webServer = new WebServer(webPort);
 
     const onAuthSuccess = async () => {
-      console.log('✅ SmartThings authentication successful, reloading devices...');
+      logger.info('✅ SmartThings authentication successful, reloading devices...');
       try {
         await coordinator.reloadDevices();
         // LightingMonitor will be started automatically by setDevices() in reloadDevices()
       } catch (error) {
-        console.error('❌ Error reloading devices after auth:', error);
+        logger.error({ err: error }, '❌ Error reloading devices after auth');
       }
     };
 
@@ -74,40 +74,37 @@ async function startup(): Promise<void> {
     );
 
     if (!smartThingsAPI.hasAuth()) {
-      console.log('⚠️  No SmartThings authentication found');
-      console.log(`🌐 Please visit http://localhost:${webPort} to authenticate with SmartThings`);
+      logger.warn('⚠️  No SmartThings authentication found');
+      logger.info({ url: `http://localhost:${webPort}` }, '🌐 Please visit web interface to authenticate with SmartThings');
     } else {
-      console.log('✅ SmartThings authentication found');
+      logger.info('✅ SmartThings authentication found');
     }
 
-    console.log('⚡ Starting HAP server...');
+    logger.info('⚡ Starting HAP server...');
     await hapServer.initialize(coordinator);
     await hapServer.start();
 
-    console.log('🔧 Initializing coordinator...');
+    logger.info('🔧 Initializing coordinator...');
     await coordinator.initialize();
 
-    console.log('🌐 Starting web server...');
+    logger.info('🌐 Starting web server...');
     await webServer.start();
 
     // The lighting monitor will be started automatically when devices are set via setDevices()
     // in the coordinator's reloadDevices() method
-    console.log('🔍 Lighting monitor will start automatically when devices are loaded');
+    logger.info('🔍 Lighting monitor will start automatically when devices are loaded');
 
-    console.log('✅ SmartThings HomeKit Bridge is running!');
-    console.log('');
-    console.log('📱 Web Interface: http://localhost:' + webPort);
-    console.log('🏠 HomeKit Bridge: Port ' + hapPort);
-    console.log('');
+    logger.info({ webPort, hapPort }, '✅ SmartThings HomeKit Bridge is running!');
 
     if (hapServer.getQrCode()) {
-      console.log('🔗 HomeKit Pairing Information:');
-      console.log('   QR Code: Available in web interface');
-      console.log('   Setup Code:', hapServer.getPairingCode());
+      logger.info({
+        qrCode: 'Available in web interface',
+        setupCode: hapServer.getPairingCode()
+      }, '🔗 HomeKit Pairing Information');
     }
 
     const gracefulShutdown = async (signal: string) => {
-      console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
+      logger.info({ signal }, '🛑 Received signal, shutting down gracefully...');
 
       try {
         coordinator.stop();
@@ -115,10 +112,10 @@ async function startup(): Promise<void> {
         await hapServer.stop();
         await webServer.stop();
 
-        console.log('✅ Graceful shutdown complete');
+        logger.info('✅ Graceful shutdown complete');
         process.exit(0);
       } catch (error) {
-        console.error('❌ Error during shutdown:', error);
+        logger.error({ err: error }, '❌ Error during shutdown');
         process.exit(1);
       }
     };
@@ -127,14 +124,14 @@ async function startup(): Promise<void> {
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
   } catch (error) {
-    console.error('❌ Failed to start SmartThings HomeKit Bridge:', error);
+    logger.error({ err: error }, '❌ Failed to start SmartThings HomeKit Bridge');
     process.exit(1);
   }
 }
 
 if (require.main === module) {
   startup().catch((error) => {
-    console.error('❌ Startup error:', error);
+    logger.error({ err: error }, '❌ Startup error');
     process.exit(1);
   });
 }

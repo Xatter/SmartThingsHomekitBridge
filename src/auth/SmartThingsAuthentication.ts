@@ -1,5 +1,7 @@
 import { promises as fs } from 'fs';
 import { SmartThingsAuthToken } from '@/types';
+import { logger } from '@/utils/logger';
+import { withRetry } from '@/utils/retry';
 
 export class SmartThingsAuthentication {
   private token: SmartThingsAuthToken | null = null;
@@ -15,12 +17,12 @@ export class SmartThingsAuthentication {
       this.token = JSON.parse(tokenData);
 
       if (this.token && this.isTokenExpired()) {
-        console.warn('SmartThings token has expired');
+        logger.warn('SmartThings token has expired');
         this.token = null;
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.error('Error loading SmartThings token:', error);
+        logger.error({ err: error }, 'Error loading SmartThings token');
       }
       this.token = null;
     }
@@ -43,22 +45,20 @@ export class SmartThingsAuthentication {
   }
 
   async save(token: SmartThingsAuthToken): Promise<void> {
-    console.log('💾 SmartThingsAuthentication.save() called');
-    console.log('Token path:', this.tokenPath);
-    console.log('Token to save:', { ...token, access_token: '***', refresh_token: '***' });
+    logger.debug({ path: this.tokenPath }, '💾 SmartThingsAuthentication.save() called');
 
     this.token = token;
 
     try {
       const dir = require('path').dirname(this.tokenPath);
-      console.log('Creating directory:', dir);
+      logger.debug({ dir }, 'Creating directory');
       await fs.mkdir(dir, { recursive: true });
 
-      console.log('Writing token to file...');
+      logger.debug('Writing token to file');
       await fs.writeFile(this.tokenPath, JSON.stringify(token, null, 2));
-      console.log('✅ SmartThings token saved successfully to:', this.tokenPath);
+      logger.info({ path: this.tokenPath }, '✅ SmartThings token saved successfully');
     } catch (error) {
-      console.error('❌ Error saving SmartThings token:', error);
+      logger.error({ err: error }, '❌ Error saving SmartThings token');
       throw error;
     }
   }
@@ -69,24 +69,28 @@ export class SmartThingsAuthentication {
     }
 
     try {
+      const refreshToken = this.token.refresh_token;
       const clientCredentials = Buffer.from(
         `${process.env.SMARTTHINGS_CLIENT_ID}:${process.env.SMARTTHINGS_CLIENT_SECRET}`
       ).toString('base64');
 
-      const response = await fetch('https://api.smartthings.com/oauth/token', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Authorization': `Basic ${clientCredentials}`,
-        },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token',
-          refresh_token: this.token.refresh_token,
+      const response = await withRetry(
+        () => fetch('https://api.smartthings.com/oauth/token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': `Basic ${clientCredentials}`,
+          },
+          body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            refresh_token: refreshToken!,
+          }),
         }),
-      });
+        { maxRetries: 3, operationName: 'refresh OAuth token' }
+      );
 
       if (!response.ok) {
-        console.error('Failed to refresh token:', response.statusText);
+        logger.error({ status: response.statusText }, 'Failed to refresh token');
         return false;
       }
 
@@ -102,7 +106,7 @@ export class SmartThingsAuthentication {
       await this.save(newToken);
       return true;
     } catch (error) {
-      console.error('Error refreshing token:', error);
+      logger.error({ err: error }, 'Error refreshing token');
       return false;
     }
   }

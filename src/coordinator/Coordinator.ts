@@ -5,7 +5,12 @@ import { LightingMonitor } from '@/monitoring/LightingMonitor';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { CoordinatorState, DeviceState, UnifiedDevice } from '@/types';
 import { HAPThermostatEvent } from '@/hap/HAPServer';
+import { logger } from '@/utils/logger';
 
+/**
+ * Coordinates device state between SmartThings API, HomeKit bridge, and lighting monitor.
+ * Manages device synchronization, temperature control, and polling.
+ */
 export class Coordinator {
   private readonly api: SmartThingsAPI;
   private readonly lightingMonitor: LightingMonitor;
@@ -15,6 +20,14 @@ export class Coordinator {
   private pollTask: cron.ScheduledTask | null = null;
   private readonly pollInterval: string;
 
+  /**
+   * Creates a new Coordinator instance.
+   * @param api - SmartThings API client
+   * @param lightingMonitor - Lighting monitor for AC light control
+   * @param hapServer - HomeKit bridge server
+   * @param stateFilePath - Path to persist coordinator state
+   * @param pollIntervalSeconds - Device polling interval in seconds (default: 300)
+   */
   constructor(
     api: SmartThingsAPI,
     lightingMonitor: LightingMonitor,
@@ -44,6 +57,10 @@ export class Coordinator {
     return `*/${seconds} * * * * *`;
   }
 
+  /**
+   * Initializes the coordinator by loading state and starting polling.
+   * Defers device reloading by 2 seconds to avoid blocking pairing process.
+   */
   async initialize(): Promise<void> {
     await this.loadState();
     // Only reload devices if we have auth and existing devices to restore
@@ -79,12 +96,12 @@ export class Coordinator {
         deviceStates,
       };
 
-      console.log(`Loaded coordinator state: ${this.state.pairedDevices.length} paired devices`);
+      logger.info({ count: this.state.pairedDevices.length }, 'Loaded coordinator state');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.error('Error loading coordinator state:', error);
+        logger.error({ err: error }, 'Error loading coordinator state');
       } else {
-        console.log('No existing coordinator state found, starting fresh');
+        logger.info('No existing coordinator state found, starting fresh');
       }
     }
   }
@@ -101,29 +118,31 @@ export class Coordinator {
       await fs.mkdir(require('path').dirname(this.stateFilePath), { recursive: true });
       await fs.writeFile(this.stateFilePath, JSON.stringify(stateToSave, null, 2));
     } catch (error) {
-      console.error('Error saving coordinator state:', error);
+      logger.error({ err: error }, 'Error saving coordinator state');
     }
   }
 
+  /**
+   * Reloads all HVAC devices from SmartThings and syncs them to HomeKit.
+   * Does not remove existing devices - preserves HomeKit stability.
+   */
   async reloadDevices(): Promise<void> {
     if (!this.api.hasAuth()) {
-      console.warn('Cannot reload devices: No SmartThings authentication');
+      logger.warn('Cannot reload devices: No SmartThings authentication');
       return;
     }
 
-    console.log('⏳ Reloading devices - this may take a moment...');
+    logger.info('⏳ Reloading devices - this may take a moment...');
 
     try {
-      console.log('🔍 Reloading devices from SmartThings...');
+      logger.info('🔍 Reloading devices from SmartThings');
       const filteredDevices = await this.api.getDevices([]);
       const deviceIds = filteredDevices.map(device => device.deviceId);
 
-      console.log(`📱 Found ${filteredDevices.length} HVAC devices`);
-      console.log('🏠 HVAC devices found:');
+      logger.info({ count: filteredDevices.length }, '📱 Found HVAC devices');
+      logger.debug('🏠 HVAC devices found:');
       filteredDevices.forEach(device => {
-        console.log(`  - ${device.name} (${device.deviceId})`);
-        console.log(`    Capabilities: ${device.capabilities.map(cap => cap.id).join(', ')}`);
-        console.log(`    Thermostat capabilities: ${Object.entries(device.thermostatCapabilities).filter(([_, value]) => value).map(([key, _]) => key).join(', ')}`);
+        logger.debug({ deviceId: device.deviceId, name: device.name, capabilities: device.capabilities.map(cap => cap.id) }, `  - Device: ${device.name}`);
       });
 
       // Don't remove devices during reload - this preserves HomeKit stability
@@ -140,22 +159,22 @@ export class Coordinator {
             // addDevice will check if device was already bridged and skip if so
             await this.hapServer.addDevice(device.deviceId, deviceState);
           } catch (error) {
-            console.error(`❌ Failed to add ${device.name} to HomeKit bridge:`, error);
+            logger.error({ err: error, deviceName: device.name }, '❌ Failed to add device to HomeKit bridge');
           }
         }
       }
 
-      console.log(`✅ Reloaded devices: ${deviceIds.length} HVAC devices synchronized`);
+      logger.info({ count: deviceIds.length }, '✅ Reloaded devices: HVAC devices synchronized');
 
       await this.updateDeviceStates();
       await this.saveState();
     } catch (error) {
-      console.error('❌ Error reloading devices:', error);
+      logger.error({ err: error }, '❌ Error reloading devices');
     }
   }
 
   private async updateDeviceStates(): Promise<void> {
-    console.log(`📊 Coordinator: Updating device states at ${new Date().toISOString()}`);
+    logger.debug('📊 Coordinator: Updating device states');
 
     const promises = this.state.pairedDevices.map(async (deviceId) => {
       try {
@@ -173,19 +192,23 @@ export class Coordinator {
             const stateChanged = modeChanged || setpointDiff > 0.5 || tempDiff > 0.5;
 
             if (stateChanged) {
-              console.log(`📈 State change detected for ${deviceState.name}:`);
-              console.log(`   Temp: ${tempDiff.toFixed(1)}°F diff, Setpoint: ${setpointDiff.toFixed(1)}°F diff, Mode: ${modeChanged ? `${previousState.mode} -> ${deviceState.mode}` : 'unchanged'}`);
+              logger.info({
+                deviceName: deviceState.name,
+                tempDiff: tempDiff.toFixed(1),
+                setpointDiff: setpointDiff.toFixed(1),
+                modeChange: modeChanged ? `${previousState.mode} -> ${deviceState.mode}` : 'unchanged'
+              }, '📈 State change detected');
               await this.hapServer.updateDeviceState(deviceId, deviceState);
             } else {
-              console.log(`   No significant changes for ${deviceState.name}`);
+              logger.debug({ deviceName: deviceState.name }, 'No significant changes');
             }
           } else {
-            console.log(`   First state update for ${deviceState.name}`);
+            logger.debug({ deviceName: deviceState.name }, 'First state update');
             await this.hapServer.updateDeviceState(deviceId, deviceState);
           }
         }
       } catch (error) {
-        console.error(`Error updating state for device ${deviceId}:`, error);
+        logger.error({ err: error, deviceId }, 'Error updating state for device');
       }
     });
 
@@ -239,7 +262,7 @@ export class Coordinator {
       this.pollTask.stop();
     }
 
-    console.log(`Starting coordinator polling with interval: ${this.pollInterval}`);
+    logger.info({ interval: this.pollInterval }, 'Starting coordinator polling');
 
     this.pollTask = cron.schedule(this.pollInterval, async () => {
       await this.pollDevices();
@@ -251,22 +274,25 @@ export class Coordinator {
 
   private async pollDevices(): Promise<void> {
     if (!this.api.hasAuth()) {
-      console.warn('Coordinator polling: No SmartThings authentication');
+      logger.warn('Coordinator polling: No SmartThings authentication');
       return;
     }
 
-    console.log(`⏰ Coordinator: Polling devices at ${new Date().toISOString()}`);
+    logger.debug('⏰ Coordinator: Polling devices');
 
     const previousAverageTemp = this.state.averageTemperature;
     await this.updateDeviceStates();
 
     if (Math.abs(this.state.averageTemperature - previousAverageTemp) > 0.5) {
-      console.log(`Temperature change detected: ${previousAverageTemp}°F -> ${this.state.averageTemperature}°F`);
+      logger.info({
+        previousTemp: previousAverageTemp,
+        newTemp: this.state.averageTemperature
+      }, 'Temperature change detected');
       await this.synchronizeTemperatures();
     }
 
     await this.saveState();
-    console.log(`✅ Coordinator: Polling complete at ${new Date().toISOString()}`);
+    logger.debug('✅ Coordinator: Polling complete');
   }
 
   private async synchronizeTemperatures(): Promise<void> {
@@ -277,7 +303,7 @@ export class Coordinator {
       return;
     }
 
-    console.log(`Synchronizing all devices to ${targetTemp}°F in ${currentMode} mode`);
+    logger.info({ targetTemp, mode: currentMode }, 'Synchronizing all devices to temperature');
 
     const promises = this.state.pairedDevices.map(async (deviceId) => {
       try {
@@ -286,23 +312,30 @@ export class Coordinator {
           await this.changeTemperature(deviceId, targetTemp);
         }
       } catch (error) {
-        console.error(`Error synchronizing temperature for device ${deviceId}:`, error);
+        logger.error({ err: error, deviceId }, 'Error synchronizing temperature for device');
       }
     });
 
     await Promise.allSettled(promises);
   }
 
+  /**
+   * Changes the temperature setpoint for a specific device.
+   * Converts auto mode to cool. Does not work in off mode.
+   * @param deviceId - Device to update
+   * @param temperature - Target temperature in Fahrenheit
+   * @returns true if successful, false otherwise
+   */
   async changeTemperature(deviceId: string, temperature: number): Promise<boolean> {
     const currentState = this.state.deviceStates.get(deviceId);
     if (!currentState) {
-      console.error(`Cannot change temperature: No state found for device ${deviceId}`);
+      logger.error({ deviceId }, 'Cannot change temperature: No state found for device');
       return false;
     }
 
     const mode = currentState.mode === 'auto' ? 'cool' : currentState.mode;
     if (mode === 'off') {
-      console.warn(`Cannot set temperature for device ${deviceId}: mode is 'off'`);
+      logger.warn({ deviceId }, 'Cannot set temperature for device: mode is off');
       return false;
     }
 
@@ -318,6 +351,13 @@ export class Coordinator {
     return success;
   }
 
+  /**
+   * Changes the operating mode for a specific device.
+   * If mode is heat/cool, synchronizes all other ON devices to the same mode.
+   * @param deviceId - Device to update
+   * @param mode - Target mode (heat, cool, auto, or off)
+   * @returns true if successful, false otherwise
+   */
   async changeMode(deviceId: string, mode: 'heat' | 'cool' | 'auto' | 'off'): Promise<boolean> {
     const success = await this.api.setMode(deviceId, mode);
 
@@ -341,7 +381,7 @@ export class Coordinator {
       return;
     }
 
-    console.log(`Synchronizing all ON devices to ${newMode} mode`);
+    logger.info({ mode: newMode }, 'Synchronizing all ON devices to mode');
 
     const promises = this.state.pairedDevices.map(async (deviceId) => {
       try {
@@ -357,7 +397,7 @@ export class Coordinator {
           await this.hapServer.updateDeviceState(deviceId, currentState);
         }
       } catch (error) {
-        console.error(`Error synchronizing mode for device ${deviceId}:`, error);
+        logger.error({ err: error, deviceId }, 'Error synchronizing mode for device');
       }
     });
 
@@ -365,10 +405,18 @@ export class Coordinator {
     this.state.currentMode = newMode;
   }
 
+  /**
+   * Returns a copy of all device states.
+   * @returns Map of device IDs to their current states
+   */
   getDeviceStates(): Map<string, DeviceState> {
     return new Map(this.state.deviceStates);
   }
 
+  /**
+   * Returns a copy of the complete coordinator state.
+   * @returns Coordinator state including paired devices, average temp, mode, and device states
+   */
   getState(): CoordinatorState {
     return {
       ...this.state,
@@ -376,26 +424,35 @@ export class Coordinator {
     };
   }
 
+  /**
+   * Retrieves all devices from SmartThings API.
+   * @returns Array of unified devices, or empty array if no auth or error
+   */
   async getDevices(): Promise<UnifiedDevice[]> {
     if (!this.api.hasAuth()) {
-      console.warn('Cannot get devices: No SmartThings authentication');
+      logger.warn('Cannot get devices: No SmartThings authentication');
       return [];
     }
 
     try {
       return await this.api.getDevices(this.state.pairedDevices);
     } catch (error) {
-      console.error('Error getting unified devices:', error);
+      logger.error({ err: error }, 'Error getting unified devices');
       return [];
     }
   }
 
+  /**
+   * Handles thermostat events from HomeKit and updates SmartThings.
+   * Called when user changes temperature or mode in Home app.
+   * @param event - Thermostat event containing device ID, type, and values
+   */
   async handleHAPThermostatEvent(event: HAPThermostatEvent): Promise<void> {
-    console.log(`Handling HAP thermostat event for device ${event.deviceId}:`, event);
+    logger.info({ deviceId: event.deviceId, eventType: event.type }, 'Handling HAP thermostat event');
 
     const currentState = this.state.deviceStates.get(event.deviceId);
     if (!currentState) {
-      console.error(`No state found for device ${event.deviceId}`);
+      logger.error({ deviceId: event.deviceId }, 'No state found for device');
       return;
     }
 
@@ -412,7 +469,7 @@ export class Coordinator {
         }
       }
     } catch (error) {
-      console.error(`Error handling Matter event for device ${event.deviceId}:`, error);
+      logger.error({ err: error, deviceId: event.deviceId }, 'Error handling thermostat event');
     }
   }
 
@@ -420,7 +477,7 @@ export class Coordinator {
     try {
       const status = await this.api.getDeviceStatus(device.deviceId);
       if (!status) {
-        console.error(`No status returned for device ${device.name}`);
+        logger.error({ deviceName: device.name }, 'No status returned for device');
         return null;
       }
 
@@ -436,16 +493,20 @@ export class Coordinator {
         coolingSetpoint: status.coolingSetpoint,
       };
     } catch (error) {
-      console.error(`Failed to get device state for ${device.name}:`, error);
+      logger.error({ err: error, deviceName: device.name }, 'Failed to get device state');
       return null;
     }
   }
 
+  /**
+   * Stops the coordinator polling task.
+   * Call this when shutting down the application.
+   */
   stop(): void {
     if (this.pollTask) {
       this.pollTask.stop();
       this.pollTask = null;
-      console.log('Coordinator polling stopped');
+      logger.info('Coordinator polling stopped');
     }
   }
 }

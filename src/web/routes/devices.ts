@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { Coordinator } from '@/coordinator/Coordinator';
+import { logger } from '@/utils/logger';
 
 export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinator): Router {
   const router = Router();
@@ -14,7 +15,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
       const devices = await coordinator.getDevices();
       res.json(devices);
     } catch (error) {
-      console.error('Error fetching devices:', error);
+      logger.error({ err: error }, 'Error fetching devices');
       res.status(500).json({ error: 'Failed to fetch devices' });
     }
   });
@@ -34,14 +35,19 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         isHVAC: Object.values(device.thermostatCapabilities).some(Boolean)
       }));
 
-      console.log(`Found ${devices.length} filtered devices:`);
+      logger.debug({ count: devices.length }, 'Found filtered devices');
       devicesWithAnalysis.forEach(device => {
-        console.log(`- ${device.name}: ${device.capabilityIds.join(', ')} (HVAC: ${device.isHVAC}) (Paired: ${device.isPaired})`);
+        logger.debug({
+          name: device.name,
+          capabilities: device.capabilityIds,
+          isHVAC: device.isHVAC,
+          isPaired: device.isPaired
+        }, `Device: ${device.name}`);
       });
 
       res.json(devicesWithAnalysis);
     } catch (error) {
-      console.error('Error fetching all devices:', error);
+      logger.error({ err: error }, 'Error fetching all devices');
       res.status(500).json({ error: 'Failed to fetch all devices' });
     }
   });
@@ -71,7 +77,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         currentMode: state.currentMode,
       });
     } catch (error) {
-      console.error('Error fetching paired devices:', error);
+      logger.error({ err: error }, 'Error fetching paired devices');
       res.status(500).json({ error: 'Failed to fetch paired devices' });
     }
   });
@@ -96,7 +102,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
           : new Date(deviceState.lastUpdated).toISOString(),
       });
     } catch (error) {
-      console.error(`Error fetching device ${req.params.deviceId}:`, error);
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Error fetching device');
       res.status(500).json({ error: 'Failed to fetch device' });
     }
   });
@@ -122,7 +128,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         res.status(500).json({ error: 'Failed to change temperature' });
       }
     } catch (error) {
-      console.error(`Error changing temperature for device ${req.params.deviceId}:`, error);
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Error changing temperature');
       res.status(500).json({ error: 'Failed to change temperature' });
     }
   });
@@ -148,7 +154,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         res.status(500).json({ error: 'Failed to change mode' });
       }
     } catch (error) {
-      console.error(`Error changing mode for device ${req.params.deviceId}:`, error);
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Error changing mode');
       res.status(500).json({ error: 'Failed to change mode' });
     }
   });
@@ -168,7 +174,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         res.status(500).json({ error: 'Failed to turn on light' });
       }
     } catch (error) {
-      console.error(`Error turning on light for device ${req.params.deviceId}:`, error);
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Error turning on light');
       res.status(500).json({ error: 'Failed to turn on light' });
     }
   });
@@ -188,7 +194,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         res.status(500).json({ error: 'Failed to turn off light' });
       }
     } catch (error) {
-      console.error(`Error turning off light for device ${req.params.deviceId}:`, error);
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Error turning off light');
       res.status(500).json({ error: 'Failed to turn off light' });
     }
   });
@@ -202,7 +208,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
       await coordinator.reloadDevices();
       res.json({ success: true });
     } catch (error) {
-      console.error('Error reloading devices:', error);
+      logger.error({ err: error }, 'Error reloading devices');
       res.status(500).json({ error: 'Failed to reload devices' });
     }
   });

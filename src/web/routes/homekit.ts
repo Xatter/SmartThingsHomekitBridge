@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
+import { logger } from '@/utils/logger';
 
 export function createHomeKitRoutes(hapServer: SmartThingsHAPServer): Router {
   const router = Router();
@@ -8,10 +9,12 @@ export function createHomeKitRoutes(hapServer: SmartThingsHAPServer): Router {
     try {
       const qrCode = hapServer.getQrCode();
       const pairingCode = hapServer.getPairingCode();
+      const isPaired = hapServer.isPaired();
 
       res.json({
         qrCode,
         pairingCode,
+        isPaired,
         instructions: {
           homekit: [
             'Open the Home app on your iOS device',
@@ -23,7 +26,7 @@ export function createHomeKitRoutes(hapServer: SmartThingsHAPServer): Router {
         }
       });
     } catch (error) {
-      console.error('Error getting HomeKit pairing info:', error);
+      logger.error({ err: error }, 'Error getting HomeKit pairing info');
       res.status(500).json({ error: 'Failed to get pairing information' });
     }
   });
@@ -39,8 +42,22 @@ export function createHomeKitRoutes(hapServer: SmartThingsHAPServer): Router {
         pairingCode,
       });
     } catch (error) {
-      console.error('Error getting HomeKit status:', error);
+      logger.error({ err: error }, 'Error getting HomeKit status');
       res.status(500).json({ error: 'Failed to get HomeKit status' });
+    }
+  });
+
+  router.post('/reset-pairing', async (req: Request, res: Response) => {
+    try {
+      logger.info('Pairing reset requested via API');
+      await hapServer.resetPairing();
+      res.json({
+        success: true,
+        message: 'HomeKit pairing reset initiated. The bridge will restart shortly.'
+      });
+    } catch (error) {
+      logger.error({ err: error }, 'Error resetting HomeKit pairing');
+      res.status(500).json({ error: 'Failed to reset HomeKit pairing' });
     }
   });
 

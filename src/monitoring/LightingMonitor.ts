@@ -1,5 +1,6 @@
 import * as cron from 'node-cron';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
+import { logger } from '@/utils/logger';
 
 export class LightingMonitor {
   private readonly api: SmartThingsAPI;
@@ -22,37 +23,36 @@ export class LightingMonitor {
 
   setDevices(deviceIds: string[]): void {
     this.monitoredDevices = [...deviceIds];
-    console.log(`LightingMonitor set to monitor ${deviceIds.length} devices:`, deviceIds);
+    logger.info({ count: deviceIds.length, deviceIds }, 'LightingMonitor set to monitor devices');
 
     // If we now have devices and the monitor was previously started but stopped due to no devices,
     // or if the task exists but needs to restart with new devices, restart it
     if (deviceIds.length > 0) {
-      console.log('LightingMonitor: Devices updated, restarting monitor...');
+      logger.debug('LightingMonitor: Devices updated, restarting monitor');
       this.start();
     } else if (this.task) {
-      console.log('LightingMonitor: No devices to monitor, stopping monitor');
+      logger.info('LightingMonitor: No devices to monitor, stopping monitor');
       this.stop();
     }
   }
 
   start(): void {
-    console.log('LightingMonitor: start() method called');
+    logger.debug('LightingMonitor: start() method called');
 
     if (this.task) {
-      console.log('LightingMonitor: Stopping existing task before starting new one');
+      logger.debug('LightingMonitor: Stopping existing task before starting new one');
       this.stop();
     }
 
     if (this.monitoredDevices.length === 0) {
-      console.log('LightingMonitor: No devices to monitor');
+      logger.info('LightingMonitor: No devices to monitor');
       return;
     }
 
-    console.log(`Starting LightingMonitor with interval: ${this.interval}`);
-    console.log(`LightingMonitor: Will monitor ${this.monitoredDevices.length} devices`);
+    logger.info({ interval: this.interval, deviceCount: this.monitoredDevices.length }, 'Starting LightingMonitor');
 
     this.task = cron.schedule(this.interval, async () => {
-      console.log(`[${new Date().toISOString()}] LightingMonitor cron triggered`);
+      logger.debug('LightingMonitor cron triggered');
       await this.checkAndTurnOffLights();
     }, {
       scheduled: false,
@@ -60,12 +60,12 @@ export class LightingMonitor {
     });
 
     this.task.start();
-    console.log(`LightingMonitor started with cron pattern: ${this.interval}`);
+    logger.info({ cronPattern: this.interval }, 'LightingMonitor started');
 
     // Immediately run a check on start
-    console.log('LightingMonitor: Running initial light check...');
+    logger.debug('LightingMonitor: Running initial light check');
     this.checkAndTurnOffLights().catch(error => {
-      console.error('LightingMonitor: Error in initial light check:', error);
+      logger.error({ err: error }, 'LightingMonitor: Error in initial light check');
     });
   }
 
@@ -73,41 +73,41 @@ export class LightingMonitor {
     if (this.task) {
       this.task.stop();
       this.task = null;
-      console.log('LightingMonitor stopped');
+      logger.info('LightingMonitor stopped');
     }
   }
 
   private async checkAndTurnOffLights(): Promise<void> {
     if (!this.api.hasAuth()) {
-      console.warn('LightingMonitor: No SmartThings authentication available');
+      logger.warn('LightingMonitor: No SmartThings authentication available');
       return;
     }
 
-    console.log(`LightingMonitor: Checking ${this.monitoredDevices.length} devices for lights`);
+    logger.debug({ deviceCount: this.monitoredDevices.length }, 'LightingMonitor: Checking devices for lights');
 
     const promises = this.monitoredDevices.map(async (deviceId) => {
       try {
         const deviceState = await this.api.getDeviceStatus(deviceId);
 
         if (!deviceState) {
-          console.warn(`LightingMonitor: Could not get status for device ${deviceId}`);
+          logger.warn({ deviceId }, 'LightingMonitor: Could not get status for device');
           return;
         }
 
         if (deviceState.lightOn) {
-          console.log(`LightingMonitor: Light is ON for device ${deviceState.name} (${deviceId}), turning off`);
+          logger.info({ deviceId, deviceName: deviceState.name }, 'LightingMonitor: Light is ON, turning off');
           const success = await this.api.turnLightOff(deviceId);
 
           if (success) {
-            console.log(`LightingMonitor: Successfully turned off light for ${deviceState.name}`);
+            logger.info({ deviceName: deviceState.name }, 'LightingMonitor: Successfully turned off light');
           } else {
-            console.error(`LightingMonitor: Failed to turn off light for ${deviceState.name}`);
+            logger.error({ deviceName: deviceState.name }, 'LightingMonitor: Failed to turn off light');
           }
         } else {
-          console.log(`LightingMonitor: Light is already OFF for device ${deviceState.name} (${deviceId})`);
+          logger.debug({ deviceId, deviceName: deviceState.name }, 'LightingMonitor: Light is already OFF');
         }
       } catch (error) {
-        console.error(`LightingMonitor: Error checking device ${deviceId}:`, error);
+        logger.error({ err: error, deviceId }, 'LightingMonitor: Error checking device');
       }
     });
 
@@ -119,27 +119,27 @@ export class LightingMonitor {
       const deviceState = await this.api.getDeviceStatus(deviceId);
 
       if (!deviceState) {
-        console.warn(`LightingMonitor: Could not get status for device ${deviceId}`);
+        logger.warn({ deviceId }, 'LightingMonitor: Could not get status for device');
         return false;
       }
 
       if (deviceState.lightOn) {
-        console.log(`LightingMonitor: Manual check - Light is ON for device ${deviceState.name} (${deviceId}), turning off`);
+        logger.info({ deviceId, deviceName: deviceState.name }, 'LightingMonitor: Manual check - Light is ON, turning off');
         const success = await this.api.turnLightOff(deviceId);
 
         if (success) {
-          console.log(`LightingMonitor: Successfully turned off light for ${deviceState.name}`);
+          logger.info({ deviceName: deviceState.name }, 'LightingMonitor: Successfully turned off light');
           return true;
         } else {
-          console.error(`LightingMonitor: Failed to turn off light for ${deviceState.name}`);
+          logger.error({ deviceName: deviceState.name }, 'LightingMonitor: Failed to turn off light');
           return false;
         }
       } else {
-        console.log(`LightingMonitor: Manual check - Light is already OFF for device ${deviceState.name} (${deviceId})`);
+        logger.debug({ deviceId, deviceName: deviceState.name }, 'LightingMonitor: Manual check - Light is already OFF');
         return true;
       }
     } catch (error) {
-      console.error(`LightingMonitor: Error in manual check for device ${deviceId}:`, error);
+      logger.error({ err: error, deviceId }, 'LightingMonitor: Error in manual check for device');
       return false;
     }
   }

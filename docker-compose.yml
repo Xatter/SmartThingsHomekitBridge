@@ -5,29 +5,27 @@ services:
     build: .
     container_name: smartthings-homekit-bridge
     restart: unless-stopped
-    ports:
-      - "3000:3000"    # Web interface
-      - "5353:5353/udp" # mDNS for HomeKit discovery
+    # Use host networking for HomeKit/mDNS to work properly
+    # This allows the HAP server to be discovered and connected to by iOS devices
+    network_mode: host
     environment:
       - NODE_ENV=production
       # SmartThings credentials (set these in .env file)
       - SMARTTHINGS_CLIENT_ID=${SMARTTHINGS_CLIENT_ID}
       - SMARTTHINGS_CLIENT_SECRET=${SMARTTHINGS_CLIENT_SECRET}
       - SMARTTHINGS_REDIRECT_URI=${SMARTTHINGS_REDIRECT_URI:-http://localhost:3000/auth/callback}
+      # HAP_PORT: Use 52826 to avoid conflict with Homebridge (which uses 51826)
+      - HAP_PORT=${HAP_PORT:-52826}
     volumes:
       # Persist HomeKit pairing data
       - homekit_data:/app/homekit
       # Optional: bind mount for configuration
       - ./config:/app/config:ro
-    networks:
-      - bridge_network
-    # Enable host networking for better mDNS support
-    # network_mode: host  # Uncomment if you have HomeKit discovery issues
+    # Note: ports section is not used with network_mode: host
+    # The container will use the host's network directly
+    # Web interface: http://localhost:3000
+    # HAP server: port 52826 (default, configurable via HAP_PORT)
 
 volumes:
   homekit_data:
     driver: local
-
-networks:
-  bridge_network:
-    driver: bridge

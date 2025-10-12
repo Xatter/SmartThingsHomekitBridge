@@ -3,6 +3,7 @@ import { DeviceState } from '@/types';
 import * as QRCode from 'qrcode';
 import { v4 as uuid } from 'uuid';
 import * as path from 'path';
+import { logger } from '@/utils/logger';
 import { promises as fs } from 'fs';
 import { AccessoryCache, CachedAccessory } from './AccessoryCache';
 
@@ -27,6 +28,10 @@ export interface HAPThermostatEvent {
   temperature?: number;
 }
 
+/**
+ * HomeKit Accessory Protocol server that bridges SmartThings devices to HomeKit.
+ * Manages device lifecycle, state synchronization, and HomeKit pairing.
+ */
 export class SmartThingsHAPServer {
   private coordinator: Coordinator | null = null;
   private bridge: Bridge | null = null;
@@ -47,6 +52,11 @@ export class SmartThingsHAPServer {
     state: DeviceState;
   }>();
 
+  /**
+   * Creates a new HAP server instance.
+   * @param port - HomeKit bridge port (default: 51826)
+   * @param pincode - HomeKit pairing PIN (format: XXX-XX-XXX)
+   */
   constructor(port: number = 51826, pincode: string = '942-37-286') {
     this.port = port;
     this.pincode = pincode;
@@ -54,15 +64,20 @@ export class SmartThingsHAPServer {
     this.accessoryCache = new AccessoryCache(persistPath);
   }
 
+  /**
+   * Initializes the HAP bridge and sets up persistence.
+   * Must be called before start().
+   * @param coordinator - Coordinator instance for handling device events
+   */
   async initialize(coordinator: Coordinator): Promise<void> {
     this.coordinator = coordinator;
 
     try {
-      console.log('HAP server initializing...');
+      logger.info('HAP server initializing...');
 
       // Set up HAP-NodeJS storage path to persist accessory data
       const persistPath = process.env.HAP_PERSIST_PATH || path.join(process.cwd(), 'persist');
-      console.log(`📁 Setting HAP storage path to: ${persistPath}`);
+      logger.info(`📁 Setting HAP storage path to: ${persistPath}`);
       HAPStorage.setCustomStoragePath(persistPath);
 
       // Create the bridge accessory with a consistent UUID
@@ -71,7 +86,7 @@ export class SmartThingsHAPServer {
 
       // Listen for unpair event to clean up when removed from HomeKit
       this.bridge.on('unpaired' as any, () => {
-        console.log('🔓 Bridge unpaired from HomeKit - cleaning up persistence');
+        logger.info('🔓 Bridge unpaired from HomeKit - cleaning up persistence');
         this.handleUnpaired();
       });
 
@@ -85,16 +100,16 @@ export class SmartThingsHAPServer {
 
       // QR code will be generated after bridge is published
 
-      console.log('✅ HAP server initialized successfully');
-      console.log(`🏠 HomeKit Bridge: Port ${this.port}`);
-      console.log(`🔗 HomeKit Pairing Information:`);
-      console.log(`   QR Code: Available in web interface`);
-      console.log(`   Setup Code: ${this.setupCode}`);
-      console.log(`   PIN: ${this.pincode}`);
-      console.log('🎉 Ready for HomeKit pairing!');
+      logger.info('✅ HAP server initialized successfully');
+      logger.info(`🏠 HomeKit Bridge: Port ${this.port}`);
+      logger.info(`🔗 HomeKit Pairing Information:`);
+      logger.info(`   QR Code: Available in web interface`);
+      logger.info(`   Setup Code: ${this.setupCode}`);
+      logger.info(`   PIN: ${this.pincode}`);
+      logger.info('🎉 Ready for HomeKit pairing!');
     } catch (error) {
-      console.error('❌ Error initializing HAP server:', error);
-      console.error('💥 Cannot operate without functioning HomeKit protocol - terminating');
+      logger.error({ err: error }, '❌ Error initializing HAP server');
+      logger.error('💥 Cannot operate without functioning HomeKit protocol - terminating');
       throw error;
     }
   }
@@ -108,11 +123,16 @@ export class SmartThingsHAPServer {
       // For now, set a placeholder
       this.qrCode = null;
     } catch (error) {
-      console.error('Error generating QR code:', error);
+      logger.error({ err: error }, 'Error generating QR code');
       this.qrCode = null;
     }
   }
 
+  /**
+   * Publishes the HAP bridge and makes it discoverable for HomeKit pairing.
+   * Restores cached accessories from previous sessions before publishing.
+   * @throws {Error} If bridge not initialized via initialize()
+   */
   async start(): Promise<void> {
     if (!this.bridge) {
       throw new Error('Bridge not initialized');
@@ -127,30 +147,31 @@ export class SmartThingsHAPServer {
       const bridgeUsername = process.env.HAP_BRIDGE_USERNAME || 'CC:22:3D:E3:CE:F6';
 
       // Publish the bridge to make it discoverable
-      console.log(`📡 Publishing bridge with username: ${bridgeUsername}`);
-      console.log(`   Accessories in bridge: ${this.bridge.bridgedAccessories.length}`);
+      logger.info(`📡 Publishing bridge with username: ${bridgeUsername}`);
+      logger.info(`   Accessories in bridge: ${this.bridge.bridgedAccessories.length}`);
 
       this.bridge.publish({
         username: bridgeUsername,
         port: this.port,
         pincode: this.pincode,
-        category: Categories.BRIDGE
-      });
+        category: Categories.BRIDGE,
+        bind: '0.0.0.0' // Bind to all network interfaces, not just localhost
+      } as any);
 
       // Add listener to detect configuration changes
       this.bridge.on('advertised' as any, () => {
-        console.log('🔔 Bridge advertised event fired');
+        logger.info('🔔 Bridge advertised event fired');
       });
 
       // Check if bridge has any event emitters we can listen to
-      console.log(`   Bridge published successfully`);
+      logger.info(`   Bridge published successfully`);
 
       // Generate QR code after bridge is published
       await this.generateQrCodeAfterPublish();
 
-      console.log('🌐 HAP Bridge published and ready for pairing');
+      logger.info('🌐 HAP Bridge published and ready for pairing');
     } catch (error) {
-      console.error('❌ Error starting HAP server:', error);
+      logger.error({ err: error }, '❌ Error starting HAP server');
       throw error;
     }
   }
@@ -158,12 +179,13 @@ export class SmartThingsHAPServer {
   private async restoreCachedAccessories(): Promise<void> {
     const cachedAccessories = await this.accessoryCache.load();
     if (cachedAccessories.length === 0) {
-      console.log('📭 No cached accessories to restore');
+      logger.info('📭 No cached accessories to restore');
       return;
     }
 
-    console.log(`🔄 Restoring ${cachedAccessories.length} cached accessories...`);
+    logger.info(`🔄 Restoring ${cachedAccessories.length} cached accessories...`);
     const accessories: Accessory[] = [];
+    const setupPromises: Promise<void>[] = [];
 
     for (const cached of cachedAccessories) {
       // Create unique display name by adding last 4 chars of device ID if names are duplicated
@@ -182,7 +204,7 @@ export class SmartThingsHAPServer {
       // Add Identify handler - required for HomeKit to properly manage the accessory
       infoService.getCharacteristic(Characteristic.Identify)
         .on('set', (value: CharacteristicValue, callback: CharacteristicSetCallback) => {
-          console.log(`🔍 HomeKit IDENTIFY request for ${cached.name}`);
+          logger.info(`🔍 HomeKit IDENTIFY request for ${cached.name}`);
           callback();
         });
 
@@ -202,10 +224,12 @@ export class SmartThingsHAPServer {
 
       // IMPORTANT: Set up characteristics with event handlers NOW
       // This is critical - without these handlers, HomeKit can't interact with the accessory
-      this.setupThermostatCharacteristics(thermostatService, cached.deviceId, defaultState)
+      // FIX: Collect the promise so we can await ALL setups before publishing
+      const setupPromise = this.setupThermostatCharacteristics(thermostatService, cached.deviceId, defaultState)
         .catch(error => {
-          console.error(`Failed to setup characteristics for ${cached.name}:`, error);
+          logger.error({ name: cached.name, err: error }, 'Failed to setup characteristics');
         });
+      setupPromises.push(setupPromise);
 
       // Store the device reference
       this.devices.set(cached.deviceId, {
@@ -225,23 +249,28 @@ export class SmartThingsHAPServer {
       accessories.push(accessory);
     }
 
+    // CRITICAL FIX: Wait for ALL characteristic setups to complete before proceeding
+    logger.info(`⏳ Waiting for ${setupPromises.length} characteristic setups to complete...`);
+    await Promise.all(setupPromises);
+    logger.info(`✅ All characteristic setups completed`);
+
     // Add all accessories to the bridge at once
     if (accessories.length > 0 && this.bridge) {
-      console.log(`🔧 Adding ${accessories.length} accessories to bridge...`);
+      logger.info(`🔧 Adding ${accessories.length} accessories to bridge...`);
 
       // Log current bridge state
-      console.log(`   Bridge info before adding accessories:`);
-      console.log(`   - Bridged accessories count: ${this.bridge.bridgedAccessories.length}`);
+      logger.info(`   Bridge info before adding accessories:`);
+      logger.info(`   - Bridged accessories count: ${this.bridge.bridgedAccessories.length}`);
 
       this.bridge.addBridgedAccessories(accessories);
       this.hasRestoredAccessories = true;
 
-      console.log(`✅ Restored ${accessories.length} accessories to bridge`);
-      console.log(`   - Bridged accessories count after: ${this.bridge.bridgedAccessories.length}`);
+      logger.info(`✅ Restored ${accessories.length} accessories to bridge`);
+      logger.info(`   - Bridged accessories count after: ${this.bridge.bridgedAccessories.length}`);
 
       // Log accessory details
       accessories.forEach(acc => {
-        console.log(`   - Accessory: ${acc.displayName} (UUID: ${acc.UUID})`);
+        logger.info(`   - Accessory: ${acc.displayName} (UUID: ${acc.UUID})`);
       });
     }
   }
@@ -253,6 +282,9 @@ export class SmartThingsHAPServer {
       // Get the setup URI from the published bridge
       const setupURI = this.bridge.setupURI();
 
+      // Log the setup URI for debugging
+      logger.info({ setupURI, port: this.port, pincode: this.pincode }, '📱 Generated HomeKit Setup URI');
+
       this.qrCode = await QRCode.toString(setupURI, {
         type: 'svg',
         width: 256,
@@ -262,32 +294,48 @@ export class SmartThingsHAPServer {
           light: '#FFFFFF'
         }
       });
+
+      logger.info('✅ QR code generated successfully');
     } catch (error) {
-      console.error('Error generating QR code after publish:', error);
+      logger.error({ err: error }, 'Error generating QR code after publish');
       this.qrCode = null;
     }
   }
 
+  /**
+   * Returns the QR code SVG for HomeKit pairing.
+   * @returns SVG string or null if bridge not yet published
+   */
   getQrCode(): string | null {
     return this.qrCode;
   }
 
+  /**
+   * Returns the HomeKit pairing setup code.
+   * @returns Setup code string or null if not available
+   */
   getPairingCode(): string | null {
     return this.setupCode;
   }
 
+  /**
+   * Adds a SmartThings device to the HomeKit bridge as a thermostat accessory.
+   * If device already exists, updates its state instead. Caches accessory for persistence.
+   * @param deviceId - Unique SmartThings device identifier
+   * @param deviceState - Current device state (temperature, mode, etc.)
+   */
   async addDevice(deviceId: string, deviceState: DeviceState): Promise<void> {
-    console.log(`HAP: Processing device ${deviceState.name} (${deviceId})`);
+    logger.info(`HAP: Processing device ${deviceState.name} (${deviceId})`);
 
     if (!this.bridge) {
-      console.error('❌ Cannot add device - HAP bridge not initialized');
+      logger.error('❌ Cannot add device - HAP bridge not initialized');
       return;
     }
 
     // Check if device already exists in our tracking
     const existingDevice = this.devices.get(deviceId);
     if (existingDevice) {
-      console.log(`📋 HAP: Device ${deviceState.name} already tracked`);
+      logger.info(`📋 HAP: Device ${deviceState.name} already tracked`);
 
       // Just update the state, characteristics were already set up during restore
       await this.updateDeviceState(deviceId, deviceState);
@@ -296,7 +344,7 @@ export class SmartThingsHAPServer {
 
     // Check if this is a cached accessory that wasn't restored (shouldn't happen normally)
     if (this.accessoryCache.has(deviceId)) {
-      console.log(`⚠️  HAP: Device ${deviceState.name} is cached but wasn't restored`);
+      logger.info(`⚠️  HAP: Device ${deviceState.name} is cached but wasn't restored`);
       return;
     }
 
@@ -323,7 +371,7 @@ export class SmartThingsHAPServer {
       // Add Identify handler
       infoService.getCharacteristic(Characteristic.Identify)
         .on('set', (value: CharacteristicValue, callback: CharacteristicSetCallback) => {
-          console.log(`🔍 HomeKit IDENTIFY request for ${deviceState.name}`);
+          logger.info(`🔍 HomeKit IDENTIFY request for ${deviceState.name}`);
           callback();
         });
 
@@ -359,10 +407,14 @@ export class SmartThingsHAPServer {
         firmwareRevision
       });
 
-      console.log(`✅ HAP: Thermostat device ${deviceState.name} added to bridge and cached`);
-      console.log(`   Initial state: ${deviceState.currentTemperature}°F, setpoint: ${deviceState.temperatureSetpoint}°F, mode: ${deviceState.mode}`);
+      logger.info({
+        name: deviceState.name,
+        currentTemp: deviceState.currentTemperature,
+        setpoint: deviceState.temperatureSetpoint,
+        mode: deviceState.mode
+      }, '✅ HAP: Thermostat device added to bridge and cached');
     } catch (error) {
-      console.error(`❌ Failed to add device ${deviceState.name}:`, error);
+      logger.error({ name: deviceState.name, err: error }, '❌ Failed to add device');
       throw error;
     }
   }
@@ -372,8 +424,13 @@ export class SmartThingsHAPServer {
     deviceId: string,
     deviceState: DeviceState
   ): Promise<void> {
-    console.log(`⚙️  Setting up characteristics for ${deviceState.name} (${deviceId})`);
-    console.log(`   State: temp=${deviceState.currentTemperature}°F, setpoint=${deviceState.temperatureSetpoint}°F, mode=${deviceState.mode}`);
+    logger.info({
+      name: deviceState.name,
+      deviceId,
+      currentTemp: deviceState.currentTemperature,
+      setpoint: deviceState.temperatureSetpoint,
+      mode: deviceState.mode
+    }, '⚙️  Setting up characteristics');
     // Current Temperature (read-only)
     thermostatService
       .getCharacteristic(Characteristic.CurrentTemperature)
@@ -395,18 +452,18 @@ export class SmartThingsHAPServer {
       })
       .setValue(this.fahrenheitToCelsius(safeTargetSetpoint))
       .on('set', (value: CharacteristicValue, callback: CharacteristicSetCallback) => {
-        console.log(`🏠 HomeKit SET TargetTemperature for ${deviceId}: ${value}°C`);
+        logger.info(`🏠 HomeKit SET TargetTemperature for ${deviceId}: ${value}°C`);
         this.handleTargetTemperatureChange(deviceId, value as number, callback);
       })
       .on('get', (callback: CharacteristicGetCallback) => {
-        console.log(`🏠 HomeKit GET TargetTemperature for ${deviceId}`);
+        logger.info(`🏠 HomeKit GET TargetTemperature for ${deviceId}`);
         const device = this.devices.get(deviceId);
         if (device) {
           const temp = this.fahrenheitToCelsius(device.state.temperatureSetpoint);
-          console.log(`   Returning: ${temp}°C (${device.state.temperatureSetpoint}°F)`);
+          logger.info(`   Returning: ${temp}°C (${device.state.temperatureSetpoint}°F)`);
           callback(null, temp);
         } else {
-          console.log(`   ❌ Device not found!`);
+          logger.info(`   ❌ Device not found!`);
           callback(new Error('Device not found'));
         }
       });
@@ -421,18 +478,18 @@ export class SmartThingsHAPServer {
       .getCharacteristic(Characteristic.TargetHeatingCoolingState)
       .setValue(this.mapModeToTargetState(deviceState.mode))
       .on('set', (value: CharacteristicValue, callback: CharacteristicSetCallback) => {
-        console.log(`🏠 HomeKit SET TargetHeatingCoolingState for ${deviceId}: ${value}`);
+        logger.info(`🏠 HomeKit SET TargetHeatingCoolingState for ${deviceId}: ${value}`);
         this.handleTargetModeChange(deviceId, value as number, callback);
       })
       .on('get', (callback: CharacteristicGetCallback) => {
-        console.log(`🏠 HomeKit GET TargetHeatingCoolingState for ${deviceId}`);
+        logger.info(`🏠 HomeKit GET TargetHeatingCoolingState for ${deviceId}`);
         const device = this.devices.get(deviceId);
         if (device) {
           const mode = this.mapModeToTargetState(device.state.mode);
-          console.log(`   Returning: ${mode} (${device.state.mode})`);
+          logger.info(`   Returning: ${mode} (${device.state.mode})`);
           callback(null, mode);
         } else {
-          console.log(`   ❌ Device not found!`);
+          logger.info(`   ❌ Device not found!`);
           callback(new Error('Device not found'));
         }
       });
@@ -459,7 +516,7 @@ export class SmartThingsHAPServer {
     callback: CharacteristicSetCallback
   ): Promise<void> {
     const fahrenheitValue = this.celsiusToFahrenheit(celsiusValue);
-    console.log(`HAP: Target temperature change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
+    logger.info(`HAP: Target temperature change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
 
     // Update our local state immediately
     const device = this.devices.get(deviceId);
@@ -477,7 +534,7 @@ export class SmartThingsHAPServer {
         type: 'temperature',
         temperature: Math.round(fahrenheitValue)
       }).catch(error => {
-        console.error(`Error updating SmartThings for ${deviceId}:`, error);
+        logger.error({ deviceId, err: error }, 'Error updating SmartThings');
       });
     }
   }
@@ -488,7 +545,7 @@ export class SmartThingsHAPServer {
     callback: CharacteristicSetCallback
   ): Promise<void> {
     const mode = this.mapTargetStateToMode(hapMode);
-    console.log(`HAP: Target mode change for ${deviceId}: ${mode}`);
+    logger.info(`HAP: Target mode change for ${deviceId}: ${mode}`);
 
     // Update our local state immediately
     const device = this.devices.get(deviceId);
@@ -512,7 +569,7 @@ export class SmartThingsHAPServer {
         type: 'mode',
         mode: mode
       }).catch(error => {
-        console.error(`Error updating SmartThings for ${deviceId}:`, error);
+        logger.error({ deviceId, err: error }, 'Error updating SmartThings');
       });
     }
   }
@@ -524,7 +581,7 @@ export class SmartThingsHAPServer {
   ): Promise<void> {
     try {
       const fahrenheitValue = this.celsiusToFahrenheit(celsiusValue);
-      console.log(`HAP: Cooling threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
+      logger.info(`HAP: Cooling threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
 
       if (this.coordinator) {
         await this.coordinator.handleHAPThermostatEvent({
@@ -536,7 +593,7 @@ export class SmartThingsHAPServer {
 
       callback();
     } catch (error) {
-      console.error(`Error handling cooling threshold change for ${deviceId}:`, error);
+      logger.error({ deviceId, err: error }, 'Error handling cooling threshold change');
       callback(error as Error);
     }
   }
@@ -548,7 +605,7 @@ export class SmartThingsHAPServer {
   ): Promise<void> {
     try {
       const fahrenheitValue = this.celsiusToFahrenheit(celsiusValue);
-      console.log(`HAP: Heating threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
+      logger.info(`HAP: Heating threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
 
       if (this.coordinator) {
         await this.coordinator.handleHAPThermostatEvent({
@@ -560,15 +617,21 @@ export class SmartThingsHAPServer {
 
       callback();
     } catch (error) {
-      console.error(`Error handling heating threshold change for ${deviceId}:`, error);
+      logger.error({ deviceId, err: error }, 'Error handling heating threshold change');
       callback(error as Error);
     }
   }
 
+  /**
+   * Updates HomeKit characteristics when SmartThings device state changes.
+   * Includes cooldown period to prevent excessive updates.
+   * @param deviceId - Device to update
+   * @param deviceState - New device state
+   */
   async updateDeviceState(deviceId: string, deviceState: DeviceState): Promise<void> {
     const device = this.devices.get(deviceId);
     if (!device) {
-      console.warn(`HAP: Device ${deviceId} not found for state update`);
+      logger.warn(`HAP: Device ${deviceId} not found for state update`);
       return;
     }
 
@@ -576,13 +639,13 @@ export class SmartThingsHAPServer {
     const lastUpdate = this.lastUpdateTime.get(deviceId) || 0;
     const now = Date.now();
     if (now - lastUpdate < this.UPDATE_COOLDOWN_MS) {
-      console.log(`⏸️  HAP: Skipping update for ${deviceState.name} - cooldown period (${now - lastUpdate}ms since last update)`);
+      logger.info(`⏸️  HAP: Skipping update for ${deviceState.name} - cooldown period (${now - lastUpdate}ms since last update)`);
       return;
     }
 
     try {
-      console.log(`🔄 HAP: updateDeviceState called for ${deviceState.name} (${deviceId})`);
-      console.log(`   Caller stack: ${new Error().stack?.split('\n')[2]?.trim()}`);
+      logger.info(`🔄 HAP: updateDeviceState called for ${deviceState.name} (${deviceId})`);
+      logger.info(`   Caller stack: ${new Error().stack?.split('\n')[2]?.trim()}`);
 
       // Check if values actually changed
       const oldState = device.state;
@@ -591,11 +654,11 @@ export class SmartThingsHAPServer {
       const modeChanged = oldState.mode !== deviceState.mode;
 
       if (!tempChanged && !setpointChanged && !modeChanged) {
-        console.log(`   No changes detected, skipping update`);
+        logger.info({ deviceId }, '   No changes detected, skipping update');
         return;
       }
 
-      console.log(`   Changes detected: temp=${tempChanged}, setpoint=${setpointChanged}, mode=${modeChanged}`);
+      logger.info({ deviceId, tempChanged, setpointChanged, modeChanged }, '   Changes detected');
       this.lastUpdateTime.set(deviceId, now);
 
       // Update characteristics if values have changed
@@ -604,7 +667,7 @@ export class SmartThingsHAPServer {
       // Update current temperature
       if (tempChanged) {
         const newTemp = this.fahrenheitToCelsius(deviceState.currentTemperature);
-        console.log(`   Updating CurrentTemperature: ${oldState.currentTemperature}°F -> ${deviceState.currentTemperature}°F (${newTemp}°C)`);
+        logger.info(`   Updating CurrentTemperature: ${oldState.currentTemperature}°F -> ${deviceState.currentTemperature}°F (${newTemp}°C)`);
         service
           .getCharacteristic(Characteristic.CurrentTemperature)
           .updateValue(newTemp);
@@ -613,7 +676,7 @@ export class SmartThingsHAPServer {
       // Update target temperature
       if (setpointChanged) {
         const newSetpoint = this.fahrenheitToCelsius(deviceState.temperatureSetpoint);
-        console.log(`   Updating TargetTemperature: ${oldState.temperatureSetpoint}°F -> ${deviceState.temperatureSetpoint}°F (${newSetpoint}°C)`);
+        logger.info(`   Updating TargetTemperature: ${oldState.temperatureSetpoint}°F -> ${deviceState.temperatureSetpoint}°F (${newSetpoint}°C)`);
         service
           .getCharacteristic(Characteristic.TargetTemperature)
           .updateValue(newSetpoint);
@@ -623,7 +686,12 @@ export class SmartThingsHAPServer {
       if (modeChanged) {
         const currentState = this.mapModeToCurrentState(deviceState.mode);
         const targetState = this.mapModeToTargetState(deviceState.mode);
-        console.log(`   Updating HeatingCoolingState: ${oldState.mode} -> ${deviceState.mode} (current=${currentState}, target=${targetState})`);
+        logger.info({
+          oldMode: oldState.mode,
+          newMode: deviceState.mode,
+          currentState,
+          targetState
+        }, '   Updating HeatingCoolingState');
 
         service
           .getCharacteristic(Characteristic.CurrentHeatingCoolingState)
@@ -638,26 +706,30 @@ export class SmartThingsHAPServer {
       // Update stored state
       device.state = deviceState;
 
-      console.log(`✅ HAP: Updated device state for ${deviceState.name}`);
+      logger.info({ name: deviceState.name }, '✅ HAP: Updated device state');
     } catch (error) {
-      console.error(`❌ Failed to update HAP device state for ${deviceState.name}:`, error);
+      logger.error({ name: deviceState.name, err: error }, '❌ Failed to update HAP device state');
     }
   }
 
+  /**
+   * Removes a device from the HomeKit bridge and clears it from cache.
+   * @param deviceId - Device to remove
+   */
   async removeDevice(deviceId: string): Promise<void> {
     const device = this.devices.get(deviceId);
     if (device && this.bridge) {
       try {
         this.bridge.removeBridgedAccessory(device.accessory);
-        console.log(`✅ HAP: Device ${deviceId} removed from bridge`);
+        logger.info({ deviceId }, '✅ HAP: Device removed from bridge');
       } catch (error) {
-        console.error(`Error removing device ${deviceId} from HAP bridge:`, error);
+        logger.error({ deviceId, err: error }, 'Error removing device from HAP bridge');
       }
     }
 
     this.devices.delete(deviceId);
     await this.accessoryCache.remove(deviceId);
-    console.log(`✅ HAP: Device ${deviceId} removed from tracking and cache`);
+    logger.info(`✅ HAP: Device ${deviceId} removed from tracking and cache`);
   }
 
   // Temperature conversion methods
@@ -717,6 +789,10 @@ export class SmartThingsHAPServer {
     }
   }
 
+  /**
+   * Returns current state of all devices managed by this HAP server.
+   * @returns Map of device IDs to their current states
+   */
   getDeviceStates(): Map<string, DeviceState> {
     const states = new Map<string, DeviceState>();
     for (const [deviceId, device] of this.devices) {
@@ -726,7 +802,9 @@ export class SmartThingsHAPServer {
   }
 
   /**
-   * Get list of currently bridged device IDs
+   * Returns set of device IDs currently bridged to HomeKit.
+   * Checks both internal tracking and bridge accessories.
+   * @returns Set of device IDs
    */
   getBridgedDeviceIds(): Set<string> {
     const deviceIds = new Set<string>();
@@ -765,15 +843,15 @@ export class SmartThingsHAPServer {
 
   private async handleUnpaired(): Promise<void> {
     try {
-      console.log('🧹 Cleaning up after unpair...');
+      logger.info('🧹 Cleaning up after unpair...');
 
       // Clear the cached accessories
       await this.accessoryCache.save([]);
-      console.log('   ✓ Cleared cached accessories');
+      logger.info('   ✓ Cleared cached accessories');
 
       // Clear the devices map
       this.devices.clear();
-      console.log('   ✓ Cleared device map');
+      logger.info('   ✓ Cleared device map');
 
       // Delete persistence files to allow re-pairing
       const persistPath = process.env.HAP_PERSIST_PATH || path.join(process.cwd(), 'persist');
@@ -783,53 +861,91 @@ export class SmartThingsHAPServer {
       try {
         // Delete AccessoryInfo file
         await fs.unlink(path.join(persistPath, `AccessoryInfo.${cleanUsername}.json`));
-        console.log('   ✓ Deleted AccessoryInfo');
+        logger.info('   ✓ Deleted AccessoryInfo');
       } catch (error) {
-        console.log('   - AccessoryInfo already deleted or not found');
+        logger.info('   - AccessoryInfo already deleted or not found');
       }
 
       try {
         // Delete IdentifierCache file
         await fs.unlink(path.join(persistPath, `IdentifierCache.${cleanUsername}.json`));
-        console.log('   ✓ Deleted IdentifierCache');
+        logger.info('   ✓ Deleted IdentifierCache');
       } catch (error) {
-        console.log('   - IdentifierCache already deleted or not found');
+        logger.info('   - IdentifierCache already deleted or not found');
       }
 
-      console.log('✅ Bridge is ready to be re-paired');
+      logger.info('✅ Bridge is ready to be re-paired');
 
       // Restart the bridge to reinitialize
-      console.log('🔄 Restarting bridge...');
+      logger.info('🔄 Restarting bridge...');
       if (this.bridge) {
         this.bridge.unpublish();
       }
 
       // Give it a moment before restarting
       setTimeout(() => {
-        console.log('♻️ Reinitializing bridge for fresh pairing...');
+        logger.info('♻️ Reinitializing bridge for fresh pairing...');
         this.initialize(this.coordinator!).then(() => {
           this.start().catch(error => {
-            console.error('Error restarting bridge after unpair:', error);
+            logger.error({ err: error }, 'Error restarting bridge after unpair');
           });
         });
       }, 2000);
 
     } catch (error) {
-      console.error('Error handling unpair:', error);
+      logger.error({ err: error }, 'Error handling unpair');
     }
   }
 
+  /**
+   * Manually resets the HomeKit pairing by clearing all cached accessories,
+   * deleting persistence files, and reinitializing the bridge.
+   * This is useful when you want to force a fresh pairing without using the Home app.
+   */
+  async resetPairing(): Promise<void> {
+    logger.info('🔄 Manual pairing reset requested');
+    await this.handleUnpaired();
+  }
+
+  /**
+   * Checks if the bridge is currently paired with any HomeKit controllers.
+   * @returns true if paired, false otherwise
+   */
+  isPaired(): boolean {
+    if (!this.bridge) {
+      return false;
+    }
+
+    // Check if there are any paired controllers
+    // HAP-NodeJS stores paired controllers in the AccessoryInfo
+    try {
+      const accessoryInfo = (this.bridge as any)._accessoryInfo;
+      if (accessoryInfo) {
+        const pairedClients = accessoryInfo.pairedClients || {};
+        return Object.keys(pairedClients).length > 0;
+      }
+    } catch (error) {
+      logger.error({ err: error }, 'Error checking pairing status');
+    }
+
+    return false;
+  }
+
+  /**
+   * Unpublishes the HAP bridge and stops the server.
+   * Makes the bridge no longer discoverable in HomeKit.
+   */
   async stop(): Promise<void> {
     if (this.bridge) {
       try {
         this.bridge.unpublish();
-        console.log('HAP bridge unpublished');
+        logger.info('HAP bridge unpublished');
       } catch (error) {
-        console.error('Error unpublishing HAP bridge:', error);
+        logger.error({ err: error }, 'Error unpublishing HAP bridge');
       }
       this.bridge = null;
     }
 
-    console.log('HAP server stopped');
+    logger.info('HAP server stopped');
   }
 }

@@ -1,7 +1,10 @@
 # Use Node.js 18 LTS as base image
 FROM node:18-alpine
 
-# Install timezone data for proper cron operation and su-exec for entrypoint
+# Install dependencies:
+# - tzdata: timezone data for proper cron operation
+# - su-exec: for entrypoint user switching
+# Note: mDNS/Avahi not needed with host networking - uses host's network stack
 RUN apk add --no-cache tzdata su-exec
 
 # Set working directory
@@ -36,12 +39,14 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # Note: We don't switch to USER smartthings here
 # The entrypoint will fix volume permissions and then switch to smartthings user
 
-# Expose port 3000 for web interface
+# Expose ports for web interface and HomeKit
+# Note: Port 52826 is used to avoid conflict with Homebridge (51826)
 EXPOSE 3000
+EXPOSE 52826
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3000/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
 
 # Set entrypoint to handle permissions
 ENTRYPOINT ["docker-entrypoint.sh"]

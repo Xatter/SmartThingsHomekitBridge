@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { SmartThingsAuthToken } from '@/types';
+import { logger } from '@/utils/logger';
+import { withRetry } from '@/utils/retry';
 
 export function createAuthRoutes(auth: SmartThingsAuthentication, onAuthSuccess?: () => void): Router {
   const router = Router();
@@ -23,38 +25,34 @@ export function createAuthRoutes(auth: SmartThingsAuthentication, onAuthSuccess?
   });
 
   router.get('/smartthings/callback', async (req: Request, res: Response) => {
-    console.log('===== OAUTH CALLBACK HANDLER EXECUTED =====');
-    console.log('🔄 OAuth callback received');
-    console.log('Query params:', req.query);
-    console.log('Session:', req.session);
+    logger.debug({ query: req.query, hasSession: !!req.session }, '🔄 OAuth callback received');
 
     try {
       const { code, state, error } = req.query;
 
       if (error) {
-        console.error('❌ OAuth error:', error);
+        logger.error({ error }, '❌ OAuth error');
         return res.redirect('/setup?error=oauth_error');
       }
 
       if (!code || !state) {
-        console.error('❌ Missing code or state in callback');
-        console.log('Code:', code, 'State:', state);
+        logger.error({ code: !!code, state: !!state }, '❌ Missing code or state in callback');
         return res.redirect('/setup?error=missing_params');
       }
 
       const sessionState = req.session && (req.session as any).oauthState;
-      console.log('State comparison - URL:', state, 'Session:', sessionState);
+      logger.debug({ urlState: state, sessionState }, 'State comparison');
 
       if (state !== sessionState) {
-        console.error('❌ OAuth state mismatch');
+        logger.error('❌ OAuth state mismatch');
         return res.redirect('/setup?error=state_mismatch');
       }
 
-      console.log('🔄 Exchanging authorization code for access token');
-      console.log('Environment check:');
-      console.log('- CLIENT_ID:', process.env.SMARTTHINGS_CLIENT_ID ? '✅' : '❌');
-      console.log('- CLIENT_SECRET:', process.env.SMARTTHINGS_CLIENT_SECRET ? '✅' : '❌');
-      console.log('- REDIRECT_URI:', process.env.SMARTTHINGS_REDIRECT_URI);
+      logger.info({
+        hasClientId: !!process.env.SMARTTHINGS_CLIENT_ID,
+        hasClientSecret: !!process.env.SMARTTHINGS_CLIENT_SECRET,
+        redirectUri: process.env.SMARTTHINGS_REDIRECT_URI
+      }, '🔄 Exchanging authorization code for access token');
 
       const tokenRequestBody = new URLSearchParams({
         grant_type: 'authorization_code',
@@ -66,30 +64,34 @@ export function createAuthRoutes(auth: SmartThingsAuthentication, onAuthSuccess?
         `${process.env.SMARTTHINGS_CLIENT_ID}:${process.env.SMARTTHINGS_CLIENT_SECRET}`
       ).toString('base64');
 
-      console.log('Token request body:', tokenRequestBody.toString());
-      console.log('Using Basic Auth for client credentials');
+      logger.debug('Using Basic Auth for client credentials');
 
-      const tokenResponse = await fetch('https://api.smartthings.com/oauth/token', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Authorization': `Basic ${clientCredentials}`,
-        },
-        body: tokenRequestBody,
-      });
+      const tokenResponse = await withRetry(
+        () => fetch('https://api.smartthings.com/oauth/token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': `Basic ${clientCredentials}`,
+          },
+          body: tokenRequestBody,
+        }),
+        { maxRetries: 3, operationName: 'exchange OAuth authorization code' }
+      );
 
-      console.log('Token response status:', tokenResponse.status);
+      logger.debug({ status: tokenResponse.status }, 'Token response received');
 
       if (!tokenResponse.ok) {
         const errorText = await tokenResponse.text();
-        console.error('❌ Token exchange failed - Status:', tokenResponse.status);
-        console.error('❌ Error response body:', errorText);
-        console.error('❌ Response headers:', Object.fromEntries(tokenResponse.headers.entries()));
+        logger.error({
+          status: tokenResponse.status,
+          errorText,
+          headers: Object.fromEntries(tokenResponse.headers.entries())
+        }, '❌ Token exchange failed');
         return res.redirect('/setup?error=token_exchange_failed');
       }
 
       const tokenData: any = await tokenResponse.json();
-      console.log('✅ Token response received:', tokenData);
+      logger.info('✅ Token response received');
 
       const authToken: SmartThingsAuthToken = {
         access_token: tokenData.access_token,
@@ -99,34 +101,33 @@ export function createAuthRoutes(auth: SmartThingsAuthentication, onAuthSuccess?
         scope: tokenData.scope,
       };
 
-      console.log('💾 Saving auth token...');
+      logger.debug('💾 Saving auth token');
       await auth.save(authToken);
-      console.log('✅ Auth token saved successfully');
+      logger.info('✅ Auth token saved successfully');
 
-      console.log('🎉 Calling onAuthSuccess callback...');
+      logger.debug('🎉 Calling onAuthSuccess callback');
       if (onAuthSuccess) {
         onAuthSuccess();
       }
 
-      console.log('↩️ Redirecting to /setup?success=true');
+      logger.info('↩️ Redirecting to /setup?success=true');
       res.redirect('/setup?success=true');
     } catch (error) {
-      console.error('OAuth callback error:', error);
+      logger.error({ err: error }, 'OAuth callback error');
       res.redirect('/setup?error=callback_error');
     }
   });
 
   router.get('/status', (req: Request, res: Response) => {
-    console.log('🔍 Auth status check');
     const hasAuth = auth.hasAuth();
     const token = auth.getToken();
 
-    console.log('- Has auth:', hasAuth);
-    console.log('- Token exists:', !!token);
-    if (token) {
-      console.log('- Token expires at:', new Date(token.expires_at));
-      console.log('- Token scope:', token.scope);
-    }
+    logger.debug({
+      hasAuth,
+      hasToken: !!token,
+      expiresAt: token ? new Date(token.expires_at) : null,
+      scope: token?.scope
+    }, '🔍 Auth status check');
 
     res.json({
       authenticated: hasAuth,
@@ -142,7 +143,7 @@ export function createAuthRoutes(auth: SmartThingsAuthentication, onAuthSuccess?
       auth.clear();
       res.json({ success: true });
     } catch (error) {
-      console.error('Logout error:', error);
+      logger.error({ err: error }, 'Logout error');
       res.status(500).json({ error: 'Failed to logout' });
     }
   });
