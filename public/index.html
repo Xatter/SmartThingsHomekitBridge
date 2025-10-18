@@ -636,8 +636,10 @@
         }
 
         function DeviceCard({ device, onControl }) {
-            const [localTemp, setLocalTemp] = useState(device.temperatureSetpoint);
-            const [localMode, setLocalMode] = useState(device.mode);
+            const internal = device.internal || device;
+            const smartThings = device.smartThings;
+            const [localTemp, setLocalTemp] = useState(internal.temperatureSetpoint);
+            const [localMode, setLocalMode] = useState(internal.mode);
 
             const handleTempChange = async (delta) => {
                 const newTemp = localTemp + delta;
@@ -681,17 +683,55 @@
             return (
                 <div className="device-card">
                     <div className="device-name">{device.name}</div>
+                    {device.isEnrolledInAutoMode && (
+                        <div style={{
+                            fontSize: '0.8rem',
+                            color: '#34c759',
+                            fontWeight: '600',
+                            marginBottom: '8px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px'
+                        }}>
+                            🤖 Auto Mode Enrolled
+                        </div>
+                    )}
 
-                    <div className="device-info">
-                        <div className="temperature">{Math.round(device.currentTemperature)}°F</div>
-                        <div className={`mode ${localMode}`}>
-                            {localMode.toUpperCase()}
+                    <div style={{marginBottom: '16px', padding: '12px', background: '#f5f5f7', borderRadius: '8px'}}>
+                        <div style={{fontSize: '0.9rem', fontWeight: '600', marginBottom: '8px', color: '#007aff'}}>
+                            HomeKit/Internal
+                        </div>
+                        <div className="device-info">
+                            <div className="temperature">{Math.round(internal.currentTemperature)}°F</div>
+                            <div className={`mode ${internal.mode}`}>
+                                {internal.mode.toUpperCase()}
+                            </div>
+                        </div>
+                        <div style={{fontSize: '0.85rem', color: '#6e6e73', marginTop: '4px'}}>
+                            Set to: {internal.temperatureSetpoint}°F
                         </div>
                     </div>
 
+                    {smartThings && (
+                        <div style={{marginBottom: '16px', padding: '12px', background: '#fff3e0', borderRadius: '8px'}}>
+                            <div style={{fontSize: '0.9rem', fontWeight: '600', marginBottom: '8px', color: '#ff9500'}}>
+                                SmartThings/Device
+                            </div>
+                            <div className="device-info">
+                                <div className="temperature">{Math.round(smartThings.currentTemperature)}°F</div>
+                                <div className={`mode ${smartThings.mode}`}>
+                                    {smartThings.mode.toUpperCase()}
+                                </div>
+                            </div>
+                            <div style={{fontSize: '0.85rem', color: '#6e6e73', marginTop: '4px'}}>
+                                Set to: {smartThings.temperatureSetpoint}°F
+                            </div>
+                        </div>
+                    )}
+
                     <div style={{textAlign: 'center', marginBottom: '16px'}}>
-                        <div style={{fontSize: '1.1rem', marginBottom: '8px'}}>
-                            Set to: {localTemp}°F
+                        <div style={{fontSize: '0.9rem', color: '#6e6e73', marginBottom: '8px'}}>
+                            Adjust Temperature
                         </div>
                         <div style={{display: 'flex', justifyContent: 'center', gap: '8px'}}>
                             <button
@@ -700,6 +740,7 @@
                             >
                                 -
                             </button>
+                            <span style={{lineHeight: '32px', fontWeight: '600'}}>{localTemp}°F</span>
                             <button
                                 className="control-button"
                                 onClick={() => handleTempChange(1)}

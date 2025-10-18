@@ -55,18 +55,59 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
     }
   });
 
-  router.get('/paired', (req: Request, res: Response) => {
+  router.get('/paired', async (req: Request, res: Response) => {
     try {
       const state = coordinator.getState();
-      const pairedDevicesWithState = Array.from(state.deviceStates.entries())
-        .filter(([deviceId, deviceState]) => !deviceState.name.toLowerCase().includes('ecobee'))
-        .map(([deviceId, deviceState]) => ({
-          ...deviceState,
-          id: deviceId,
-          lastUpdated: deviceState.lastUpdated instanceof Date
-            ? deviceState.lastUpdated.toISOString()
-            : new Date(deviceState.lastUpdated).toISOString(),
-        }));
+      const autoController = coordinator.getAutoModeController();
+      const enrolledDeviceIds = autoController.getEnrolledDeviceIds();
+
+      // Fetch actual SmartThings API state for all devices
+      const devicesWithBothStates = await Promise.all(
+        Array.from(state.deviceStates.entries())
+          .filter(([deviceId, deviceState]) => !deviceState.name.toLowerCase().includes('ecobee'))
+          .map(async ([deviceId, internalState]) => {
+            // Fetch actual state from SmartThings API
+            let smartThingsState = null;
+            if (api.hasAuth()) {
+              try {
+                smartThingsState = await api.getDeviceStatus(deviceId);
+              } catch (error) {
+                logger.warn({ deviceId, err: error }, 'Failed to fetch SmartThings state for device');
+              }
+            }
+
+            return {
+              id: deviceId,
+              name: internalState.name,
+              // Internal state (what HomeKit sees)
+              internal: {
+                mode: internalState.mode,
+                currentTemperature: internalState.currentTemperature,
+                temperatureSetpoint: internalState.temperatureSetpoint,
+                heatingSetpoint: internalState.heatingSetpoint,
+                coolingSetpoint: internalState.coolingSetpoint,
+                lightOn: internalState.lightOn,
+                lastUpdated: internalState.lastUpdated instanceof Date
+                  ? internalState.lastUpdated.toISOString()
+                  : new Date(internalState.lastUpdated).toISOString(),
+              },
+              // Actual SmartThings API state (what the device is really doing)
+              smartThings: smartThingsState ? {
+                mode: smartThingsState.mode,
+                currentTemperature: smartThingsState.currentTemperature,
+                temperatureSetpoint: smartThingsState.temperatureSetpoint,
+                heatingSetpoint: smartThingsState.heatingSetpoint,
+                coolingSetpoint: smartThingsState.coolingSetpoint,
+                lightOn: smartThingsState.lightOn,
+                lastUpdated: smartThingsState.lastUpdated instanceof Date
+                  ? smartThingsState.lastUpdated.toISOString()
+                  : new Date(smartThingsState.lastUpdated).toISOString(),
+              } : null,
+              // Auto mode enrollment status
+              isEnrolledInAutoMode: enrolledDeviceIds.includes(deviceId),
+            };
+          })
+      );
 
       const filteredPairedDevices = state.pairedDevices.filter(deviceId => {
         const deviceState = state.deviceStates.get(deviceId);
@@ -75,7 +116,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
 
       res.json({
         pairedDevices: filteredPairedDevices,
-        deviceStates: pairedDevicesWithState,
+        deviceStates: devicesWithBothStates,
         averageTemperature: state.averageTemperature,
         currentMode: state.currentMode,
       });
