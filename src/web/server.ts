@@ -6,6 +6,7 @@ import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { Coordinator } from '@/coordinator/Coordinator';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
+import { PluginManager } from '@/plugins';
 import { createAuthRoutes } from './routes/auth';
 import { createDevicesRoutes } from './routes/devices';
 import { createHomeKitRoutes } from './routes/homekit';
@@ -47,11 +48,37 @@ export class WebServer {
     api: SmartThingsAPI,
     coordinator: Coordinator,
     hapServer: SmartThingsHAPServer,
-    onAuthSuccess?: () => void
+    onAuthSuccess?: () => void,
+    pluginManager?: PluginManager
   ): void {
     this.app.use('/api/auth', createAuthRoutes(auth, onAuthSuccess));
     this.app.use('/api/devices', createDevicesRoutes(api, coordinator));
     this.app.use('/api/homekit', createHomeKitRoutes(hapServer));
+
+    // Register plugin routes
+    if (pluginManager) {
+      const pluginRoutes = pluginManager.getAllWebRoutes();
+      for (const [pluginName, routes] of pluginRoutes) {
+        const router = express.Router();
+        for (const route of routes) {
+          router.get(route.path, route.handler);
+          router.post(route.path, route.handler);
+        }
+        this.app.use(`/api/plugins/${pluginName}`, router);
+        logger.info({ plugin: pluginName, routeCount: routes.length }, 'Registered plugin routes');
+      }
+
+      // Plugin list endpoint
+      this.app.get('/api/plugins', (req, res) => {
+        const plugins = pluginManager.getPlugins().map(loaded => ({
+          name: loaded.plugin.name,
+          version: loaded.plugin.version,
+          description: loaded.plugin.description,
+          source: loaded.metadata.source,
+        }));
+        res.json(plugins);
+      });
+    }
 
     this.app.get('/api/health', (req, res) => {
       res.json({

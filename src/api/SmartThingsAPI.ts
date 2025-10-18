@@ -636,4 +636,42 @@ export class SmartThingsAPI {
       return hasStandardThermostat(caps) || hasSamsungAC(caps);
     });
   }
+
+  /**
+   * Execute multiple commands on a device.
+   * Generic method for plugins to execute arbitrary commands.
+   *
+   * @param deviceId - Device to control
+   * @param commands - Array of commands to execute
+   * @returns Promise that resolves when commands are executed
+   */
+  async executeCommands(deviceId: string, commands: Array<{
+    component: string;
+    capability: string;
+    command: string;
+    arguments?: any[];
+  }>): Promise<void> {
+    const client = await this.getClient();
+    if (!client) {
+      throw new Error('No SmartThings client available');
+    }
+
+    try {
+      for (const cmd of commands) {
+        await withRetry(
+          () => client.devices.executeCommand(deviceId, {
+            component: cmd.component,
+            capability: cmd.capability,
+            command: cmd.command,
+            arguments: cmd.arguments || [],
+          }),
+          { maxRetries: 3, initialDelayMs: 1000 }
+        );
+        logger.debug({ deviceId, command: cmd }, 'Executed command');
+      }
+    } catch (error) {
+      logger.error({ err: error, deviceId, commands }, 'Error executing commands');
+      throw error;
+    }
+  }
 }

@@ -26,6 +26,8 @@ export interface HAPThermostatEvent {
   type: 'temperature' | 'mode' | 'both';
   mode?: 'heat' | 'cool' | 'auto' | 'off';
   temperature?: number;
+  heatingSetpoint?: number;
+  coolingSetpoint?: number;
 }
 
 /**
@@ -530,11 +532,11 @@ export class SmartThingsHAPServer {
 
     // Handle SmartThings update asynchronously (don't await)
     if (this.coordinator) {
-      this.coordinator.handleHAPThermostatEvent({
+      this.coordinator.handleThermostatEvent({
         deviceId,
         type: 'temperature',
         temperature: Math.round(fahrenheitValue)
-      }).catch(error => {
+      }).catch((error: any) => {
         logger.error({ deviceId, err: error }, 'Error updating SmartThings');
       });
     }
@@ -565,11 +567,11 @@ export class SmartThingsHAPServer {
 
     // Handle SmartThings update asynchronously (don't await)
     if (this.coordinator) {
-      this.coordinator.handleHAPThermostatEvent({
+      this.coordinator.handleThermostatEvent({
         deviceId,
         type: 'mode',
         mode: mode
-      }).catch(error => {
+      }).catch((error: any) => {
         logger.error({ deviceId, err: error }, 'Error updating SmartThings');
       });
     }
@@ -585,7 +587,7 @@ export class SmartThingsHAPServer {
       logger.info(`HAP: Cooling threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
 
       if (this.coordinator) {
-        await this.coordinator.handleHAPThermostatEvent({
+        await this.coordinator.handleThermostatEvent({
           deviceId,
           type: 'temperature',
           temperature: Math.round(fahrenheitValue)
@@ -609,7 +611,7 @@ export class SmartThingsHAPServer {
       logger.info(`HAP: Heating threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
 
       if (this.coordinator) {
-        await this.coordinator.handleHAPThermostatEvent({
+        await this.coordinator.handleThermostatEvent({
           deviceId,
           type: 'temperature',
           temperature: Math.round(fahrenheitValue)

@@ -58,8 +58,9 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
   router.get('/paired', async (req: Request, res: Response) => {
     try {
       const state = coordinator.getState();
-      const autoController = coordinator.getAutoModeController();
-      const enrolledDeviceIds = autoController.getEnrolledDeviceIds();
+      // Auto-mode controller is now in the HVAC plugin
+      // Access via /api/plugins/hvac-auto-mode/status instead
+      const enrolledDeviceIds: string[] = [];
 
       // Fetch actual SmartThings API state for all devices
       const devicesWithBothStates = await Promise.all(
@@ -164,7 +165,18 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         return res.status(400).json({ error: 'Invalid temperature value' });
       }
 
-      const success = await coordinator.changeTemperature(deviceId, temperature);
+      // Get current device state to determine mode
+      const deviceState = coordinator.getDeviceState(deviceId);
+      if (!deviceState) {
+        return res.status(404).json({ error: 'Device not found' });
+      }
+
+      const mode = deviceState.mode === 'auto' ? 'cool' : deviceState.mode;
+      if (mode === 'off') {
+        return res.status(400).json({ error: 'Cannot set temperature when device is off' });
+      }
+
+      const success = await api.setTemperature(deviceId, temperature, mode as 'heat' | 'cool');
 
       if (success) {
         res.json({ success: true, temperature });
@@ -190,7 +202,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         return res.status(400).json({ error: 'Invalid mode value' });
       }
 
-      const success = await coordinator.changeMode(deviceId, mode);
+      const success = await api.setMode(deviceId, mode);
 
       if (success) {
         res.json({ success: true, mode });
@@ -257,88 +269,14 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
     }
   });
 
-  // Auto-mode controller status
+  // Auto-mode routes have been moved to the HVAC plugin
+  // Access them at /api/plugins/hvac-auto-mode/status and /api/plugins/hvac-auto-mode/decision
   router.get('/auto-mode/status', (req: Request, res: Response) => {
-    try {
-      const autoController = coordinator.getAutoModeController();
-      const status = autoController.getStatus();
-      res.json(status);
-    } catch (error) {
-      console.error('Error fetching auto-mode status:', error);
-      res.status(500).json({ error: 'Failed to fetch auto-mode status' });
-    }
+    res.redirect(307, '/api/plugins/hvac-auto-mode/status');
   });
 
-  // Auto-mode decision with demand calculations
   router.get('/auto-mode/decision', (req: Request, res: Response) => {
-    try {
-      const autoController = coordinator.getAutoModeController();
-      const state = coordinator.getState();
-      const enrolledIds = autoController.getEnrolledDeviceIds();
-
-      if (enrolledIds.length === 0) {
-        return res.json({
-          enrolled: false,
-          decision: null,
-          message: 'No devices enrolled in auto mode'
-        });
-      }
-
-      // Gather device information for evaluation
-      const autoModeDevices = enrolledIds
-        .map(deviceId => {
-          const deviceState = state.deviceStates.get(deviceId);
-          if (!deviceState) return null;
-
-          const lowerBound = deviceState.heatingSetpoint || (deviceState.temperatureSetpoint - DEFAULT_TEMP_BAND_MARGIN);
-          const upperBound = deviceState.coolingSetpoint || (deviceState.temperatureSetpoint + DEFAULT_TEMP_BAND_MARGIN);
-
-          return {
-            id: deviceId,
-            name: deviceState.name,
-            currentTemperature: deviceState.currentTemperature,
-            lowerBound,
-            upperBound,
-            weight: 1.0,
-          };
-        })
-        .filter(device => device !== null);
-
-      if (autoModeDevices.length === 0) {
-        return res.json({
-          enrolled: true,
-          deviceCount: enrolledIds.length,
-          decision: null,
-          message: 'Enrolled devices have no valid state'
-        });
-      }
-
-      const decision = autoController.evaluate(autoModeDevices);
-      res.json({
-        enrolled: true,
-        deviceCount: enrolledIds.length,
-        enrolledDeviceIds: enrolledIds,
-        decision: {
-          mode: decision.mode,
-          totalHeatDemand: decision.totalHeatDemand,
-          totalCoolDemand: decision.totalCoolDemand,
-          reason: decision.reason,
-          switchSuppressed: decision.switchSuppressed,
-          secondsUntilSwitchAllowed: decision.secondsUntilSwitchAllowed,
-          deviceDemands: decision.deviceDemands.map(d => ({
-            deviceId: d.deviceId,
-            deviceName: d.deviceName,
-            heatDemand: d.heatDemand,
-            coolDemand: d.coolDemand,
-            rawHeatDelta: d.rawHeatDelta,
-            rawCoolDelta: d.rawCoolDelta,
-          })),
-        },
-      });
-    } catch (error) {
-      console.error('Error fetching auto-mode decision:', error);
-      res.status(500).json({ error: 'Failed to fetch auto-mode decision' });
-    }
+    res.redirect(307, '/api/plugins/hvac-auto-mode/decision');
   });
 
   return router;
