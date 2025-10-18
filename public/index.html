@@ -638,8 +638,10 @@
         function DeviceCard({ device, onControl }) {
             const internal = device.internal || device;
             const smartThings = device.smartThings;
-            const [localTemp, setLocalTemp] = useState(internal.temperatureSetpoint);
-            const [localMode, setLocalMode] = useState(internal.mode);
+            // Controls should reflect SmartThings state (actual device state), not internal/HomeKit state
+            const controlState = smartThings || internal;
+            const [localTemp, setLocalTemp] = useState(controlState.temperatureSetpoint);
+            const [localMode, setLocalMode] = useState(controlState.mode);
 
             const handleTempChange = async (delta) => {
                 const newTemp = localTemp + delta;
