@@ -190,13 +190,24 @@ export class Coordinator {
         const deviceState = await this.api.getDeviceStatus(deviceId);
         if (deviceState) {
           const previousState = this.state.deviceStates.get(deviceId);
-          this.state.deviceStates.set(deviceId, deviceState);
+
+          // Check if device is enrolled in auto mode
+          const isAutoMode = this.autoModeController.getEnrolledDeviceIds().includes(deviceId);
+
+          // If in auto mode, preserve the 'auto' mode for HomeKit
+          // (SmartThings reports the actual mode, but we want to show 'auto' in HomeKit)
+          const stateForHomeKit = isAutoMode
+            ? { ...deviceState, mode: 'auto' as const }
+            : deviceState;
+
+          // Store the state with preserved mode
+          this.state.deviceStates.set(deviceId, stateForHomeKit);
 
           // Update HAP if state changed
           if (previousState) {
             const tempDiff = Math.abs(previousState.currentTemperature - deviceState.currentTemperature);
             const setpointDiff = Math.abs(previousState.temperatureSetpoint - deviceState.temperatureSetpoint);
-            const modeChanged = previousState.mode !== deviceState.mode;
+            const modeChanged = previousState.mode !== stateForHomeKit.mode;
 
             const stateChanged = modeChanged || setpointDiff > 0.5 || tempDiff > 0.5;
 
@@ -205,15 +216,16 @@ export class Coordinator {
                 deviceName: deviceState.name,
                 tempDiff: tempDiff.toFixed(1),
                 setpointDiff: setpointDiff.toFixed(1),
-                modeChange: modeChanged ? `${previousState.mode} -> ${deviceState.mode}` : 'unchanged'
+                modeChange: modeChanged ? `${previousState.mode} -> ${stateForHomeKit.mode}` : 'unchanged',
+                autoMode: isAutoMode
               }, '📈 State change detected');
-              await this.hapServer.updateDeviceState(deviceId, deviceState);
+              await this.hapServer.updateDeviceState(deviceId, stateForHomeKit);
             } else {
               logger.debug({ deviceName: deviceState.name }, 'No significant changes');
             }
           } else {
             logger.debug({ deviceName: deviceState.name }, 'First state update');
-            await this.hapServer.updateDeviceState(deviceId, deviceState);
+            await this.hapServer.updateDeviceState(deviceId, stateForHomeKit);
           }
         }
       } catch (error) {

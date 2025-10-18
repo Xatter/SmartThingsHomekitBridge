@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import path from 'path';
+import * as cron from 'node-cron';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { LightingMonitor } from '@/monitoring/LightingMonitor';
@@ -40,6 +41,16 @@ async function startup(): Promise<void> {
     await smartThingsAuth.load();
 
     const smartThingsAPI = new SmartThingsAPI(smartThingsAuth);
+
+    // Schedule proactive token refresh every hour
+    logger.info('🔐 Starting proactive token refresh scheduler (runs hourly)');
+    const tokenRefreshTask = cron.schedule('0 * * * *', async () => {
+      logger.debug('⏰ Running scheduled token refresh check');
+      await smartThingsAuth.checkAndRefreshToken();
+    }, {
+      scheduled: true,
+      timezone: 'UTC'
+    });
 
     const lightingMonitor = new LightingMonitor(smartThingsAPI, lightingInterval);
 
@@ -107,6 +118,7 @@ async function startup(): Promise<void> {
       logger.info({ signal }, '🛑 Received signal, shutting down gracefully...');
 
       try {
+        tokenRefreshTask.stop();
         coordinator.stop();
         lightingMonitor.stop();
         await hapServer.stop();

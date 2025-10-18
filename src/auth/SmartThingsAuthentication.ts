@@ -120,6 +120,31 @@ export class SmartThingsAuthentication {
     return Date.now() >= (this.token.expires_at - bufferTime);
   }
 
+  /**
+   * Checks if token should be proactively refreshed.
+   * Uses a longer threshold (1 hour) to refresh before expiration.
+   */
+  private shouldProactivelyRefresh(): boolean {
+    if (!this.token) {
+      return false;
+    }
+
+    // Refresh if token will expire within 1 hour
+    const proactiveThreshold = 60 * 60 * 1000; // 1 hour
+    return Date.now() >= (this.token.expires_at - proactiveThreshold);
+  }
+
+  /**
+   * Gets time until token expiration in milliseconds.
+   * Returns null if no token exists.
+   */
+  getTimeUntilExpiration(): number | null {
+    if (!this.token) {
+      return null;
+    }
+    return this.token.expires_at - Date.now();
+  }
+
   async ensureValidToken(): Promise<boolean> {
     if (this.hasAuth()) {
       return true;
@@ -133,6 +158,43 @@ export class SmartThingsAuthentication {
     }
 
     return false;
+  }
+
+  /**
+   * Proactively checks and refreshes token if it's close to expiration.
+   * Should be called periodically (e.g., every hour) to maintain fresh tokens.
+   * @returns true if token was refreshed or is still valid, false if refresh failed
+   */
+  async checkAndRefreshToken(): Promise<boolean> {
+    if (!this.token) {
+      logger.debug('No token to refresh');
+      return false;
+    }
+
+    const timeUntilExpiration = this.getTimeUntilExpiration();
+    if (timeUntilExpiration === null) {
+      return false;
+    }
+
+    const hoursUntilExpiration = timeUntilExpiration / (60 * 60 * 1000);
+
+    if (this.shouldProactivelyRefresh()) {
+      logger.info({ hoursUntilExpiration: hoursUntilExpiration.toFixed(2) },
+        '🔄 Token expiring soon, proactively refreshing');
+
+      const refreshed = await this.refreshToken();
+      if (refreshed) {
+        logger.info('✅ Token proactively refreshed successfully');
+        return true;
+      } else {
+        logger.error('❌ Failed to proactively refresh token');
+        return false;
+      }
+    } else {
+      logger.debug({ hoursUntilExpiration: hoursUntilExpiration.toFixed(2) },
+        '✓ Token still valid, no refresh needed');
+      return true;
+    }
   }
 
   clear(): void {
