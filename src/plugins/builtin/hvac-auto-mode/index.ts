@@ -164,20 +164,44 @@ class HVACAutoModePlugin implements Plugin {
 
       // Validate required fields
       const temp = device.currentTemperature;
-      const heatSetpoint = device.heatingSetpoint;
-      const coolSetpoint = device.coolingSetpoint;
+      let heatSetpoint = device.heatingSetpoint;
+      let coolSetpoint = device.coolingSetpoint;
 
-      if (
-        temp === undefined ||
-        heatSetpoint === undefined ||
-        coolSetpoint === undefined ||
-        isNaN(temp) ||
-        isNaN(heatSetpoint) ||
-        isNaN(coolSetpoint)
-      ) {
+      // Validate temperature is available
+      if (temp === undefined || isNaN(temp)) {
         this.context.logger.warn(
-          { deviceId, deviceName: device.label, temp, heatSetpoint, coolSetpoint },
+          { deviceId, deviceName: device.label, temp },
           '⚠️  Device has invalid temperature data, skipping'
+        );
+        continue;
+      }
+
+      // Handle devices that only report one setpoint (common with Samsung ACs)
+      // Create reasonable default bounds based on available setpoint
+      const DEFAULT_TEMP_BAND = 4; // °F between heating and cooling setpoints
+
+      if (coolSetpoint !== undefined && !isNaN(coolSetpoint)) {
+        // Device has cooling setpoint - use it for upper bound
+        // If no heating setpoint, create one based on cooling setpoint
+        if (heatSetpoint === undefined || isNaN(heatSetpoint)) {
+          heatSetpoint = coolSetpoint - DEFAULT_TEMP_BAND;
+          this.context.logger.debug(
+            { deviceId, deviceName: device.label, coolSetpoint, inferredHeatSetpoint: heatSetpoint },
+            'Inferred heating setpoint from cooling setpoint'
+          );
+        }
+      } else if (heatSetpoint !== undefined && !isNaN(heatSetpoint)) {
+        // Device only has heating setpoint - create cooling setpoint
+        coolSetpoint = heatSetpoint + DEFAULT_TEMP_BAND;
+        this.context.logger.debug(
+          { deviceId, deviceName: device.label, heatSetpoint, inferredCoolSetpoint: coolSetpoint },
+          'Inferred cooling setpoint from heating setpoint'
+        );
+      } else {
+        // No valid setpoints at all
+        this.context.logger.warn(
+          { deviceId, deviceName: device.label, heatSetpoint, coolSetpoint },
+          '⚠️  Device has no valid setpoints, skipping'
         );
         continue;
       }

@@ -259,6 +259,9 @@ export class SmartThingsAPI {
         mode: mode as 'heat' | 'cool' | 'auto' | 'off',
         lightOn: lightingStatus === 'on',
         lastUpdated: new Date(),
+        // Include separate setpoints for auto-mode coordination
+        heatingSetpoint: heatingSetpoint || undefined,
+        coolingSetpoint: coolingSetpoint || undefined,
       };
     } catch (error) {
       logger.error({ deviceId, err: error }, 'Error getting device status');
