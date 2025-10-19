@@ -1,5 +1,6 @@
 import { Plugin, PluginContext } from '../../types';
 import { UnifiedDevice } from '@/types';
+import { isThermostatLikeDevice } from '@/utils/deviceUtils';
 
 /**
  * Core Devices Plugin
@@ -34,15 +35,11 @@ class CoreDevicesPlugin implements Plugin {
   }
 
   /**
-   * This plugin handles non-thermostat devices
+   * This plugin handles non-HVAC devices (lights, switches, sensors, etc.)
    */
   shouldHandleDevice(device: UnifiedDevice): boolean {
-    // For now, we'll handle devices that aren't thermostats
-    // In the future, we can check specific capabilities
-    const isThermostat = device.capabilities?.some(
-      cap => cap.id === 'thermostatMode' || cap.id === 'thermostatHeatingSetpoint'
-    );
-    return !isThermostat;
+    // Handle all devices EXCEPT thermostat-like devices (which are handled by hvac-auto-mode plugin)
+    return !isThermostatLikeDevice(device);
   }
 
   /**

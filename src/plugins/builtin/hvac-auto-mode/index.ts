@@ -2,6 +2,7 @@ import { Plugin, PluginContext, PluginWebRoute } from '../../types';
 import { UnifiedDevice } from '@/types';
 import { AutoModeController, AutoModeDevice } from './AutoModeController';
 import { Request, Response } from 'express';
+import { isThermostatLikeDevice } from '@/utils/deviceUtils';
 
 /**
  * HVAC Auto-Mode Plugin
@@ -71,21 +72,24 @@ class HVACAutoModePlugin implements Plugin {
   }
 
   /**
-   * Handle thermostats only
+   * Handle all thermostat-like devices (thermostats and air conditioners)
    */
   shouldHandleDevice(device: UnifiedDevice): boolean {
-    return device.capabilities?.some(
-      cap => cap.id === 'thermostatMode' || cap.id === 'thermostatHeatingSetpoint'
-    ) ?? false;
+    return isThermostatLikeDevice(device);
   }
 
   /**
    * Intercept HomeKit -> SmartThings state changes
    * Enroll/unenroll devices based on mode changes
+   * Handles both thermostatMode (traditional thermostats) and airConditionerMode (Samsung ACs)
    */
   async beforeSetSmartThingsState(device: UnifiedDevice, state: any): Promise<any | null> {
-    if (state.thermostatMode) {
-      const mode = state.thermostatMode.toLowerCase();
+    // Check for mode changes in either thermostatMode or airConditionerMode
+    const modeField = state.thermostatMode ? 'thermostatMode' :
+                     state.airConditionerMode ? 'airConditionerMode' : null;
+
+    if (modeField) {
+      const mode = state[modeField].toLowerCase();
 
       // Check if switching to AUTO mode (enroll)
       if (mode === this.AUTO_MODE_MARKER) {
@@ -100,7 +104,7 @@ class HVACAutoModePlugin implements Plugin {
         const currentMode = this.controller.getCurrentMode();
         return {
           ...state,
-          thermostatMode: currentMode,
+          [modeField]: currentMode,
         };
       }
 

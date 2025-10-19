@@ -2,6 +2,7 @@ import * as cron from 'node-cron';
 import { Plugin, PluginContext, PluginWebRoute } from '../../types';
 import { UnifiedDevice } from '@/types';
 import { Request, Response } from 'express';
+import { isThermostatLikeDevice } from '@/utils/deviceUtils';
 
 /**
  * Lighting Monitor Plugin
@@ -55,14 +56,10 @@ class LightingMonitorPlugin implements Plugin {
   }
 
   /**
-   * This plugin handles devices with thermostat capabilities (AC units with lights)
+   * This plugin handles HVAC devices (AC units and thermostats with lights)
    */
   shouldHandleDevice(device: UnifiedDevice): boolean {
-    // Check if device has thermostat capabilities (AC units typically have lights)
-    const isThermostat = device.capabilities?.some(
-      cap => cap.id === 'thermostatMode' || cap.id === 'airConditionerMode'
-    );
-    return isThermostat ?? false;
+    return isThermostatLikeDevice(device);
   }
 
   /**

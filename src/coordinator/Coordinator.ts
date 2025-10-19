@@ -8,6 +8,7 @@ import { HAPThermostatEvent } from '@/hap/HAPServer';
 import { logger } from '@/utils/logger';
 import { PluginManager } from '@/plugins';
 import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
+import { isThermostatLikeDevice } from '@/utils/deviceUtils';
 
 /**
  * Coordinates device state between SmartThings API, HomeKit bridge, and plugins.
@@ -24,6 +25,7 @@ export class Coordinator {
   private state: CoordinatorState;
   private pollTask: cron.ScheduledTask | null = null;
   private readonly pollInterval: string;
+  private deviceMetadata: Map<string, UnifiedDevice> = new Map();
 
   constructor(
     api: SmartThingsAPI,
@@ -168,14 +170,7 @@ export class Coordinator {
 
       // Filter for HVAC devices that should be added to HomeKit
       const hvacDevices = includedDevices.filter(device => {
-        const caps = device.thermostatCapabilities;
-        const isHVAC = caps && (
-          caps.thermostat ||
-          caps.thermostatMode ||
-          caps.airConditionerMode ||
-          caps.customThermostatSetpointControl ||
-          (caps.temperatureMeasurement && (caps.thermostatCoolingSetpoint || caps.thermostatHeatingSetpoint))
-        );
+        const isHVAC = isThermostatLikeDevice(device);
 
         if (!isHVAC) {
           logger.info({ deviceId: device.deviceId, name: device.name },
@@ -190,6 +185,12 @@ export class Coordinator {
         hvac: hvacDevices.length,
         nonHvac: includedDevices.length - hvacDevices.length
       }, '🌡️  Filtering HVAC devices for HomeKit');
+
+      // Store device metadata for all included devices (needed for capability checks)
+      this.deviceMetadata.clear();
+      for (const device of includedDevices) {
+        this.deviceMetadata.set(device.deviceId, device);
+      }
 
       // Determine which devices should be removed from HomeKit
       const currentDeviceIds = new Set(this.state.pairedDevices);
@@ -291,8 +292,26 @@ export class Coordinator {
   }
 
   private buildUnifiedDevice(deviceId: string, deviceState: DeviceState): UnifiedDevice {
-    // Build a UnifiedDevice from the deviceState
-    // This is used by plugins to make decisions
+    // Try to get stored device metadata first
+    const metadata = this.deviceMetadata.get(deviceId);
+
+    if (metadata) {
+      // Return metadata with updated state
+      return {
+        ...metadata,
+        currentState: deviceState,
+        isPaired: true,
+        // Update convenience properties from currentState
+        currentTemperature: deviceState.currentTemperature,
+        heatingSetpoint: deviceState.heatingSetpoint,
+        coolingSetpoint: deviceState.coolingSetpoint,
+        mode: deviceState.mode,
+        temperatureSetpoint: deviceState.temperatureSetpoint,
+      };
+    }
+
+    // Fallback: build minimal device if metadata not available
+    logger.warn({ deviceId }, 'Building device without metadata - capabilities unknown');
     return {
       deviceId,
       label: deviceState.name,
@@ -300,7 +319,7 @@ export class Coordinator {
       manufacturerName: '',
       presentationId: '',
       deviceTypeName: '',
-      capabilities: [], // TODO: store capabilities in state
+      capabilities: [],
       components: [],
       thermostatCapabilities: {},
       currentState: deviceState,
@@ -397,12 +416,39 @@ export class Coordinator {
       const commands: any[] = [];
 
       if (finalState.thermostatMode !== undefined) {
-        commands.push({
-          component: 'main',
-          capability: 'thermostatMode',
-          command: 'setThermostatMode',
-          arguments: [finalState.thermostatMode],
-        });
+        // Check if device uses airConditionerMode or thermostatMode
+        const caps = device.thermostatCapabilities;
+        const usesAirConditionerMode = caps.airConditionerMode && !caps.thermostatMode;
+
+        logger.debug({
+          deviceId: event.deviceId,
+          deviceName: device.label,
+          thermostatCapabilities: caps,
+          usesAirConditionerMode,
+          mode: finalState.thermostatMode
+        }, 'Determining which mode capability to use');
+
+        if (usesAirConditionerMode) {
+          // Samsung air conditioner - use airConditionerMode capability
+          logger.info({ deviceId: event.deviceId, mode: finalState.thermostatMode },
+            '🌡️  Using airConditionerMode for Samsung AC');
+          commands.push({
+            component: 'main',
+            capability: 'airConditionerMode',
+            command: 'setAirConditionerMode',
+            arguments: [finalState.thermostatMode],
+          });
+        } else {
+          // Traditional thermostat - use thermostatMode capability
+          logger.info({ deviceId: event.deviceId, mode: finalState.thermostatMode },
+            '🌡️  Using thermostatMode for traditional thermostat');
+          commands.push({
+            component: 'main',
+            capability: 'thermostatMode',
+            command: 'setThermostatMode',
+            arguments: [finalState.thermostatMode],
+          });
+        }
       }
 
       if (finalState.heatingSetpoint !== undefined) {
