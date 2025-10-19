@@ -2,12 +2,12 @@ import * as cron from 'node-cron';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
-import { LightingMonitor } from '@/monitoring/LightingMonitor';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { CoordinatorState, DeviceState, UnifiedDevice } from '@/types';
 import { HAPThermostatEvent } from '@/hap/HAPServer';
 import { logger } from '@/utils/logger';
 import { PluginManager } from '@/plugins';
+import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 
 /**
  * Coordinates device state between SmartThings API, HomeKit bridge, and plugins.
@@ -17,9 +17,9 @@ import { PluginManager } from '@/plugins';
  */
 export class Coordinator {
   private readonly api: SmartThingsAPI;
-  private readonly lightingMonitor: LightingMonitor;
   private readonly hapServer: SmartThingsHAPServer;
   private readonly pluginManager: PluginManager;
+  private readonly inclusionManager: DeviceInclusionManager;
   private readonly stateFilePath: string;
   private state: CoordinatorState;
   private pollTask: cron.ScheduledTask | null = null;
@@ -27,16 +27,16 @@ export class Coordinator {
 
   constructor(
     api: SmartThingsAPI,
-    lightingMonitor: LightingMonitor,
     hapServer: SmartThingsHAPServer,
     pluginManager: PluginManager,
+    inclusionManager: DeviceInclusionManager,
     stateFilePath: string,
     pollIntervalSeconds: number = 300
   ) {
     this.api = api;
-    this.lightingMonitor = lightingMonitor;
     this.hapServer = hapServer;
     this.pluginManager = pluginManager;
+    this.inclusionManager = inclusionManager;
     this.stateFilePath = stateFilePath;
     this.pollInterval = this.convertSecondsToInterval(pollIntervalSeconds);
 
@@ -59,12 +59,16 @@ export class Coordinator {
   async initialize(): Promise<void> {
     await this.loadState();
 
-    // Only reload devices if we have auth and existing devices to restore
-    if (this.api.hasAuth() && this.state.pairedDevices.length > 0) {
+    // Reload devices if we have auth to sync with current inclusion settings
+    // This ensures excluded devices are removed from HomeKit on startup
+    if (this.api.hasAuth()) {
       // Defer device loading to avoid blocking pairing process
       setTimeout(async () => {
+        logger.info('🔄 Syncing devices with inclusion settings and HomeKit...');
         await this.reloadDevices();
       }, 2000);
+    } else {
+      logger.info('⏸️  Skipping device sync - no authentication available');
     }
 
     this.startPolling();
@@ -133,12 +137,28 @@ export class Coordinator {
 
     try {
       logger.info('🔍 Reloading devices from SmartThings');
-      const filteredDevices = await this.api.getDevices([]);
-      const deviceIds = filteredDevices.map(device => device.deviceId);
+      const allDevices = await this.api.getDevices([]);
 
-      logger.info({ count: filteredDevices.length }, '📱 Found devices');
-      logger.debug('🏠 Devices found:');
-      filteredDevices.forEach(device => {
+      // Filter devices based on inclusion settings
+      const includedDevices = allDevices.filter(device => {
+        const isIncluded = this.inclusionManager.isIncluded(device.deviceId);
+        if (!isIncluded) {
+          logger.debug({ deviceId: device.deviceId, name: device.name }, 'Device excluded from HomeKit');
+        }
+        return isIncluded;
+      });
+
+      const excludedCount = allDevices.length - includedDevices.length;
+      const deviceIds = includedDevices.map(device => device.deviceId);
+
+      logger.info({
+        total: allDevices.length,
+        included: includedDevices.length,
+        excluded: excludedCount
+      }, '📱 Found devices');
+
+      logger.debug('🏠 Included devices:');
+      includedDevices.forEach(device => {
         logger.debug({
           deviceId: device.deviceId,
           name: device.name,
@@ -146,11 +166,48 @@ export class Coordinator {
         }, `  - Device: ${device.name}`);
       });
 
-      this.state.pairedDevices = deviceIds;
-      this.lightingMonitor.setDevices(deviceIds);
+      // Filter for HVAC devices that should be added to HomeKit
+      const hvacDevices = includedDevices.filter(device => {
+        const caps = device.thermostatCapabilities;
+        const isHVAC = caps && (
+          caps.thermostat ||
+          caps.thermostatMode ||
+          caps.airConditionerMode ||
+          caps.customThermostatSetpointControl ||
+          (caps.temperatureMeasurement && (caps.thermostatCoolingSetpoint || caps.thermostatHeatingSetpoint))
+        );
 
-      // Add or update devices in HAP server
-      for (const device of filteredDevices) {
+        if (!isHVAC) {
+          logger.info({ deviceId: device.deviceId, name: device.name },
+            '⏭️  Skipping non-HVAC device for HomeKit (device visible in web UI only)');
+        }
+
+        return isHVAC;
+      });
+
+      logger.info({
+        total: includedDevices.length,
+        hvac: hvacDevices.length,
+        nonHvac: includedDevices.length - hvacDevices.length
+      }, '🌡️  Filtering HVAC devices for HomeKit');
+
+      // Determine which devices should be removed from HomeKit
+      const currentDeviceIds = new Set(this.state.pairedDevices);
+      const newDeviceIds = new Set(hvacDevices.map(d => d.deviceId));
+      const devicesToRemove = Array.from(currentDeviceIds).filter(id => !newDeviceIds.has(id));
+
+      // Remove devices that are no longer included or no longer HVAC
+      for (const deviceId of devicesToRemove) {
+        try {
+          await this.hapServer.removeDevice(deviceId);
+          logger.info({ deviceId }, '🗑️  Removed device from HomeKit');
+        } catch (error) {
+          logger.error({ deviceId, err: error }, '❌ Failed to remove device from HomeKit');
+        }
+      }
+
+      // Add or update HVAC devices in HAP server
+      for (const device of hvacDevices) {
         const deviceState = await this.getDeviceStateByDevice(device);
         if (deviceState) {
           try {
@@ -162,7 +219,13 @@ export class Coordinator {
         }
       }
 
-      logger.info({ count: deviceIds.length }, '✅ Reloaded devices: synchronized');
+      // Update pairedDevices to only track HVAC devices actually in HomeKit
+      this.state.pairedDevices = hvacDevices.map(d => d.deviceId);
+
+      logger.info({
+        added: hvacDevices.length,
+        removed: devicesToRemove.length
+      }, '✅ Reloaded devices: synchronized');
 
       await this.updateDeviceStates();
       await this.saveState();
@@ -423,6 +486,13 @@ export class Coordinator {
       devices.push(this.buildUnifiedDevice(deviceId, deviceState));
     }
     return devices;
+  }
+
+  /**
+   * Get array of paired device IDs
+   */
+  getPairedDeviceIds(): string[] {
+    return [...this.state.pairedDevices];
   }
 
   /**

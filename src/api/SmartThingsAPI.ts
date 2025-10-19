@@ -583,10 +583,10 @@ export class SmartThingsAPI {
   }
 
   /**
-   * Retrieves all HVAC devices with thermostat capabilities.
-   * Filters out ecobee devices and includes current state for paired devices.
+   * Retrieves all devices from SmartThings.
+   * Includes current state for paired devices and analyzes thermostat capabilities.
    * @param pairedDeviceIds - List of already paired device IDs to fetch state for
-   * @returns Array of unified devices with thermostat capabilities
+   * @returns Array of all unified devices
    */
   async getDevices(pairedDeviceIds: string[] = []): Promise<UnifiedDevice[]> {
     const allDevices = await this.getAllDevices();
@@ -623,18 +623,9 @@ export class SmartThingsAPI {
 
     const devices = await Promise.all(devicePromises);
 
-    const hasStandardThermostat = (caps: ThermostatCapabilities) =>
-      caps.temperatureMeasurement || caps.thermostat ||
-      caps.thermostatCoolingSetpoint || caps.thermostatHeatingSetpoint;
-
-    const hasSamsungAC = (caps: ThermostatCapabilities) =>
-      caps.airConditionerMode || caps.customThermostatSetpointControl;
-
-    return devices.filter(device => {
-      if (device.name.toLowerCase().includes('ecobee')) return false;
-      const caps = device.thermostatCapabilities;
-      return hasStandardThermostat(caps) || hasSamsungAC(caps);
-    });
+    // Return ALL devices (no filtering)
+    // The thermostatCapabilities are included so the UI can determine which controls to show
+    return devices;
   }
 
   /**
