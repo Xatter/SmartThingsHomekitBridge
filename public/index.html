@@ -383,6 +383,58 @@
             border-radius: 4px;
             margin: 16px 0;
         }
+
+        /* Toggle Switch Styles */
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 51px;
+            height: 31px;
+            flex-shrink: 0;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 31px;
+        }
+
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 23px;
+            width: 23px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked + .toggle-slider {
+            background-color: #34c759;
+        }
+
+        input:checked + .toggle-slider:before {
+            transform: translateX(20px);
+        }
+
+        input:disabled + .toggle-slider {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 <body>
@@ -396,6 +448,7 @@
                 const hash = window.location.hash.slice(1);
                 if (hash === 'setup') return 'setup';
                 if (hash === 'auto-mode') return 'auto-mode';
+                if (hash === 'plugins') return 'plugins';
                 return 'devices';
             });
             const [authStatus, setAuthStatus] = useState(null);
@@ -403,6 +456,7 @@
             const [matterInfo, setMatterInfo] = useState(null);
             const [autoModeStatus, setAutoModeStatus] = useState(null);
             const [autoModeDecision, setAutoModeDecision] = useState(null);
+            const [plugins, setPlugins] = useState([]);
             const [loading, setLoading] = useState(true);
             const [error, setError] = useState(null);
 
@@ -411,6 +465,7 @@
                     const hash = window.location.hash.slice(1);
                     if (hash === 'setup') setCurrentPage('setup');
                     else if (hash === 'auto-mode') setCurrentPage('auto-mode');
+                    else if (hash === 'plugins') setCurrentPage('plugins');
                     else setCurrentPage('devices');
                 };
 
@@ -427,6 +482,8 @@
                         fetchMatterInfo();
                     } else if (currentPage === 'auto-mode') {
                         fetchAutoModeData();
+                    } else if (currentPage === 'plugins') {
+                        fetchPlugins();
                     }
                 };
                 initializePage();
@@ -460,11 +517,12 @@
                 console.log('Fetching devices...');
                 setLoading(true);
                 try {
-                    const response = await fetch('/api/devices/paired');
+                    const response = await fetch('/api/devices');
                     console.log('Devices response status:', response.status);
                     const data = await response.json();
                     console.log('Devices data:', data);
-                    setDevices(data.deviceStates || []);
+                    // API now returns array of all devices with inclusion status
+                    setDevices(data || []);
                 } catch (error) {
                     setError('Failed to fetch devices');
                     console.error('Error fetching devices:', error);
@@ -491,8 +549,8 @@
                 setLoading(true);
                 try {
                     const [statusResponse, decisionResponse] = await Promise.all([
-                        fetch('/api/devices/auto-mode/status'),
-                        fetch('/api/devices/auto-mode/decision')
+                        fetch('/api/plugins/hvac-auto-mode/status'),
+                        fetch('/api/plugins/hvac-auto-mode/decision')
                     ]);
 
                     const statusData = await statusResponse.json();
@@ -508,19 +566,51 @@
                 }
             };
 
+            const fetchPlugins = async () => {
+                setLoading(true);
+                try {
+                    const response = await fetch('/api/plugins');
+                    const data = await response.json();
+                    setPlugins(data);
+                } catch (error) {
+                    setError('Failed to fetch plugins');
+                    console.error('Error fetching plugins:', error);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
             const handleDeviceControl = async (deviceId, action, value) => {
                 try {
-                    const response = await fetch(`/api/devices/${deviceId}/${action}`, {
+                    let url = `/api/devices/${deviceId}/${action}`;
+                    let body = null;
+
+                    // Format request based on action type
+                    if (action === 'temperature') {
+                        body = JSON.stringify({ temperature: value });
+                    } else if (action === 'mode') {
+                        body = JSON.stringify({ mode: value });
+                    } else if (action === 'light') {
+                        // Light controls use URL path for on/off
+                        url = `/api/devices/${deviceId}/light/${value}`;
+                    }
+
+                    const response = await fetch(url, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(value)
+                        body: body
                     });
 
                     if (response.ok) {
                         fetchDevices(); // Refresh devices
+                    } else {
+                        const error = await response.json();
+                        console.error('Error controlling device:', error);
+                        alert(`Failed to control device: ${error.error || 'Unknown error'}`);
                     }
                 } catch (error) {
                     console.error('Error controlling device:', error);
+                    alert(`Failed to control device: ${error.message}`);
                 }
             };
 
@@ -536,7 +626,7 @@
                 <div className="container">
                     <div className="header">
                         <h1>SmartThings HomeKit Bridge</h1>
-                        <p>Bridge your SmartThings HVAC devices to HomeKit</p>
+                        <p>Bridge your SmartThings devices to HomeKit</p>
                     </div>
 
                     <div className="nav">
@@ -555,6 +645,14 @@
                             }}
                         >
                             Auto Mode
+                        </button>
+                        <button
+                            className={`nav-button ${currentPage === 'plugins' ? 'active' : ''}`}
+                            onClick={() => {
+                                window.location.hash = 'plugins';
+                            }}
+                        >
+                            Plugins
                         </button>
                         <button
                             className={`nav-button ${currentPage === 'setup' ? 'active' : ''}`}
@@ -591,6 +689,10 @@
                         />
                     )}
 
+                    {currentPage === 'plugins' && (
+                        <PluginsPage plugins={plugins} loading={loading} onRefresh={fetchPlugins} />
+                    )}
+
                     {currentPage === 'setup' && (
                         <SetupPage matterInfo={matterInfo} loading={loading} />
                     )}
@@ -599,6 +701,9 @@
         }
 
         function DevicesPage({ devices, loading, onDeviceControl }) {
+            const [reloadNotice, setReloadNotice] = useState(null);
+            const [togglingDevice, setTogglingDevice] = useState(null);
+
             if (loading) {
                 return <div className="loading">Loading devices...</div>;
             }
@@ -607,27 +712,80 @@
                 return (
                     <div className="card">
                         <h2>No Devices Found</h2>
-                        <p>No HVAC devices were found in your SmartThings account.</p>
+                        <p>No devices were found in your SmartThings account.</p>
                     </div>
                 );
             }
 
+            async function handleToggleInclusion(device) {
+                try {
+                    setTogglingDevice(device.deviceId);
+                    const action = device.included ? 'exclude' : 'include';
+                    const response = await fetch(`/api/devices/${device.deviceId}/${action}`, {
+                        method: 'POST',
+                    });
+                    const result = await response.json();
+
+                    if (result.success) {
+                        setReloadNotice('Device settings updated. Click "Reload Devices" to apply changes.');
+                        // Refresh device list
+                        setTimeout(() => window.location.reload(), 500);
+                    } else {
+                        alert('Failed to update device: ' + (result.error || 'Unknown error'));
+                    }
+                } catch (error) {
+                    console.error('Error toggling device inclusion:', error);
+                    alert('Failed to update device: ' + error.message);
+                } finally {
+                    setTogglingDevice(null);
+                }
+            }
+
+            async function handleReloadDevices() {
+                try {
+                    const response = await fetch('/api/devices/reload', { method: 'POST' });
+                    if (response.ok) {
+                        setReloadNotice(null);
+                        alert('Devices reloaded successfully!');
+                        window.location.reload();
+                    } else {
+                        alert('Failed to reload devices');
+                    }
+                } catch (error) {
+                    console.error('Error reloading devices:', error);
+                    alert('Failed to reload devices: ' + error.message);
+                }
+            }
+
+            const includedDevices = devices.filter(d => d.included);
+            const excludedDevices = devices.filter(d => !d.included);
+
             return (
                 <>
                     <div className="card">
-                        <h2>Connected Devices ({devices.length})</h2>
+                        <h2>All SmartThings Devices ({devices.length})</h2>
                         <p>
                             <span className="status-indicator connected"></span>
-                            SmartThings Connected
+                            SmartThings Connected · {includedDevices.length} in HomeKit · {excludedDevices.length} excluded
                         </p>
+                        {reloadNotice && (
+                            <div className="info-box" style={{backgroundColor: '#fff3cd', borderColor: '#ffc107', marginTop: '12px'}}>
+                                <p style={{color: '#856404', margin: '0 0 8px 0'}}>⚠️ {reloadNotice}</p>
+                                <button onClick={handleReloadDevices} className="primary-button">
+                                    Reload Devices
+                                </button>
+                            </div>
+                        )}
                     </div>
 
                     <div className="device-grid">
                         {devices.map(device => (
                             <DeviceCard
-                                key={device.id}
+                                key={device.deviceId}
                                 device={device}
-                                onControl={onDeviceControl}
+                                onToggle={() => handleToggleInclusion(device)}
+                                isToggling={togglingDevice === device.deviceId}
+                                onDeviceControl={onDeviceControl}
                             />
                         ))}
                     </div>
@@ -635,149 +793,170 @@
             );
         }
 
-        function DeviceCard({ device, onControl }) {
-            const internal = device.internal || device;
-            const smartThings = device.smartThings;
-            // Controls should reflect SmartThings state (actual device state), not internal/HomeKit state
-            const controlState = smartThings || internal;
-            const [localTemp, setLocalTemp] = useState(controlState.temperatureSetpoint);
-            const [localMode, setLocalMode] = useState(controlState.mode);
+        function DeviceCard({ device, onToggle, isToggling, onDeviceControl }) {
+            // Determine if device is HVAC (including Samsung Air Conditioners)
+            const isHVAC = device.thermostatCapabilities && (
+                device.thermostatCapabilities.thermostat ||
+                device.thermostatCapabilities.thermostatMode ||
+                device.thermostatCapabilities.airConditionerMode ||
+                device.thermostatCapabilities.customThermostatSetpointControl ||
+                device.thermostatCapabilities.temperatureMeasurement
+            );
 
-            const handleTempChange = async (delta) => {
-                const newTemp = localTemp + delta;
-                if (newTemp >= 45 && newTemp <= 95) {
-                    try {
-                        const response = await fetch(`/api/devices/${device.id}/temperature`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ temperature: newTemp })
-                        });
+            // Determine if device has light capability (but exclude pure switches)
+            const hasLight = device.capabilities?.some(c =>
+                c.id === 'switch' ||
+                c.id === 'samsungce.airConditionerLighting'
+            ) && isHVAC; // Only show light controls for HVAC devices with lights
 
-                        if (response.ok) {
-                            setLocalTemp(newTemp);
-                        } else {
-                            console.error('Failed to change temperature');
-                        }
-                    } catch (error) {
-                        console.error('Error changing temperature:', error);
-                    }
+            // Get current state (prefer SmartThings state as source of truth)
+            const state = device.smartThings || device.internal || {};
+            const mode = state.mode || 'off';
+            const currentTemp = state.currentTemperature;
+            const setpoint = state.temperatureSetpoint;
+            const lightOn = state.lightOn;
+
+            // Get device type indicator
+            function getDeviceTypeIcon(device) {
+                const caps = device.thermostatCapabilities || {};
+                // Check for standard thermostats and Samsung ACs
+                if (caps.thermostat || caps.thermostatMode || caps.airConditionerMode || caps.customThermostatSetpointControl) {
+                    return '❄️'; // Air conditioner icon for Samsung ACs and standard thermostats
                 }
-            };
+                if (caps.temperatureMeasurement) return '🌡️';
+                if (device.capabilities?.some(c => c.id === 'switch')) return '💡';
+                if (device.capabilities?.some(c => c.id === 'contactSensor')) return '🚪';
+                if (device.capabilities?.some(c => c.id === 'motionSensor')) return '👋';
+                return '📱';
+            }
 
-            const handleModeChange = async (mode) => {
-                try {
-                    const response = await fetch(`/api/devices/${device.id}/mode`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ mode })
-                    });
-
-                    if (response.ok) {
-                        setLocalMode(mode);
-                    } else {
-                        console.error('Failed to change mode');
-                    }
-                } catch (error) {
-                    console.error('Error changing mode:', error);
-                }
-            };
+            const deviceIcon = getDeviceTypeIcon(device);
 
             return (
-                <div className="device-card">
-                    <div className="device-name">{device.name}</div>
-                    {device.isEnrolledInAutoMode && (
-                        <div style={{
-                            fontSize: '0.8rem',
-                            color: '#34c759',
-                            fontWeight: '600',
-                            marginBottom: '8px',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '4px'
-                        }}>
-                            🤖 Auto Mode Enrolled
+                <div className="device-card" style={{
+                    opacity: device.included ? 1 : 0.6,
+                    border: device.included ? '2px solid #34c759' : '2px solid #ccc'
+                }}>
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px'}}>
+                        <div style={{flex: 1}}>
+                            <div className="device-name">{deviceIcon} {device.name}</div>
+                            {device.manufacturerName && (
+                                <div style={{fontSize: '0.8rem', color: '#6e6e73', marginTop: '4px'}}>
+                                    {device.manufacturerName}
+                                </div>
+                            )}
                         </div>
-                    )}
+                        <label className="toggle-switch">
+                            <input
+                                type="checkbox"
+                                checked={device.included}
+                                disabled={isToggling}
+                                onChange={onToggle}
+                            />
+                            <span className="toggle-slider"></span>
+                        </label>
+                    </div>
 
-                    <div style={{marginBottom: '16px', padding: '12px', background: '#f5f5f7', borderRadius: '8px'}}>
-                        <div style={{fontSize: '0.9rem', fontWeight: '600', marginBottom: '8px', color: '#007aff'}}>
-                            HomeKit/Internal
-                        </div>
-                        <div className="device-info">
-                            <div className="temperature">{Math.round(internal.currentTemperature)}°F</div>
-                            <div className={`mode ${internal.mode}`}>
-                                {internal.mode.toUpperCase()}
-                            </div>
-                        </div>
-                        <div style={{fontSize: '0.85rem', color: '#6e6e73', marginTop: '4px'}}>
-                            Set to: {internal.temperatureSetpoint}°F
+                    <div style={{marginBottom: '12px'}}>
+                        <div style={{fontSize: '0.85rem', fontWeight: '600', color: device.included ? '#34c759' : '#6e6e73'}}>
+                            {device.included ? '✅ Included in HomeKit' : '⏸️ Excluded from HomeKit'}
                         </div>
                     </div>
 
-                    {smartThings && (
-                        <div style={{marginBottom: '16px', padding: '12px', background: '#fff3e0', borderRadius: '8px'}}>
-                            <div style={{fontSize: '0.9rem', fontWeight: '600', marginBottom: '8px', color: '#ff9500'}}>
-                                SmartThings/Device
-                            </div>
-                            <div className="device-info">
-                                <div className="temperature">{Math.round(smartThings.currentTemperature)}°F</div>
-                                <div className={`mode ${smartThings.mode}`}>
-                                    {smartThings.mode.toUpperCase()}
+                    {/* HVAC Controls */}
+                    {isHVAC && device.included && state && (
+                        <div style={{marginTop: '16px', padding: '12px', background: '#f5f5f7', borderRadius: '8px'}}>
+                            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px'}}>
+                                <div>
+                                    <div style={{fontSize: '0.75rem', color: '#6e6e73'}}>Current</div>
+                                    <div style={{fontSize: '1.5rem', fontWeight: '600'}}>{currentTemp}°F</div>
+                                </div>
+                                <div>
+                                    <div style={{fontSize: '0.75rem', color: '#6e6e73'}}>Target</div>
+                                    <div style={{fontSize: '1.5rem', fontWeight: '600'}}>{setpoint}°F</div>
+                                </div>
+                                <div>
+                                    <div style={{fontSize: '0.75rem', color: '#6e6e73'}}>Mode</div>
+                                    <div style={{fontSize: '0.9rem', fontWeight: '600', textTransform: 'uppercase'}}>
+                                        {mode}
+                                    </div>
                                 </div>
                             </div>
-                            <div style={{fontSize: '0.85rem', color: '#6e6e73', marginTop: '4px'}}>
-                                Set to: {smartThings.temperatureSetpoint}°F
+
+                            <div style={{display: 'flex', gap: '8px', marginBottom: '8px'}}>
+                                <button
+                                    className="nav-button"
+                                    style={{flex: 1, padding: '8px'}}
+                                    onClick={() => onDeviceControl(device.deviceId, 'temperature', setpoint - 1)}
+                                >
+                                    ▼ -1°F
+                                </button>
+                                <button
+                                    className="nav-button"
+                                    style={{flex: 1, padding: '8px'}}
+                                    onClick={() => onDeviceControl(device.deviceId, 'temperature', setpoint + 1)}
+                                >
+                                    ▲ +1°F
+                                </button>
+                            </div>
+
+                            <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap'}}>
+                                {['heat', 'cool', 'auto', 'off'].map(m => (
+                                    <button
+                                        key={m}
+                                        className="nav-button"
+                                        style={{
+                                            flex: '1 1 45%',
+                                            padding: '6px',
+                                            fontSize: '0.8rem',
+                                            background: mode === m ? '#007aff' : '#fff',
+                                            color: mode === m ? '#fff' : '#007aff'
+                                        }}
+                                        onClick={() => onDeviceControl(device.deviceId, 'mode', m)}
+                                    >
+                                        {m.toUpperCase()}
+                                    </button>
+                                ))}
                             </div>
                         </div>
                     )}
 
-                    <div style={{textAlign: 'center', marginBottom: '16px'}}>
-                        <div style={{fontSize: '0.9rem', color: '#6e6e73', marginBottom: '8px'}}>
-                            Adjust Temperature
+                    {/* Light Controls */}
+                    {hasLight && device.included && state && (
+                        <div style={{marginTop: '12px', display: 'flex', gap: '8px'}}>
+                            <button
+                                className="nav-button"
+                                style={{
+                                    flex: 1,
+                                    padding: '8px',
+                                    background: lightOn ? '#007aff' : '#fff',
+                                    color: lightOn ? '#fff' : '#007aff'
+                                }}
+                                onClick={() => onDeviceControl(device.deviceId, 'light', 'on')}
+                            >
+                                💡 Light ON
+                            </button>
+                            <button
+                                className="nav-button"
+                                style={{
+                                    flex: 1,
+                                    padding: '8px',
+                                    background: !lightOn ? '#007aff' : '#fff',
+                                    color: !lightOn ? '#fff' : '#007aff'
+                                }}
+                                onClick={() => onDeviceControl(device.deviceId, 'light', 'off')}
+                            >
+                                🌙 Light OFF
+                            </button>
                         </div>
-                        <div style={{display: 'flex', justifyContent: 'center', gap: '8px'}}>
-                            <button
-                                className="control-button"
-                                onClick={() => handleTempChange(-1)}
-                            >
-                                -
-                            </button>
-                            <span style={{lineHeight: '32px', fontWeight: '600'}}>{localTemp}°F</span>
-                            <button
-                                className="control-button"
-                                onClick={() => handleTempChange(1)}
-                            >
-                                +
-                            </button>
+                    )}
+
+                    {/* Show state info for non-included devices */}
+                    {!device.included && isHVAC && state && (
+                        <div style={{marginTop: '12px', fontSize: '0.85rem', color: '#6e6e73'}}>
+                            Current: {currentTemp}°F · Target: {setpoint}°F · {mode.toUpperCase()}
                         </div>
-                    </div>
-
-                    <div className="controls">
-                        {['heat', 'cool', 'auto', 'off'].map(mode => (
-                            <button
-                                key={mode}
-                                className={`control-button ${localMode === mode ? 'active' : ''}`}
-                                onClick={() => handleModeChange(mode)}
-                            >
-                                {mode.charAt(0).toUpperCase() + mode.slice(1)}
-                            </button>
-                        ))}
-                    </div>
-
-                    <div className="controls" style={{marginTop: '8px'}}>
-                        <button
-                            className="control-button"
-                            onClick={() => onControl(device.id, 'light/on', {})}
-                        >
-                            Light On
-                        </button>
-                        <button
-                            className="control-button"
-                            onClick={() => onControl(device.id, 'light/off', {})}
-                        >
-                            Light Off
-                        </button>
-                    </div>
+                    )}
                 </div>
             );
         }
@@ -918,7 +1097,10 @@
                 return <div className="loading">Loading auto-mode status...</div>;
             }
 
-            if (!decision || !decision.enrolled) {
+            // Check if there are enrolled devices
+            const enrolledCount = status?.enrolledDeviceIds?.length || 0;
+
+            if (!status || enrolledCount === 0) {
                 return (
                     <div className="card">
                         <h2>Auto Mode</h2>
@@ -937,13 +1119,13 @@
                 );
             }
 
-            const currentMode = decision.decision?.mode || 'off';
-            const totalHeatDemand = decision.decision?.totalHeatDemand || 0;
-            const totalCoolDemand = decision.decision?.totalCoolDemand || 0;
-            const deviceDemands = decision.decision?.deviceDemands || [];
-            const reason = decision.decision?.reason || 'No decision available';
-            const switchSuppressed = decision.decision?.switchSuppressed || false;
-            const secondsUntilAllowed = decision.decision?.secondsUntilSwitchAllowed || 0;
+            const currentMode = decision?.mode || 'off';
+            const totalHeatDemand = decision?.totalHeatDemand || 0;
+            const totalCoolDemand = decision?.totalCoolDemand || 0;
+            const deviceDemands = decision?.deviceDemands || [];
+            const reason = decision?.reason || 'No decision available';
+            const switchSuppressed = decision?.switchSuppressed || false;
+            const secondsUntilAllowed = decision?.secondsUntilSwitchAllowed || 0;
 
             const formatTime = (seconds) => {
                 if (seconds <= 0) return 'Ready';
@@ -973,7 +1155,7 @@
                             <div className="stat-card">
                                 <div className="stat-label">Enrolled Devices</div>
                                 <div className="stat-value">
-                                    {decision.deviceCount}
+                                    {enrolledCount}
                                 </div>
                             </div>
 
@@ -1082,6 +1264,166 @@
                         </div>
                     )}
                 </>
+            );
+        }
+
+        function PluginsPage({ plugins, loading, onRefresh }) {
+            const [restartNotice, setRestartNotice] = React.useState(null);
+            const [togglingPlugin, setTogglingPlugin] = React.useState(null);
+            const [isRestarting, setIsRestarting] = React.useState(false);
+
+            async function handleTogglePlugin(plugin) {
+                try {
+                    setTogglingPlugin(plugin.name);
+                    const action = plugin.enabled ? 'disable' : 'enable';
+                    const response = await fetch(`/api/plugins/${plugin.name}/${action}`, {
+                        method: 'POST',
+                    });
+                    const result = await response.json();
+
+                    if (result.success) {
+                        setRestartNotice('Plugin settings updated. Restart required to take effect.');
+                        onRefresh();
+                    } else {
+                        alert('Failed to update plugin: ' + (result.error || 'Unknown error'));
+                    }
+                } catch (error) {
+                    console.error('Error toggling plugin:', error);
+                    alert('Failed to update plugin: ' + error.message);
+                } finally {
+                    setTogglingPlugin(null);
+                }
+            }
+
+            async function handleRestart() {
+                if (!confirm('Restart the SmartThings HomeKit Bridge? This will briefly interrupt HomeKit connectivity.')) {
+                    return;
+                }
+
+                try {
+                    setIsRestarting(true);
+                    const response = await fetch('/api/system/restart', {
+                        method: 'POST',
+                    });
+                    const result = await response.json();
+
+                    if (result.success) {
+                        alert('Bridge is restarting... The page will reload in 10 seconds.');
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 10000);
+                    }
+                } catch (error) {
+                    console.error('Error restarting:', error);
+                    alert('Failed to restart: ' + error.message);
+                    setIsRestarting(false);
+                }
+            }
+
+            if (loading) {
+                return <div className="loading">Loading plugins...</div>;
+            }
+
+            return (
+                <div className="card">
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px'}}>
+                        <h2>Installed Plugins</h2>
+                        <button className="nav-button" onClick={onRefresh}>
+                            Refresh
+                        </button>
+                    </div>
+
+                    {restartNotice && (
+                        <div className="info-box" style={{backgroundColor: '#fff3cd', borderColor: '#ffc107', marginBottom: '20px'}}>
+                            <p style={{color: '#856404', margin: '0 0 8px 0'}}>⚠️ {restartNotice}</p>
+                            <button
+                                className="primary-button"
+                                onClick={handleRestart}
+                                disabled={isRestarting}
+                                style={{marginTop: '8px'}}
+                            >
+                                {isRestarting ? 'Restarting...' : 'Restart Bridge'}
+                            </button>
+                        </div>
+                    )}
+
+                    {plugins.length === 0 ? (
+                        <div className="info-box">
+                            <p>No plugins loaded</p>
+                        </div>
+                    ) : (
+                        <div className="device-grid">
+                            {plugins.map((plugin, index) => (
+                                <div key={index} className="device-card">
+                                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px'}}>
+                                        <div>
+                                            <h3 style={{fontSize: '1.3rem', marginBottom: '4px'}}>
+                                                {plugin.name}
+                                            </h3>
+                                            <div style={{fontSize: '0.9rem', color: '#6e6e73'}}>
+                                                v{plugin.version}
+                                            </div>
+                                        </div>
+                                        <label className="toggle-switch">
+                                            <input
+                                                type="checkbox"
+                                                checked={plugin.enabled}
+                                                disabled={togglingPlugin === plugin.name}
+                                                onChange={() => handleTogglePlugin(plugin)}
+                                            />
+                                            <span className="toggle-slider"></span>
+                                        </label>
+                                    </div>
+
+                                    {plugin.description && (
+                                        <div style={{marginBottom: '12px', color: '#1d1d1f'}}>
+                                            {plugin.description}
+                                        </div>
+                                    )}
+
+                                    <div className="device-info">
+                                        <div className="device-info-row">
+                                            <span className="label">Source:</span>
+                                            <span className="value">
+                                                {plugin.source === 'builtin' ? '🔧 Built-in' : '📦 NPM'}
+                                            </span>
+                                        </div>
+                                        <div className="device-info-row">
+                                            <span className="label">Status:</span>
+                                            <span className="value">
+                                                {plugin.enabled ? '✅ Enabled' : '⏸️ Disabled'}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    {plugin.name === 'hvac-auto-mode' && (
+                                        <button
+                                            className="nav-button"
+                                            onClick={() => window.location.hash = 'auto-mode'}
+                                            style={{marginTop: '12px', width: '100%'}}
+                                        >
+                                            View Dashboard
+                                        </button>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    <div className="card" style={{marginTop: '20px', backgroundColor: '#f9f9fb'}}>
+                        <h3 style={{marginBottom: '12px'}}>About Plugins</h3>
+                        <p style={{marginBottom: '8px', lineHeight: '1.6'}}>
+                            Plugins extend the bridge with additional functionality. The plugin system supports:
+                        </p>
+                        <ul style={{marginLeft: '20px', lineHeight: '1.8'}}>
+                            <li><strong>Built-in plugins</strong> - Core functionality bundled with the bridge</li>
+                            <li><strong>NPM plugins</strong> - Install plugins from npm (coming soon)</li>
+                            <li><strong>Device handlers</strong> - Custom logic for specific device types</li>
+                            <li><strong>State interceptors</strong> - Modify device state before sync</li>
+                            <li><strong>Web routes</strong> - Add custom API endpoints and dashboards</li>
+                        </ul>
+                    </div>
+                </div>
             );
         }
 
