@@ -1,12 +1,17 @@
 import { Router, Request, Response } from 'express';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { Coordinator } from '@/coordinator/Coordinator';
+import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 import { logger } from '@/utils/logger';
 
 // Default temperature band margin when heating/cooling setpoints are not available
 const DEFAULT_TEMP_BAND_MARGIN = 2; // °F
 
-export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinator): Router {
+export function createDevicesRoutes(
+  api: SmartThingsAPI,
+  coordinator: Coordinator,
+  inclusionManager: DeviceInclusionManager
+): Router {
   const router = Router();
 
   router.get('/', async (req: Request, res: Response) => {
@@ -15,8 +20,60 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         return res.status(401).json({ error: 'Not authenticated' });
       }
 
-      const devices = await coordinator.getDevices();
-      res.json(devices);
+      // Get ALL devices from SmartThings (not just paired ones)
+      const allDevices = await api.getDevices([]);
+
+      // Add inclusion status and current state to each device
+      const devicesWithState = await Promise.all(
+        allDevices.map(async (device) => {
+          const isIncluded = inclusionManager.isIncluded(device.deviceId);
+
+          // Get current state from coordinator (for included devices) and SmartThings
+          let internalState = null;
+          let smartThingsState = null;
+
+          if (isIncluded) {
+            internalState = coordinator.getDeviceState(device.deviceId);
+          }
+
+          // Try to fetch current state from SmartThings for all devices
+          try {
+            smartThingsState = await api.getDeviceStatus(device.deviceId);
+          } catch (error) {
+            logger.debug({ deviceId: device.deviceId, err: error }, 'Failed to fetch SmartThings state');
+          }
+
+          return {
+            ...device,
+            included: isIncluded,
+            // Include state information if available
+            internal: internalState ? {
+              mode: internalState.mode,
+              currentTemperature: internalState.currentTemperature,
+              temperatureSetpoint: internalState.temperatureSetpoint,
+              heatingSetpoint: internalState.heatingSetpoint,
+              coolingSetpoint: internalState.coolingSetpoint,
+              lightOn: internalState.lightOn,
+              lastUpdated: internalState.lastUpdated instanceof Date
+                ? internalState.lastUpdated.toISOString()
+                : new Date(internalState.lastUpdated).toISOString(),
+            } : null,
+            smartThings: smartThingsState ? {
+              mode: smartThingsState.mode,
+              currentTemperature: smartThingsState.currentTemperature,
+              temperatureSetpoint: smartThingsState.temperatureSetpoint,
+              heatingSetpoint: smartThingsState.heatingSetpoint,
+              coolingSetpoint: smartThingsState.coolingSetpoint,
+              lightOn: smartThingsState.lightOn,
+              lastUpdated: smartThingsState.lastUpdated instanceof Date
+                ? smartThingsState.lastUpdated.toISOString()
+                : new Date(smartThingsState.lastUpdated).toISOString(),
+            } : null,
+          };
+        })
+      );
+
+      res.json(devicesWithState);
     } catch (error) {
       logger.error({ err: error }, 'Error fetching devices');
       res.status(500).json({ error: 'Failed to fetch devices' });
@@ -266,6 +323,39 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
     } catch (error) {
       logger.error({ err: error }, 'Error reloading devices');
       res.status(500).json({ error: 'Failed to reload devices' });
+    }
+  });
+
+  // Include/exclude device endpoints
+  router.post('/:deviceId/include', async (req: Request, res: Response) => {
+    try {
+      const { deviceId } = req.params;
+      await inclusionManager.setIncluded(deviceId, true);
+      logger.info({ deviceId }, 'Device included (reload required)');
+      res.json({
+        success: true,
+        message: 'Device included. Reload devices to add to HomeKit.',
+        reloadRequired: true
+      });
+    } catch (error) {
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Failed to include device');
+      res.status(500).json({ error: 'Failed to include device' });
+    }
+  });
+
+  router.post('/:deviceId/exclude', async (req: Request, res: Response) => {
+    try {
+      const { deviceId } = req.params;
+      await inclusionManager.setIncluded(deviceId, false);
+      logger.info({ deviceId }, 'Device excluded (reload required)');
+      res.json({
+        success: true,
+        message: 'Device excluded. Reload devices to remove from HomeKit.',
+        reloadRequired: true
+      });
+    } catch (error) {
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Failed to exclude device');
+      res.status(500).json({ error: 'Failed to exclude device' });
     }
   });
 

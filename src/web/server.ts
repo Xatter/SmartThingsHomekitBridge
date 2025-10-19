@@ -7,6 +7,7 @@ import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { Coordinator } from '@/coordinator/Coordinator';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { PluginManager } from '@/plugins';
+import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 import { createAuthRoutes } from './routes/auth';
 import { createDevicesRoutes } from './routes/devices';
 import { createHomeKitRoutes } from './routes/homekit';
@@ -49,10 +50,11 @@ export class WebServer {
     coordinator: Coordinator,
     hapServer: SmartThingsHAPServer,
     onAuthSuccess?: () => void,
-    pluginManager?: PluginManager
+    pluginManager?: PluginManager,
+    inclusionManager?: DeviceInclusionManager
   ): void {
     this.app.use('/api/auth', createAuthRoutes(auth, onAuthSuccess));
-    this.app.use('/api/devices', createDevicesRoutes(api, coordinator));
+    this.app.use('/api/devices', createDevicesRoutes(api, coordinator, inclusionManager!));
     this.app.use('/api/homekit', createHomeKitRoutes(hapServer));
 
     // Register plugin routes
@@ -68,15 +70,50 @@ export class WebServer {
         logger.info({ plugin: pluginName, routeCount: routes.length }, 'Registered plugin routes');
       }
 
-      // Plugin list endpoint
+      // Plugin list endpoint (with enabled status)
       this.app.get('/api/plugins', (req, res) => {
         const plugins = pluginManager.getPlugins().map(loaded => ({
           name: loaded.plugin.name,
           version: loaded.plugin.version,
           description: loaded.plugin.description,
           source: loaded.metadata.source,
+          enabled: pluginManager.isPluginEnabled(loaded.plugin.name),
         }));
         res.json(plugins);
+      });
+
+      // Enable plugin endpoint
+      this.app.post('/api/plugins/:name/enable', async (req, res) => {
+        try {
+          const { name } = req.params;
+          await pluginManager.enablePlugin(name);
+          logger.info({ plugin: name }, 'Plugin enabled (restart required)');
+          res.json({
+            success: true,
+            message: 'Plugin enabled. Restart required to take effect.',
+            restartRequired: true
+          });
+        } catch (error) {
+          logger.error({ err: error, plugin: req.params.name }, 'Failed to enable plugin');
+          res.status(500).json({ error: 'Failed to enable plugin' });
+        }
+      });
+
+      // Disable plugin endpoint
+      this.app.post('/api/plugins/:name/disable', async (req, res) => {
+        try {
+          const { name } = req.params;
+          await pluginManager.disablePlugin(name);
+          logger.info({ plugin: name }, 'Plugin disabled (restart required)');
+          res.json({
+            success: true,
+            message: 'Plugin disabled. Restart required to take effect.',
+            restartRequired: true
+          });
+        } catch (error) {
+          logger.error({ err: error, plugin: req.params.name }, 'Failed to disable plugin');
+          res.status(500).json({ error: 'Failed to disable plugin' });
+        }
       });
     }
 
@@ -89,6 +126,21 @@ export class WebServer {
           homekit: hapServer.getQrCode() !== null,
         },
       });
+    });
+
+    // System restart endpoint
+    this.app.post('/api/system/restart', (req, res) => {
+      logger.info('🔄 Restart requested via API');
+      res.json({
+        success: true,
+        message: 'Restarting bridge...'
+      });
+
+      // Trigger graceful shutdown after allowing response to be sent
+      setTimeout(() => {
+        logger.info('🔄 Initiating graceful shutdown for restart');
+        process.emit('SIGTERM' as any);
+      }, 500);
     });
 
     this.app.get('/', (req, res) => {

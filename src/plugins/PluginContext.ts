@@ -29,7 +29,7 @@ export class PluginContextImpl implements IPluginContext {
     getDeviceImpl: (deviceId: string) => UnifiedDevice | undefined,
     api: SmartThingsAPI,
     hapServer: SmartThingsHAPServer,
-    persistPath: string
+    dataPath: string
   ) {
     this.pluginName = pluginName;
     this.logger = logger;
@@ -38,7 +38,7 @@ export class PluginContextImpl implements IPluginContext {
     this.getDeviceImpl = getDeviceImpl;
     this.api = api;
     this.hapServer = hapServer;
-    this.persistPath = path.join(persistPath, 'plugins', pluginName);
+    this.persistPath = path.join(dataPath, 'plugins', pluginName);
   }
 
   getDevices(): UnifiedDevice[] {
@@ -128,5 +128,20 @@ export class PluginContextImpl implements IPluginContext {
       }
       throw error;
     }
+  }
+
+  async getDeviceStatus(deviceId: string): Promise<any> {
+    this.logger.debug({ deviceId }, 'Plugin requesting device status');
+    return await this.api.getDeviceStatus(deviceId);
+  }
+
+  async turnLightOff(deviceId: string): Promise<boolean> {
+    this.logger.debug({ deviceId }, 'Plugin requesting light off');
+    return await this.api.turnLightOff(deviceId);
+  }
+
+  async turnLightOn(deviceId: string): Promise<boolean> {
+    this.logger.debug({ deviceId }, 'Plugin requesting light on');
+    return await this.api.turnLightOn(deviceId);
   }
 }

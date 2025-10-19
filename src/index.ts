@@ -2,12 +2,12 @@ import dotenv from 'dotenv';
 import * as cron from 'node-cron';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
-import { LightingMonitor } from '@/monitoring/LightingMonitor';
 import { Coordinator } from '@/coordinator/Coordinator';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { WebServer } from '@/web/server';
 import { logger } from '@/utils/logger';
 import { ConfigLoader } from '@/config/BridgeConfig';
+import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 import { PluginManager } from '@/plugins';
 
 dotenv.config();
@@ -33,9 +33,9 @@ async function startup(): Promise<void> {
     const webPort = config.web.port;
     const hapPort = config.bridge.port;
     const hapPincode = config.bridge.pincode;
-    const lightingInterval = config.polling.lightingCheckInterval;
     const pollInterval = config.polling.devicePollInterval;
-    const persistPath = config.bridge.persistPath;
+    const persistPath = config.bridge.persistPath || process.env.HAP_PERSIST_PATH || './persist';
+    const dataPath = './data';
 
     logger.info('📦 Initializing services...');
 
@@ -54,7 +54,6 @@ async function startup(): Promise<void> {
       timezone: 'UTC'
     });
 
-    const lightingMonitor = new LightingMonitor(smartThingsAPI, lightingInterval);
     const hapServer = new SmartThingsHAPServer(hapPort, hapPincode);
 
     // Initialize plugin manager
@@ -71,18 +70,24 @@ async function startup(): Promise<void> {
       hapServer,
       () => coordinator?.getDevices() || [],
       (deviceId: string) => coordinator?.getDevice(deviceId),
-      persistPath
+      persistPath,
+      dataPath
     );
 
     await pluginManager.loadPlugins();
     await pluginManager.initializePlugins();
 
+    // Initialize device inclusion manager
+    logger.info('📋 Initializing device inclusion manager...');
+    const inclusionManager = new DeviceInclusionManager(dataPath, logger);
+    await inclusionManager.load();
+
     // Now create the coordinator with plugin support
     coordinator = new Coordinator(
       smartThingsAPI,
-      lightingMonitor,
       hapServer,
       pluginManager,
+      inclusionManager,
       statePath,
       pollInterval
     );
@@ -93,7 +98,6 @@ async function startup(): Promise<void> {
       logger.info('✅ SmartThings authentication successful, reloading devices...');
       try {
         await coordinator.reloadDevices();
-        // LightingMonitor will be started automatically by setDevices() in reloadDevices()
       } catch (error) {
         logger.error({ err: error }, '❌ Error reloading devices after auth');
       }
@@ -105,7 +109,8 @@ async function startup(): Promise<void> {
       coordinator,
       hapServer,
       onAuthSuccess,
-      pluginManager // Pass plugin manager for plugin routes
+      pluginManager, // Pass plugin manager for plugin routes
+      inclusionManager // Pass inclusion manager for device routes
     );
 
     if (!smartThingsAPI.hasAuth()) {
@@ -127,10 +132,6 @@ async function startup(): Promise<void> {
 
     logger.info('🌐 Starting web server...');
     await webServer.start();
-
-    // The lighting monitor will be started automatically when devices are set via setDevices()
-    // in the coordinator's reloadDevices() method
-    logger.info('🔍 Lighting monitor will start automatically when devices are loaded');
 
     logger.info({ webPort, hapPort }, '✅ SmartThings HomeKit Bridge is running!');
     logger.info({ pluginCount: pluginManager.getPlugins().length }, '🔌 Plugins loaded');
@@ -158,7 +159,6 @@ async function startup(): Promise<void> {
         tokenRefreshTask.stop();
         await pluginManager.stopPlugins();
         coordinator.stop();
-        lightingMonitor.stop();
         await hapServer.stop();
         await webServer.stop();
 

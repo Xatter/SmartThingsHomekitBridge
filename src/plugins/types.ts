@@ -53,6 +53,22 @@ export interface PluginContext {
    * Plugin name (for logging/state persistence)
    */
   pluginName: string;
+
+  /**
+   * Get current device status from SmartThings
+   * Returns fresh state directly from the API
+   */
+  getDeviceStatus(deviceId: string): Promise<any>;
+
+  /**
+   * Turn off device light (for AC display lights)
+   */
+  turnLightOff(deviceId: string): Promise<boolean>;
+
+  /**
+   * Turn on device light (for AC display lights)
+   */
+  turnLightOn(deviceId: string): Promise<boolean>;
 }
 
 /**

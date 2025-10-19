@@ -3,6 +3,7 @@ import { promises as fs } from 'fs';
 import { Logger } from 'pino';
 import { Plugin, LoadedPlugin, PluginContext, PluginWebRoute } from './types';
 import { PluginContextImpl } from './PluginContext';
+import { PluginConfigManager } from './PluginConfigManager';
 import { UnifiedDevice } from '@/types';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
@@ -20,6 +21,8 @@ export class PluginManager {
   private readonly getDevicesImpl: () => UnifiedDevice[];
   private readonly getDeviceImpl: (deviceId: string) => UnifiedDevice | undefined;
   private readonly persistPath: string;
+  private readonly dataPath: string;
+  private readonly pluginConfigManager: PluginConfigManager;
 
   constructor(
     logger: Logger,
@@ -28,7 +31,8 @@ export class PluginManager {
     hapServer: SmartThingsHAPServer,
     getDevicesImpl: () => UnifiedDevice[],
     getDeviceImpl: (deviceId: string) => UnifiedDevice | undefined,
-    persistPath: string
+    persistPath: string,
+    dataPath?: string
   ) {
     this.logger = logger.child({ component: 'PluginManager' });
     this.config = config;
@@ -37,6 +41,9 @@ export class PluginManager {
     this.getDevicesImpl = getDevicesImpl;
     this.getDeviceImpl = getDeviceImpl;
     this.persistPath = persistPath;
+    this.dataPath = dataPath || './data';
+    // Use dataPath for plugin config
+    this.pluginConfigManager = new PluginConfigManager(this.dataPath, logger);
   }
 
   /**
@@ -44,6 +51,9 @@ export class PluginManager {
    */
   async loadPlugins(): Promise<void> {
     this.logger.info('Loading plugins...');
+
+    // Load plugin configuration first
+    await this.pluginConfigManager.load();
 
     // Load built-in plugins
     await this.loadBuiltinPlugins();
@@ -67,17 +77,33 @@ export class PluginManager {
         if (!entry.isDirectory()) continue;
 
         const pluginDir = path.join(builtinPath, entry.name);
-        const indexPath = path.join(pluginDir, 'index.ts');
+
+        // Try both .js (compiled) and .ts (development) extensions
+        let indexPath = path.join(pluginDir, 'index.js');
+        try {
+          await fs.access(indexPath);
+        } catch {
+          // Try .ts if .js doesn't exist (development mode)
+          indexPath = path.join(pluginDir, 'index.ts');
+        }
 
         try {
-          // Check if index.ts exists
+          // Check if index file exists
           await fs.access(indexPath);
 
           // Dynamically import the plugin
           const pluginModule = await import(indexPath);
-          const plugin: Plugin = pluginModule.default || pluginModule;
 
-          // Check if plugin is enabled in config
+          // Handle ES6 module / CommonJS interop - check for double default wrapping
+          const plugin: Plugin = pluginModule.default?.default || pluginModule.default || pluginModule;
+
+          // Check if plugin is enabled in persistent config
+          if (!this.pluginConfigManager.isEnabled(plugin.name)) {
+            this.logger.info({ plugin: plugin.name }, 'Plugin disabled, skipping');
+            continue;
+          }
+
+          // Also check config file (for backwards compatibility)
           const pluginConfig = this.config.plugins?.[plugin.name];
           if (pluginConfig?.enabled === false) {
             this.logger.info({ plugin: plugin.name }, 'Plugin disabled in config, skipping');
@@ -93,7 +119,7 @@ export class PluginManager {
             this.getDeviceImpl,
             this.api,
             this.hapServer,
-            this.persistPath
+            this.dataPath
           );
 
           this.contexts.set(plugin.name, context);
@@ -341,5 +367,39 @@ export class PluginManager {
    */
   getPlugin(name: string): LoadedPlugin | undefined {
     return this.plugins.get(name);
+  }
+
+  /**
+   * Check if a plugin is enabled
+   */
+  isPluginEnabled(name: string): boolean {
+    return this.pluginConfigManager.isEnabled(name);
+  }
+
+  /**
+   * Enable a plugin
+   * Note: Requires application restart to take effect
+   */
+  async enablePlugin(name: string): Promise<void> {
+    await this.pluginConfigManager.setEnabled(name, true);
+  }
+
+  /**
+   * Disable a plugin
+   * Note: Requires application restart to take effect
+   */
+  async disablePlugin(name: string): Promise<void> {
+    await this.pluginConfigManager.setEnabled(name, false);
+  }
+
+  /**
+   * Get plugins with their enabled status
+   */
+  getPluginsWithStatus(): Array<LoadedPlugin & { enabled: boolean }> {
+    const loaded = this.getPlugins();
+    return loaded.map(plugin => ({
+      ...plugin,
+      enabled: this.isPluginEnabled(plugin.plugin.name)
+    }));
   }
 }
