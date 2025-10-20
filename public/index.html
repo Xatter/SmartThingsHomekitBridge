@@ -521,10 +521,19 @@
                     console.log('Devices response status:', response.status);
                     const data = await response.json();
                     console.log('Devices data:', data);
+
+                    // Check if response is an error object
+                    if (data.error || !Array.isArray(data)) {
+                        setError(data.error || 'Failed to fetch devices');
+                        setDevices([]);
+                        return;
+                    }
+
                     // API now returns array of all devices with inclusion status
-                    setDevices(data || []);
+                    setDevices(data);
                 } catch (error) {
                     setError('Failed to fetch devices');
+                    setDevices([]);
                     console.error('Error fetching devices:', error);
                 } finally {
                     setLoading(false);
