@@ -673,7 +673,20 @@
                         </button>
                     </div>
 
-                    {error && <div className="error">{error}</div>}
+                    {error && (
+                        <div className="error">
+                            {error}
+                            {authStatus.authenticated && (
+                                <button
+                                    className="nav-button"
+                                    onClick={initiateAuth}
+                                    style={{marginTop: '12px', marginLeft: '12px'}}
+                                >
+                                    Re-authenticate with SmartThings
+                                </button>
+                            )}
+                        </div>
+                    )}
 
                     {!authStatus.authenticated && (
                         <div className="card">
