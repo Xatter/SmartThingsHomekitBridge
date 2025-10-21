@@ -63,8 +63,15 @@ export class PluginConfigManager {
    * Check if a plugin is enabled
    */
   isEnabled(pluginName: string): boolean {
-    // Default to enabled if not configured
-    return this.config[pluginName]?.enabled ?? true;
+    // If explicitly configured, use that value
+    if (this.config[pluginName]?.enabled !== undefined) {
+      return this.config[pluginName].enabled;
+    }
+
+    // Default enabled/disabled based on plugin type
+    // Core plugins enabled by default, optional plugins disabled by default
+    const defaultEnabledPlugins = ['core-devices'];
+    return defaultEnabledPlugins.includes(pluginName);
   }
 
   /**
