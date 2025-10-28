@@ -82,3 +82,4 @@ npm start
 - Monitor console logs for accessory reuse messages (♻️ symbols)
 - Verify device IDs remain consistent across restarts
 - Use Home app's accessory details to check if SerialNumber matches deviceId
+- We use terraform to deploy to production, it's located in the ../infrastructure project

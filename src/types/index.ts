@@ -85,4 +85,11 @@ export interface UnifiedDevice {
   thermostatCapabilities: ThermostatCapabilities;
   currentState?: DeviceState;
   isPaired: boolean;
+
+  // Convenience properties for plugins (from currentState)
+  currentTemperature?: number;
+  heatingSetpoint?: number;
+  coolingSetpoint?: number;
+  mode?: 'heat' | 'cool' | 'auto' | 'off';
+  temperatureSetpoint?: number;
 }
