@@ -187,7 +187,7 @@ export class SmartThingsHAPServer {
     }
 
     logger.info(`🔄 Restoring ${cachedAccessories.length} cached accessories...`);
-    logger.info('   Note: Accessories will be synced with inclusion settings when coordinator reloads devices');
+    logger.info('Note: Accessories will be synced with inclusion settings when coordinator reloads devices');
     const accessories: Accessory[] = [];
     const setupPromises: Promise<void>[] = [];
 

@@ -69,7 +69,11 @@ export class PluginConfigManager {
     }
 
     // Default enabled/disabled based on plugin type
-    // Core plugins enabled by default, optional plugins disabled by default
+    // Only 'core-devices' is enabled by default as it provides essential device bridging.
+    // Optional plugins like 'hvac-auto-mode' and 'lighting-monitor' are disabled by default
+    // to prevent unexpected behavior and allow users to opt-in to features they want.
+    // This approach ensures the bridge works reliably out-of-the-box while giving users
+    // control over additional functionality through explicit configuration.
     const defaultEnabledPlugins = ['core-devices'];
     return defaultEnabledPlugins.includes(pluginName);
   }

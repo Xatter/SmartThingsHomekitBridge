@@ -523,8 +523,13 @@
                     console.log('Devices data:', data);
 
                     // Check if response is an error object
-                    if (data.error || !Array.isArray(data)) {
-                        setError(data.error || 'Failed to fetch devices');
+                    if (data.error) {
+                        setError(data.error);
+                        setDevices([]);
+                        return;
+                    }
+                    if (!Array.isArray(data)) {
+                        setError('Unexpected response format from devices API');
                         setDevices([]);
                         return;
                     }

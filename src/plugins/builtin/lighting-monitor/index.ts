@@ -70,7 +70,15 @@ class LightingMonitorPlugin implements Plugin {
       const minutes = seconds / 60;
       return `*/${minutes} * * * *`;
     }
-    return `*/${seconds} * * * * *`;
+    // Node-cron does not support seconds granularity by default.
+    // If a sub-minute interval is requested, log a warning and use every minute.
+    if (this.context && this.context.logger) {
+      this.context.logger.warn(
+        { requestedInterval: seconds },
+        'Lighting Monitor: Sub-minute intervals are not supported; using every minute instead.'
+      );
+    }
+    return `* * * * *`; // Every minute
   }
 
   /**
@@ -239,6 +247,7 @@ class LightingMonitorPlugin implements Plugin {
     return [
       {
         path: '/status',
+        method: 'get',
         handler: (req: Request, res: Response) => {
           const devices = this.context.getDevices();
           const monitoredDevices = devices.filter(d => this.shouldHandleDevice(d));
@@ -256,6 +265,7 @@ class LightingMonitorPlugin implements Plugin {
       },
       {
         path: '/check/:deviceId',
+        method: 'get',
         handler: async (req: Request, res: Response) => {
           const { deviceId } = req.params;
 

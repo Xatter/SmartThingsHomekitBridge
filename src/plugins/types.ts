@@ -76,6 +76,7 @@ export interface PluginContext {
  */
 export interface PluginWebRoute {
   path: string;
+  method: 'get' | 'post' | 'put' | 'delete' | 'patch';
   handler: RequestHandler;
 }
 

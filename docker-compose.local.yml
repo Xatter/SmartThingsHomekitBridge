@@ -7,15 +7,17 @@ services:
     restart: unless-stopped
     # Use host networking for HomeKit/mDNS to work properly
     network_mode: host
+    env_file:
+      - .env.local
     environment:
       - NODE_ENV=development
 
-      # SmartThings OAuth Configuration (from production)
-      - SMARTTHINGS_APP_ID=e18a38f9-5aea-4fb3-8e41-243fc0e6555a
-      - SMARTTHINGS_CLIENT_ID=beb5d179-ed3d-4b0f-aed6-0d268ef4b9c7
-      - SMARTTHINGS_CLIENT_SECRET=9ea208ec-b50f-4ede-a08b-44be100e34b7
-      # Local redirect URI - will need to update SmartThings app config to allow localhost
-      - SMARTTHINGS_REDIRECT_URI=http://localhost:3001/api/auth/smartthings/callback
+      # SmartThings OAuth Configuration - loaded from .env.local file
+      # Create a .env.local file with your credentials:
+      # SMARTTHINGS_APP_ID=your-app-id
+      # SMARTTHINGS_CLIENT_ID=your-client-id
+      # SMARTTHINGS_CLIENT_SECRET=your-client-secret
+      # SMARTTHINGS_REDIRECT_URI=http://localhost:3001/api/auth/smartthings/callback
 
       # Server Configuration - use different port to avoid conflict
       - PORT=3001

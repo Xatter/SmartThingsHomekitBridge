@@ -287,6 +287,7 @@ class HVACAutoModePlugin implements Plugin {
     return [
       {
         path: '/status',
+        method: 'get',
         handler: async (req: Request, res: Response) => {
           const status = this.controller.getStatus();
           res.json(status);
@@ -294,6 +295,7 @@ class HVACAutoModePlugin implements Plugin {
       },
       {
         path: '/decision',
+        method: 'get',
         handler: async (req: Request, res: Response) => {
           const devices = this.context.getDevices();
           const enrolledIds = this.controller.getEnrolledDeviceIds();

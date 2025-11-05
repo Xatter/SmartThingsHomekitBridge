@@ -1,6 +1,5 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import { DeviceState } from '@/types';
 import { logger } from '@/utils/logger';
 
 /**

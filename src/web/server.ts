@@ -54,7 +54,9 @@ export class WebServer {
     inclusionManager?: DeviceInclusionManager
   ): void {
     this.app.use('/api/auth', createAuthRoutes(auth, onAuthSuccess));
-    this.app.use('/api/devices', createDevicesRoutes(api, coordinator, inclusionManager!));
+    if (inclusionManager) {
+      this.app.use('/api/devices', createDevicesRoutes(api, coordinator, inclusionManager));
+    }
     this.app.use('/api/homekit', createHomeKitRoutes(hapServer));
 
     // Register plugin routes
@@ -63,8 +65,7 @@ export class WebServer {
       for (const [pluginName, routes] of pluginRoutes) {
         const router = express.Router();
         for (const route of routes) {
-          router.get(route.path, route.handler);
-          router.post(route.path, route.handler);
+          router[route.method](route.path, route.handler);
         }
         this.app.use(`/api/plugins/${pluginName}`, router);
         logger.info({ plugin: pluginName, routeCount: routes.length }, 'Registered plugin routes');
@@ -139,7 +140,7 @@ export class WebServer {
       // Trigger graceful shutdown after allowing response to be sent
       setTimeout(() => {
         logger.info('🔄 Initiating graceful shutdown for restart');
-        process.emit('SIGTERM' as any);
+        process.kill(process.pid, 'SIGTERM');
       }, 500);
     });
 

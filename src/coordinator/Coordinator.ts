@@ -55,7 +55,13 @@ export class Coordinator {
       const minutes = seconds / 60;
       return `*/${minutes} * * * *`;
     }
-    return `*/${seconds} * * * * *`;
+    // Node-cron does not support seconds granularity by default.
+    // If a sub-minute interval is requested, log a warning and use every minute.
+    logger.warn(
+      { requestedInterval: seconds },
+      'Coordinator: Sub-minute polling intervals are not supported; using every minute instead.'
+    );
+    return `* * * * *`; // Every minute
   }
 
   async initialize(): Promise<void> {
@@ -151,7 +157,6 @@ export class Coordinator {
       });
 
       const excludedCount = allDevices.length - includedDevices.length;
-      const deviceIds = includedDevices.map(device => device.deviceId);
 
       logger.info({
         total: allDevices.length,
@@ -258,8 +263,13 @@ export class Coordinator {
 
           // Update HAP if state changed
           if (previousState) {
-            const tempDiff = Math.abs((previousState.currentTemperature || 0) - (deviceState.currentTemperature || 0));
-            const setpointDiff = Math.abs((previousState.temperatureSetpoint || 0) - (deviceState.temperatureSetpoint || 0));
+            // Skip temperature diff calculations if values are undefined (0 is a valid temperature!)
+            const tempDiff = (previousState.currentTemperature !== undefined && deviceState.currentTemperature !== undefined)
+              ? Math.abs(previousState.currentTemperature - deviceState.currentTemperature)
+              : Infinity; // Force update if temperature becomes defined/undefined
+            const setpointDiff = (previousState.temperatureSetpoint !== undefined && deviceState.temperatureSetpoint !== undefined)
+              ? Math.abs(previousState.temperatureSetpoint - deviceState.temperatureSetpoint)
+              : Infinity; // Force update if setpoint becomes defined/undefined
             const modeChanged = previousState.mode !== stateForHomeKit.mode;
 
             const stateChanged = modeChanged || setpointDiff > 0.5 || tempDiff > 0.5;
