@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  smartthings-bridge-local:
+    build: .
+    container_name: smartthings-homekit-bridge-local
+    restart: unless-stopped
+    # Use host networking for HomeKit/mDNS to work properly
+    network_mode: host
+    env_file:
+      - .env.local
+    environment:
+      - NODE_ENV=development
+
+      # SmartThings OAuth Configuration - loaded from .env.local file
+      # Create a .env.local file with your credentials:
+      # SMARTTHINGS_APP_ID=your-app-id
+      # SMARTTHINGS_CLIENT_ID=your-client-id
+      # SMARTTHINGS_CLIENT_SECRET=your-client-secret
+      # SMARTTHINGS_REDIRECT_URI=http://localhost:3001/api/auth/smartthings/callback
+
+      # Server Configuration - use different port to avoid conflict
+      - PORT=3001
+      - WEB_PORT=3001
+
+      # HomeKit Configuration - use different port to avoid conflict with production Homebridge
+      - HAP_PORT=52827
+      - HAP_PINCODE=942-37-286
+      - HAP_BRIDGE_USERNAME=CC:22:3D:E3:CE:F6  # Different MAC from production
+
+      # Storage Paths (these will use the NFS volumes)
+      - CONFIG_PATH=/app/data/config.json
+      - AUTH_TOKEN_PATH=/app/data/smartthings_token.json
+      - DEVICE_STATE_PATH=/app/data/device_state.json
+
+      # Logging
+      - LOG_LEVEL=debug
+
+    volumes:
+      # Bind mount the NFS volumes that are mounted on the host
+      # Run ./mount-nfs.sh first to mount the NFS shares
+      - type: bind
+        source: /tmp/smartthings-nfs/data
+        target: /app/data
+
+      - type: bind
+        source: /tmp/smartthings-nfs/persist
+        target: /app/persist
+
+    # Note: With host networking, ports are not mapped - the container uses host's network directly
+    # Web interface: http://localhost:3001
+    # HAP server: port 52827

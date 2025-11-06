@@ -2,52 +2,45 @@ import * as cron from 'node-cron';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
-import { LightingMonitor } from '@/monitoring/LightingMonitor';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { CoordinatorState, DeviceState, UnifiedDevice } from '@/types';
 import { HAPThermostatEvent } from '@/hap/HAPServer';
 import { logger } from '@/utils/logger';
-import { AutoModeController, AutoModeDevice } from '@/controller/AutoModeController';
+import { PluginManager } from '@/plugins';
+import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
+import { isThermostatLikeDevice } from '@/utils/deviceUtils';
 
 /**
- * Coordinates device state between SmartThings API, HomeKit bridge, and lighting monitor.
- * Manages device synchronization, temperature control, and polling.
+ * Coordinates device state between SmartThings API, HomeKit bridge, and plugins.
+ * Manages device synchronization and polling.
+ *
+ * This is a refactored version that delegates device-specific logic to plugins.
  */
 export class Coordinator {
   private readonly api: SmartThingsAPI;
-  private readonly lightingMonitor: LightingMonitor;
   private readonly hapServer: SmartThingsHAPServer;
+  private readonly pluginManager: PluginManager;
+  private readonly inclusionManager: DeviceInclusionManager;
   private readonly stateFilePath: string;
-  private readonly autoModeController: AutoModeController;
   private state: CoordinatorState;
   private pollTask: cron.ScheduledTask | null = null;
   private readonly pollInterval: string;
+  private deviceMetadata: Map<string, UnifiedDevice> = new Map();
 
-  /**
-   * Creates a new Coordinator instance.
-   * @param api - SmartThings API client
-   * @param lightingMonitor - Lighting monitor for AC light control
-   * @param hapServer - HomeKit bridge server
-   * @param stateFilePath - Path to persist coordinator state
-   * @param pollIntervalSeconds - Device polling interval in seconds (default: 300)
-   */
   constructor(
     api: SmartThingsAPI,
-    lightingMonitor: LightingMonitor,
     hapServer: SmartThingsHAPServer,
+    pluginManager: PluginManager,
+    inclusionManager: DeviceInclusionManager,
     stateFilePath: string,
     pollIntervalSeconds: number = 300
   ) {
     this.api = api;
-    this.lightingMonitor = lightingMonitor;
     this.hapServer = hapServer;
+    this.pluginManager = pluginManager;
+    this.inclusionManager = inclusionManager;
     this.stateFilePath = stateFilePath;
     this.pollInterval = this.convertSecondsToInterval(pollIntervalSeconds);
-
-    // Initialize auto-mode controller with state file in same directory as coordinator state
-    const stateDir = path.dirname(stateFilePath);
-    const autoModeStatePath = path.join(stateDir, 'auto_mode_state.json');
-    this.autoModeController = new AutoModeController(autoModeStatePath);
 
     this.state = {
       pairedDevices: [],
@@ -62,23 +55,30 @@ export class Coordinator {
       const minutes = seconds / 60;
       return `*/${minutes} * * * *`;
     }
-    return `*/${seconds} * * * * *`;
+    // Node-cron does not support seconds granularity by default.
+    // If a sub-minute interval is requested, log a warning and use every minute.
+    logger.warn(
+      { requestedInterval: seconds },
+      'Coordinator: Sub-minute polling intervals are not supported; using every minute instead.'
+    );
+    return `* * * * *`; // Every minute
   }
 
-  /**
-   * Initializes the coordinator by loading state and starting polling.
-   * Defers device reloading by 2 seconds to avoid blocking pairing process.
-   */
   async initialize(): Promise<void> {
     await this.loadState();
-    await this.autoModeController.load();
-    // Only reload devices if we have auth and existing devices to restore
-    if (this.api.hasAuth() && this.state.pairedDevices.length > 0) {
+
+    // Reload devices if we have auth to sync with current inclusion settings
+    // This ensures excluded devices are removed from HomeKit on startup
+    if (this.api.hasAuth()) {
       // Defer device loading to avoid blocking pairing process
       setTimeout(async () => {
+        logger.info('🔄 Syncing devices with inclusion settings and HomeKit...');
         await this.reloadDevices();
       }, 2000);
+    } else {
+      logger.info('⏸️  Skipping device sync - no authentication available');
     }
+
     this.startPolling();
   }
 
@@ -124,7 +124,7 @@ export class Coordinator {
         deviceStates: Array.from(this.state.deviceStates.entries()),
       };
 
-      await fs.mkdir(require('path').dirname(this.stateFilePath), { recursive: true });
+      await fs.mkdir(path.dirname(this.stateFilePath), { recursive: true });
       await fs.writeFile(this.stateFilePath, JSON.stringify(stateToSave, null, 2));
     } catch (error) {
       logger.error({ err: error }, 'Error saving coordinator state');
@@ -132,7 +132,7 @@ export class Coordinator {
   }
 
   /**
-   * Reloads all HVAC devices from SmartThings and syncs them to HomeKit.
+   * Reloads all devices from SmartThings and syncs them to HomeKit.
    * Does not remove existing devices - preserves HomeKit stability.
    */
   async reloadDevices(): Promise<void> {
@@ -145,23 +145,75 @@ export class Coordinator {
 
     try {
       logger.info('🔍 Reloading devices from SmartThings');
-      const filteredDevices = await this.api.getDevices([]);
-      const deviceIds = filteredDevices.map(device => device.deviceId);
+      const allDevices = await this.api.getDevices([]);
 
-      logger.info({ count: filteredDevices.length }, '📱 Found HVAC devices');
-      logger.debug('🏠 HVAC devices found:');
-      filteredDevices.forEach(device => {
-        logger.debug({ deviceId: device.deviceId, name: device.name, capabilities: device.capabilities.map(cap => cap.id) }, `  - Device: ${device.name}`);
+      // Filter devices based on inclusion settings
+      const includedDevices = allDevices.filter(device => {
+        const isIncluded = this.inclusionManager.isIncluded(device.deviceId);
+        if (!isIncluded) {
+          logger.debug({ deviceId: device.deviceId, name: device.name }, 'Device excluded from HomeKit');
+        }
+        return isIncluded;
       });
 
-      // Don't remove devices during reload - this preserves HomeKit stability
-      // Devices should only be removed explicitly by user action
+      const excludedCount = allDevices.length - includedDevices.length;
 
-      this.state.pairedDevices = deviceIds;
-      this.lightingMonitor.setDevices(deviceIds);
+      logger.info({
+        total: allDevices.length,
+        included: includedDevices.length,
+        excluded: excludedCount
+      }, '📱 Found devices');
 
-      // Add or update devices in HAP server
-      for (const device of filteredDevices) {
+      logger.debug('🏠 Included devices:');
+      includedDevices.forEach(device => {
+        logger.debug({
+          deviceId: device.deviceId,
+          name: device.name,
+          capabilities: device.capabilities.map(cap => cap.id)
+        }, `  - Device: ${device.name}`);
+      });
+
+      // Filter for HVAC devices that should be added to HomeKit
+      const hvacDevices = includedDevices.filter(device => {
+        const isHVAC = isThermostatLikeDevice(device);
+
+        if (!isHVAC) {
+          logger.info({ deviceId: device.deviceId, name: device.name },
+            '⏭️  Skipping non-HVAC device for HomeKit (device visible in web UI only)');
+        }
+
+        return isHVAC;
+      });
+
+      logger.info({
+        total: includedDevices.length,
+        hvac: hvacDevices.length,
+        nonHvac: includedDevices.length - hvacDevices.length
+      }, '🌡️  Filtering HVAC devices for HomeKit');
+
+      // Store device metadata for all included devices (needed for capability checks)
+      this.deviceMetadata.clear();
+      for (const device of includedDevices) {
+        this.deviceMetadata.set(device.deviceId, device);
+      }
+
+      // Determine which devices should be removed from HomeKit
+      const currentDeviceIds = new Set(this.state.pairedDevices);
+      const newDeviceIds = new Set(hvacDevices.map(d => d.deviceId));
+      const devicesToRemove = Array.from(currentDeviceIds).filter(id => !newDeviceIds.has(id));
+
+      // Remove devices that are no longer included or no longer HVAC
+      for (const deviceId of devicesToRemove) {
+        try {
+          await this.hapServer.removeDevice(deviceId);
+          logger.info({ deviceId }, '🗑️  Removed device from HomeKit');
+        } catch (error) {
+          logger.error({ deviceId, err: error }, '❌ Failed to remove device from HomeKit');
+        }
+      }
+
+      // Add or update HVAC devices in HAP server
+      for (const device of hvacDevices) {
         const deviceState = await this.getDeviceStateByDevice(device);
         if (deviceState) {
           try {
@@ -173,7 +225,13 @@ export class Coordinator {
         }
       }
 
-      logger.info({ count: deviceIds.length }, '✅ Reloaded devices: HVAC devices synchronized');
+      // Update pairedDevices to only track HVAC devices actually in HomeKit
+      this.state.pairedDevices = hvacDevices.map(d => d.deviceId);
+
+      logger.info({
+        added: hvacDevices.length,
+        removed: devicesToRemove.length
+      }, '✅ Reloaded devices: synchronized');
 
       await this.updateDeviceStates();
       await this.saveState();
@@ -190,23 +248,28 @@ export class Coordinator {
         const deviceState = await this.api.getDeviceStatus(deviceId);
         if (deviceState) {
           const previousState = this.state.deviceStates.get(deviceId);
+          const device = this.buildUnifiedDevice(deviceId, deviceState);
 
-          // Check if device is enrolled in auto mode
-          const isAutoMode = this.autoModeController.getEnrolledDeviceIds().includes(deviceId);
+          // Allow plugins to modify state before applying to HomeKit
+          let stateForHomeKit = await this.pluginManager.beforeSetHomeKitState(device, deviceState);
 
-          // If in auto mode, preserve the 'auto' mode for HomeKit
-          // (SmartThings reports the actual mode, but we want to show 'auto' in HomeKit)
-          const stateForHomeKit = isAutoMode
-            ? { ...deviceState, mode: 'auto' as const }
-            : deviceState;
+          if (stateForHomeKit === null) {
+            logger.debug({ deviceId }, 'HomeKit state update cancelled by plugin');
+            return;
+          }
 
-          // Store the state with preserved mode
+          // Store the state
           this.state.deviceStates.set(deviceId, stateForHomeKit);
 
           // Update HAP if state changed
           if (previousState) {
-            const tempDiff = Math.abs(previousState.currentTemperature - deviceState.currentTemperature);
-            const setpointDiff = Math.abs(previousState.temperatureSetpoint - deviceState.temperatureSetpoint);
+            // Skip temperature diff calculations if values are undefined (0 is a valid temperature!)
+            const tempDiff = (previousState.currentTemperature !== undefined && deviceState.currentTemperature !== undefined)
+              ? Math.abs(previousState.currentTemperature - deviceState.currentTemperature)
+              : Infinity; // Force update if temperature becomes defined/undefined
+            const setpointDiff = (previousState.temperatureSetpoint !== undefined && deviceState.temperatureSetpoint !== undefined)
+              ? Math.abs(previousState.temperatureSetpoint - deviceState.temperatureSetpoint)
+              : Infinity; // Force update if setpoint becomes defined/undefined
             const modeChanged = previousState.mode !== stateForHomeKit.mode;
 
             const stateChanged = modeChanged || setpointDiff > 0.5 || tempDiff > 0.5;
@@ -217,9 +280,11 @@ export class Coordinator {
                 tempDiff: tempDiff.toFixed(1),
                 setpointDiff: setpointDiff.toFixed(1),
                 modeChange: modeChanged ? `${previousState.mode} -> ${stateForHomeKit.mode}` : 'unchanged',
-                autoMode: isAutoMode
               }, '📈 State change detected');
               await this.hapServer.updateDeviceState(deviceId, stateForHomeKit);
+
+              // Notify plugins of state change
+              await this.pluginManager.afterDeviceUpdate(device, stateForHomeKit, previousState);
             } else {
               logger.debug({ deviceName: deviceState.name }, 'No significant changes');
             }
@@ -234,48 +299,48 @@ export class Coordinator {
     });
 
     await Promise.allSettled(promises);
-    this.calculateAverageTemperature();
-    this.determineCurrentMode();
   }
 
-  private calculateAverageTemperature(): void {
-    const temperatures = Array.from(this.state.deviceStates.values())
-      .map(state => state.temperatureSetpoint)
-      .filter(temp => temp > 0);
+  private buildUnifiedDevice(deviceId: string, deviceState: DeviceState): UnifiedDevice {
+    // Try to get stored device metadata first
+    const metadata = this.deviceMetadata.get(deviceId);
 
-    if (temperatures.length > 0) {
-      this.state.averageTemperature = temperatures.reduce((sum, temp) => sum + temp, 0) / temperatures.length;
-    }
-  }
-
-  private determineCurrentMode(): void {
-    // Only consider devices that are ON (mode !== 'off') for determining the active mode
-    const onDeviceModes = Array.from(this.state.deviceStates.values())
-      .filter(state => state.mode !== 'off')
-      .map(state => state.mode);
-
-    if (onDeviceModes.length === 0) {
-      // All devices are off
-      this.state.currentMode = 'off';
-      return;
+    if (metadata) {
+      // Return metadata with updated state
+      return {
+        ...metadata,
+        currentState: deviceState,
+        isPaired: true,
+        // Update convenience properties from currentState
+        currentTemperature: deviceState.currentTemperature,
+        heatingSetpoint: deviceState.heatingSetpoint,
+        coolingSetpoint: deviceState.coolingSetpoint,
+        mode: deviceState.mode,
+        temperatureSetpoint: deviceState.temperatureSetpoint,
+      };
     }
 
-    const modeCount = onDeviceModes.reduce((acc, mode) => {
-      acc[mode] = (acc[mode] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>);
-
-    let mostCommonMode = 'off';
-    let maxCount = 0;
-
-    for (const [mode, count] of Object.entries(modeCount)) {
-      if (count > maxCount) {
-        maxCount = count;
-        mostCommonMode = mode;
-      }
-    }
-
-    this.state.currentMode = mostCommonMode as 'heat' | 'cool' | 'auto' | 'off';
+    // Fallback: build minimal device if metadata not available
+    logger.warn({ deviceId }, 'Building device without metadata - capabilities unknown');
+    return {
+      deviceId,
+      label: deviceState.name,
+      name: deviceState.name,
+      manufacturerName: '',
+      presentationId: '',
+      deviceTypeName: '',
+      capabilities: [],
+      components: [],
+      thermostatCapabilities: {},
+      currentState: deviceState,
+      isPaired: true,
+      // Convenience properties from currentState
+      currentTemperature: deviceState.currentTemperature,
+      heatingSetpoint: deviceState.heatingSetpoint,
+      coolingSetpoint: deviceState.coolingSetpoint,
+      mode: deviceState.mode,
+      temperatureSetpoint: deviceState.temperatureSetpoint,
+    };
   }
 
   private startPolling(): void {
@@ -301,140 +366,142 @@ export class Coordinator {
 
     logger.debug('⏰ Coordinator: Polling devices');
 
-    const previousAverageTemp = this.state.averageTemperature;
     await this.updateDeviceStates();
 
-    // Clean up stale enrolled devices
-    await this.cleanupStaleEnrolledDevices();
-
-    // Evaluate and apply auto-mode if devices are enrolled
-    await this.evaluateAndApplyAutoMode();
-
-    if (Math.abs(this.state.averageTemperature - previousAverageTemp) > 0.5) {
-      logger.info({
-        previousTemp: previousAverageTemp,
-        newTemp: this.state.averageTemperature
-      }, 'Temperature change detected');
-      await this.synchronizeTemperatures();
+    // Build unified device array for plugins
+    const devices: UnifiedDevice[] = [];
+    for (const [deviceId, deviceState] of this.state.deviceStates.entries()) {
+      devices.push(this.buildUnifiedDevice(deviceId, deviceState));
     }
+
+    // Let plugins run their poll cycle logic
+    await this.pluginManager.onPollCycle(devices);
 
     await this.saveState();
     logger.debug('✅ Coordinator: Polling complete');
   }
 
-  private async synchronizeTemperatures(): Promise<void> {
-    const targetTemp = this.state.averageTemperature;
-    const currentMode = this.state.currentMode;
-
-    if (currentMode === 'off' || currentMode === 'auto') {
-      return;
+  /**
+   * Get a device state by device info (used during initial loading)
+   */
+  private async getDeviceStateByDevice(device: any): Promise<DeviceState | null> {
+    try {
+      const status = await this.api.getDeviceStatus(device.deviceId);
+      return status;
+    } catch (error) {
+      logger.error({ err: error, deviceId: device.deviceId }, 'Error getting device state');
+      return null;
     }
+  }
 
-    logger.info({ targetTemp, mode: currentMode }, 'Synchronizing all devices to temperature');
+  /**
+   * Handle HomeKit thermostat events (mode/temperature changes)
+   */
+  async handleThermostatEvent(event: HAPThermostatEvent): Promise<void> {
+    try {
+      logger.info({ event }, '🎛️  Received HAP thermostat event');
 
-    const promises = this.state.pairedDevices.map(async (deviceId) => {
-      try {
-        const currentState = this.state.deviceStates.get(deviceId);
-        if (currentState && Math.abs(currentState.temperatureSetpoint - targetTemp) > 0.5) {
-          await this.changeTemperature(deviceId, targetTemp);
-        }
-      } catch (error) {
-        logger.error({ err: error, deviceId }, 'Error synchronizing temperature for device');
+      const currentState = this.state.deviceStates.get(event.deviceId);
+      if (!currentState) {
+        logger.error({ deviceId: event.deviceId }, 'No state found for device');
+        return;
       }
-    });
 
-    await Promise.allSettled(promises);
-  }
+      const device = this.buildUnifiedDevice(event.deviceId, currentState);
+      const proposedState = {
+        thermostatMode: event.mode,
+        heatingSetpoint: event.heatingSetpoint,
+        coolingSetpoint: event.coolingSetpoint,
+      };
 
-  /**
-   * Changes the temperature setpoint for a specific device.
-   * Converts auto mode to cool. Does not work in off mode.
-   * @param deviceId - Device to update
-   * @param temperature - Target temperature in Fahrenheit
-   * @returns true if successful, false otherwise
-   */
-  async changeTemperature(deviceId: string, temperature: number): Promise<boolean> {
-    const currentState = this.state.deviceStates.get(deviceId);
-    if (!currentState) {
-      logger.error({ deviceId }, 'Cannot change temperature: No state found for device');
-      return false;
-    }
+      // Let plugins intercept the state change
+      const finalState = await this.pluginManager.beforeSetSmartThingsState(device, proposedState);
 
-    const mode = currentState.mode === 'auto' ? 'cool' : currentState.mode;
-    if (mode === 'off') {
-      logger.warn({ deviceId }, 'Cannot set temperature for device: mode is off');
-      return false;
-    }
+      if (finalState === null) {
+        logger.info({ deviceId: event.deviceId }, 'State change cancelled by plugin');
+        return;
+      }
 
-    const success = await this.api.setTemperature(deviceId, temperature, mode as 'heat' | 'cool');
+      // Apply state changes to SmartThings
+      const commands: any[] = [];
 
-    if (success) {
-      currentState.temperatureSetpoint = temperature;
-      currentState.lastUpdated = new Date();
-      this.state.deviceStates.set(deviceId, currentState);
-      await this.saveState();
-    }
+      if (finalState.thermostatMode !== undefined) {
+        // Check if device uses airConditionerMode or thermostatMode
+        const caps = device.thermostatCapabilities;
+        const usesAirConditionerMode = caps.airConditionerMode && !caps.thermostatMode;
 
-    return success;
-  }
+        logger.debug({
+          deviceId: event.deviceId,
+          deviceName: device.label,
+          thermostatCapabilities: caps,
+          usesAirConditionerMode,
+          mode: finalState.thermostatMode
+        }, 'Determining which mode capability to use');
 
-  /**
-   * Changes the operating mode for a specific device.
-   * If mode is heat/cool, synchronizes all other ON devices to the same mode.
-   * @param deviceId - Device to update
-   * @param mode - Target mode (heat, cool, auto, or off)
-   * @returns true if successful, false otherwise
-   */
-  async changeMode(deviceId: string, mode: 'heat' | 'cool' | 'auto' | 'off'): Promise<boolean> {
-    const success = await this.api.setMode(deviceId, mode);
+        if (usesAirConditionerMode) {
+          // Samsung air conditioner - use airConditionerMode capability
+          logger.info({ deviceId: event.deviceId, mode: finalState.thermostatMode },
+            '🌡️  Using airConditionerMode for Samsung AC');
+          commands.push({
+            component: 'main',
+            capability: 'airConditionerMode',
+            command: 'setAirConditionerMode',
+            arguments: [finalState.thermostatMode],
+          });
+        } else {
+          // Traditional thermostat - use thermostatMode capability
+          logger.info({ deviceId: event.deviceId, mode: finalState.thermostatMode },
+            '🌡️  Using thermostatMode for traditional thermostat');
+          commands.push({
+            component: 'main',
+            capability: 'thermostatMode',
+            command: 'setThermostatMode',
+            arguments: [finalState.thermostatMode],
+          });
+        }
+      }
 
-    if (success) {
-      const currentState = this.state.deviceStates.get(deviceId);
-      if (currentState) {
-        currentState.mode = mode;
+      if (finalState.heatingSetpoint !== undefined) {
+        commands.push({
+          component: 'main',
+          capability: 'thermostatHeatingSetpoint',
+          command: 'setHeatingSetpoint',
+          arguments: [finalState.heatingSetpoint],
+        });
+      }
+
+      if (finalState.coolingSetpoint !== undefined) {
+        commands.push({
+          component: 'main',
+          capability: 'thermostatCoolingSetpoint',
+          command: 'setCoolingSetpoint',
+          arguments: [finalState.coolingSetpoint],
+        });
+      }
+
+      if (commands.length > 0) {
+        await this.api.executeCommands(event.deviceId, commands);
+        logger.info({ deviceId: event.deviceId, commands }, '✅ Commands sent to SmartThings');
+
+        // Update local state
+        currentState.mode = finalState.thermostatMode || currentState.mode;
+        if (finalState.heatingSetpoint !== undefined) {
+          currentState.heatingSetpoint = finalState.heatingSetpoint;
+        }
+        if (finalState.coolingSetpoint !== undefined) {
+          currentState.coolingSetpoint = finalState.coolingSetpoint;
+        }
         currentState.lastUpdated = new Date();
-        this.state.deviceStates.set(deviceId, currentState);
+        this.state.deviceStates.set(event.deviceId, currentState);
+        await this.saveState();
       }
-
-      await this.synchronizeModesAcrossDevices(mode);
-      await this.saveState();
+    } catch (error) {
+      logger.error({ err: error, deviceId: event.deviceId }, 'Error handling thermostat event');
     }
-
-    return success;
-  }
-
-  private async synchronizeModesAcrossDevices(newMode: 'heat' | 'cool' | 'auto' | 'off'): Promise<void> {
-    if (newMode === 'auto' || newMode === 'off') {
-      return;
-    }
-
-    logger.info({ mode: newMode }, 'Synchronizing all ON devices to mode');
-
-    const promises = this.state.pairedDevices.map(async (deviceId) => {
-      try {
-        const currentState = this.state.deviceStates.get(deviceId);
-        // Only synchronize devices that are already ON (mode !== 'off')
-        if (currentState && currentState.mode !== 'off' && currentState.mode !== newMode) {
-          await this.api.setMode(deviceId, newMode);
-          currentState.mode = newMode;
-          currentState.lastUpdated = new Date();
-          this.state.deviceStates.set(deviceId, currentState);
-
-          // Update HAP server with the new state
-          await this.hapServer.updateDeviceState(deviceId, currentState);
-        }
-      } catch (error) {
-        logger.error({ err: error, deviceId }, 'Error synchronizing mode for device');
-      }
-    });
-
-    await Promise.allSettled(promises);
-    this.state.currentMode = newMode;
   }
 
   /**
    * Returns a copy of all device states.
-   * @returns Map of device IDs to their current states
    */
   getDeviceStates(): Map<string, DeviceState> {
     return new Map(this.state.deviceStates);
@@ -442,7 +509,6 @@ export class Coordinator {
 
   /**
    * Returns a copy of the complete coordinator state.
-   * @returns Coordinator state including paired devices, average temp, mode, and device states
    */
   getState(): CoordinatorState {
     return {
@@ -452,288 +518,46 @@ export class Coordinator {
   }
 
   /**
-   * Returns the auto-mode controller instance.
-   * @returns AutoModeController instance
+   * Get a specific device state
    */
-  getAutoModeController(): AutoModeController {
-    return this.autoModeController;
+  getDeviceState(deviceId: string): DeviceState | undefined {
+    return this.state.deviceStates.get(deviceId);
   }
 
   /**
-   * Retrieves all devices from SmartThings API.
-   * @returns Array of unified devices, or empty array if no auth or error
+   * Expose device getter for plugin context
    */
-  async getDevices(): Promise<UnifiedDevice[]> {
-    if (!this.api.hasAuth()) {
-      logger.warn('Cannot get devices: No SmartThings authentication');
-      return [];
-    }
-
-    try {
-      return await this.api.getDevices(this.state.pairedDevices);
-    } catch (error) {
-      logger.error({ err: error }, 'Error getting unified devices');
-      return [];
-    }
+  getDevice(deviceId: string): UnifiedDevice | undefined {
+    const state = this.state.deviceStates.get(deviceId);
+    if (!state) return undefined;
+    return this.buildUnifiedDevice(deviceId, state);
   }
 
   /**
-   * Handles thermostat events from HomeKit and updates SmartThings.
-   * Called when user changes temperature or mode in Home app.
-   * @param event - Thermostat event containing device ID, type, and values
+   * Get all devices as UnifiedDevice array
    */
-  async handleHAPThermostatEvent(event: HAPThermostatEvent): Promise<void> {
-    logger.info({ deviceId: event.deviceId, eventType: event.type }, 'Handling HAP thermostat event');
-
-    const currentState = this.state.deviceStates.get(event.deviceId);
-    if (!currentState) {
-      logger.error({ deviceId: event.deviceId }, 'No state found for device');
-      return;
+  getDevices(): UnifiedDevice[] {
+    const devices: UnifiedDevice[] = [];
+    for (const [deviceId, deviceState] of this.state.deviceStates.entries()) {
+      devices.push(this.buildUnifiedDevice(deviceId, deviceState));
     }
-
-    try {
-      if (event.type === 'temperature' || event.type === 'both') {
-        if (event.temperature !== undefined) {
-          await this.changeTemperature(event.deviceId, event.temperature);
-        }
-      }
-
-      if (event.type === 'mode' || event.type === 'both') {
-        if (event.mode !== undefined) {
-          // Special handling for 'auto' mode
-          if (event.mode === 'auto') {
-            logger.info({ deviceId: event.deviceId }, '🤖 Device switching to AUTO mode - enrolling in AutoModeController');
-            await this.autoModeController.enrollDevice(event.deviceId);
-
-            // Update local state to auto (don't send to SmartThings)
-            currentState.mode = 'auto';
-            currentState.lastUpdated = new Date();
-            this.state.deviceStates.set(event.deviceId, currentState);
-            await this.saveState();
-
-            // Immediately run auto-mode evaluation
-            await this.evaluateAndApplyAutoMode();
-          } else {
-            // Switching out of auto mode - unenroll from controller
-            const wasEnrolled = this.autoModeController.getEnrolledDeviceIds().includes(event.deviceId);
-            if (wasEnrolled) {
-              logger.info({ deviceId: event.deviceId }, '🔓 Device leaving AUTO mode - unenrolling from AutoModeController');
-              await this.autoModeController.unenrollDevice(event.deviceId);
-            }
-
-            // Normal mode change (heat/cool/off) - send to SmartThings
-            await this.changeMode(event.deviceId, event.mode);
-          }
-        }
-      }
-    } catch (error) {
-      logger.error({ err: error, deviceId: event.deviceId }, 'Error handling thermostat event');
-    }
+    return devices;
   }
 
   /**
-   * Validates that a temperature value is reasonable
+   * Get array of paired device IDs
    */
-  private isValidTemperature(temp: number | undefined | null): boolean {
-    if (temp === undefined || temp === null || isNaN(temp)) {
-      return false;
-    }
-    // Reasonable range: 32°F (freezing) to 120°F (very hot)
-    return temp >= 32 && temp <= 120;
+  getPairedDeviceIds(): string[] {
+    return [...this.state.pairedDevices];
   }
 
   /**
-   * Cleans up enrolled devices that no longer exist in the paired devices list
-   */
-  private async cleanupStaleEnrolledDevices(): Promise<void> {
-    const enrolledIds = this.autoModeController.getEnrolledDeviceIds();
-    const staleDevices: string[] = [];
-
-    for (const enrolledId of enrolledIds) {
-      // Check if device still exists in paired devices
-      if (!this.state.pairedDevices.includes(enrolledId)) {
-        staleDevices.push(enrolledId);
-      }
-    }
-
-    if (staleDevices.length > 0) {
-      logger.info({ count: staleDevices.length }, '🧹 Cleaning up stale enrolled device(s) that no longer exist');
-      for (const deviceId of staleDevices) {
-        await this.autoModeController.unenrollDevice(deviceId);
-        logger.debug({ deviceId }, '   Unenrolled device');
-      }
-    }
-  }
-
-  /**
-   * Evaluates all auto-mode enrolled devices and applies the controller's decision
-   */
-  private async evaluateAndApplyAutoMode(): Promise<void> {
-    const enrolledIds = this.autoModeController.getEnrolledDeviceIds();
-    if (enrolledIds.length === 0) {
-      logger.debug('⏩ No devices enrolled in auto mode, skipping evaluation');
-      return;
-    }
-
-    logger.info({ count: enrolledIds.length }, '🤖 Evaluating auto mode for enrolled devices');
-
-    // Gather device information for evaluation
-    const autoModeDevices: AutoModeDevice[] = [];
-    const invalidDeviceIds: string[] = [];
-
-    for (const deviceId of enrolledIds) {
-      const state = this.state.deviceStates.get(deviceId);
-      if (!state) {
-        logger.warn({ deviceId }, '⚠️  Enrolled device has no state, skipping');
-        invalidDeviceIds.push(deviceId);
-        continue;
-      }
-
-      // Validate temperature values
-      if (!this.isValidTemperature(state.currentTemperature)) {
-        logger.warn({ deviceName: state.name, deviceId, currentTemp: state.currentTemperature }, '⚠️  Device has invalid current temperature, skipping');
-        invalidDeviceIds.push(deviceId);
-        continue;
-      }
-
-      if (!this.isValidTemperature(state.temperatureSetpoint)) {
-        logger.warn({ deviceName: state.name, deviceId, setpoint: state.temperatureSetpoint }, '⚠️  Device has invalid temperature setpoint, skipping');
-        invalidDeviceIds.push(deviceId);
-        continue;
-      }
-
-      // Use heating/cooling setpoints as thresholds
-      // If not available, use temperatureSetpoint ± 2°F as fallback
-      const lowerBound = state.heatingSetpoint || (state.temperatureSetpoint - 2);
-      const upperBound = state.coolingSetpoint || (state.temperatureSetpoint + 2);
-
-      // Validate bounds are reasonable
-      if (!this.isValidTemperature(lowerBound) || !this.isValidTemperature(upperBound)) {
-        logger.warn({ deviceName: state.name, deviceId, lowerBound, upperBound }, '⚠️  Device has invalid temperature bounds, skipping');
-        invalidDeviceIds.push(deviceId);
-        continue;
-      }
-
-      if (lowerBound >= upperBound) {
-        logger.warn({ deviceName: state.name, deviceId, lowerBound, upperBound }, '⚠️  Device has invalid bounds (lower >= upper), skipping');
-        invalidDeviceIds.push(deviceId);
-        continue;
-      }
-
-      autoModeDevices.push({
-        id: deviceId,
-        name: state.name,
-        currentTemperature: state.currentTemperature,
-        lowerBound: lowerBound,
-        upperBound: upperBound,
-        weight: 1.0, // Equal weight for all devices
-      });
-    }
-
-    // Clean up devices that have been invalid for too long or no longer exist
-    if (invalidDeviceIds.length > 0) {
-      logger.warn({ count: invalidDeviceIds.length }, '⚠️  Enrolled device(s) have invalid state');
-    }
-
-    if (autoModeDevices.length === 0) {
-      logger.debug('⏩ No valid device states for auto mode evaluation');
-      return;
-    }
-
-    // Evaluate and get controller decision
-    const decision = this.autoModeController.evaluate(autoModeDevices);
-    logger.info({ mode: decision.mode }, '🎯 Auto mode decision');
-    logger.debug({ heatDemand: decision.totalHeatDemand.toFixed(1), coolDemand: decision.totalCoolDemand.toFixed(1) }, '   Demands calculated');
-    logger.debug({ reason: decision.reason }, '   Decision reason');
-
-    if (decision.switchSuppressed) {
-      logger.debug({ secondsRemaining: decision.secondsUntilSwitchAllowed }, '   ⏸️  Mode switch suppressed');
-    }
-
-    // Apply decision to all enrolled devices
-    const modeChanged = await this.autoModeController.applyDecision(decision);
-    if (modeChanged) {
-      logger.info({ mode: decision.mode }, '🔄 Applying mode to all enrolled devices');
-
-      // Set all enrolled devices to the determined mode
-      const promises = enrolledIds.map(async (deviceId) => {
-        try {
-          const currentState = this.state.deviceStates.get(deviceId);
-          if (!currentState) {
-            logger.warn({ deviceId }, '   ⚠️  Device has no state, skipping mode application');
-            return { deviceId, success: false, reason: 'No state' };
-          }
-
-          // Update SmartThings device
-          const success = await this.api.setMode(deviceId, decision.mode as 'heat' | 'cool' | 'off');
-
-          if (!success) {
-            logger.error({ deviceName: currentState.name }, '   ✗ Failed to set mode (API returned false)');
-            return { deviceId, success: false, reason: 'API failed' };
-          }
-
-          // Update local state (keep mode as 'auto' in our state, actual mode is tracked by controller)
-          currentState.lastUpdated = new Date();
-          this.state.deviceStates.set(deviceId, currentState);
-
-          logger.debug({ deviceName: currentState.name, mode: decision.mode }, '   ✓ Set device mode');
-          return { deviceId, success: true };
-        } catch (error) {
-          logger.error({ err: error, deviceId }, '   ✗ Failed to set mode for device');
-          return { deviceId, success: false, reason: 'Exception', error };
-        }
-      });
-
-      const results = await Promise.allSettled(promises);
-      const successCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
-      const failureCount = results.length - successCount;
-
-      if (failureCount > 0) {
-        logger.warn({ failureCount, successCount }, '⚠️  Auto mode application completed with failures');
-      } else {
-        logger.info({ successCount }, '✅ Auto mode application complete');
-      }
-
-      await this.saveState();
-    } else {
-      logger.debug({ mode: decision.mode }, '   No mode change needed');
-    }
-  }
-
-  private async getDeviceStateByDevice(device: UnifiedDevice): Promise<DeviceState | null> {
-    try {
-      const status = await this.api.getDeviceStatus(device.deviceId);
-      if (!status) {
-        logger.error({ deviceName: device.name }, 'No status returned for device');
-        return null;
-      }
-
-      return {
-        id: device.deviceId,
-        name: device.name,
-        currentTemperature: status.currentTemperature || 70,
-        temperatureSetpoint: status.temperatureSetpoint || 72,
-        mode: status.mode,
-        lightOn: false, // Air conditioners don't have lights
-        lastUpdated: new Date(),
-        heatingSetpoint: status.heatingSetpoint,
-        coolingSetpoint: status.coolingSetpoint,
-      };
-    } catch (error) {
-      logger.error({ err: error, deviceName: device.name }, 'Failed to get device state');
-      return null;
-    }
-  }
-
-  /**
-   * Stops the coordinator polling task.
-   * Call this when shutting down the application.
+   * Stop the coordinator
    */
   stop(): void {
     if (this.pollTask) {
       this.pollTask.stop();
       this.pollTask = null;
-      logger.info('Coordinator polling stopped');
     }
   }
 }

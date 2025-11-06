@@ -1,12 +1,17 @@
 import { Router, Request, Response } from 'express';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { Coordinator } from '@/coordinator/Coordinator';
+import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 import { logger } from '@/utils/logger';
 
 // Default temperature band margin when heating/cooling setpoints are not available
 const DEFAULT_TEMP_BAND_MARGIN = 2; // °F
 
-export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinator): Router {
+export function createDevicesRoutes(
+  api: SmartThingsAPI,
+  coordinator: Coordinator,
+  inclusionManager: DeviceInclusionManager
+): Router {
   const router = Router();
 
   router.get('/', async (req: Request, res: Response) => {
@@ -15,8 +20,60 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         return res.status(401).json({ error: 'Not authenticated' });
       }
 
-      const devices = await coordinator.getDevices();
-      res.json(devices);
+      // Get ALL devices from SmartThings (not just paired ones)
+      const allDevices = await api.getDevices([]);
+
+      // Add inclusion status and current state to each device
+      const devicesWithState = await Promise.all(
+        allDevices.map(async (device) => {
+          const isIncluded = inclusionManager.isIncluded(device.deviceId);
+
+          // Get current state from coordinator (for included devices) and SmartThings
+          let internalState = null;
+          let smartThingsState = null;
+
+          if (isIncluded) {
+            internalState = coordinator.getDeviceState(device.deviceId);
+          }
+
+          // Try to fetch current state from SmartThings for all devices
+          try {
+            smartThingsState = await api.getDeviceStatus(device.deviceId);
+          } catch (error) {
+            logger.debug({ deviceId: device.deviceId, err: error }, 'Failed to fetch SmartThings state');
+          }
+
+          return {
+            ...device,
+            included: isIncluded,
+            // Include state information if available
+            internal: internalState ? {
+              mode: internalState.mode,
+              currentTemperature: internalState.currentTemperature,
+              temperatureSetpoint: internalState.temperatureSetpoint,
+              heatingSetpoint: internalState.heatingSetpoint,
+              coolingSetpoint: internalState.coolingSetpoint,
+              lightOn: internalState.lightOn,
+              lastUpdated: internalState.lastUpdated instanceof Date
+                ? internalState.lastUpdated.toISOString()
+                : new Date(internalState.lastUpdated).toISOString(),
+            } : null,
+            smartThings: smartThingsState ? {
+              mode: smartThingsState.mode,
+              currentTemperature: smartThingsState.currentTemperature,
+              temperatureSetpoint: smartThingsState.temperatureSetpoint,
+              heatingSetpoint: smartThingsState.heatingSetpoint,
+              coolingSetpoint: smartThingsState.coolingSetpoint,
+              lightOn: smartThingsState.lightOn,
+              lastUpdated: smartThingsState.lastUpdated instanceof Date
+                ? smartThingsState.lastUpdated.toISOString()
+                : new Date(smartThingsState.lastUpdated).toISOString(),
+            } : null,
+          };
+        })
+      );
+
+      res.json(devicesWithState);
     } catch (error) {
       logger.error({ err: error }, 'Error fetching devices');
       res.status(500).json({ error: 'Failed to fetch devices' });
@@ -58,8 +115,9 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
   router.get('/paired', async (req: Request, res: Response) => {
     try {
       const state = coordinator.getState();
-      const autoController = coordinator.getAutoModeController();
-      const enrolledDeviceIds = autoController.getEnrolledDeviceIds();
+      // Auto-mode controller is now in the HVAC plugin
+      // Access via /api/plugins/hvac-auto-mode/status instead
+      const enrolledDeviceIds: string[] = [];
 
       // Fetch actual SmartThings API state for all devices
       const devicesWithBothStates = await Promise.all(
@@ -164,7 +222,18 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         return res.status(400).json({ error: 'Invalid temperature value' });
       }
 
-      const success = await coordinator.changeTemperature(deviceId, temperature);
+      // Get current device state to determine mode
+      const deviceState = coordinator.getDeviceState(deviceId);
+      if (!deviceState) {
+        return res.status(404).json({ error: 'Device not found' });
+      }
+
+      const mode = deviceState.mode === 'auto' ? 'cool' : deviceState.mode;
+      if (mode === 'off') {
+        return res.status(400).json({ error: 'Cannot set temperature when device is off' });
+      }
+
+      const success = await api.setTemperature(deviceId, temperature, mode as 'heat' | 'cool');
 
       if (success) {
         res.json({ success: true, temperature });
@@ -190,7 +259,7 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
         return res.status(400).json({ error: 'Invalid mode value' });
       }
 
-      const success = await coordinator.changeMode(deviceId, mode);
+      const success = await api.setMode(deviceId, mode);
 
       if (success) {
         res.json({ success: true, mode });
@@ -257,88 +326,47 @@ export function createDevicesRoutes(api: SmartThingsAPI, coordinator: Coordinato
     }
   });
 
-  // Auto-mode controller status
-  router.get('/auto-mode/status', (req: Request, res: Response) => {
+  // Include/exclude device endpoints
+  router.post('/:deviceId/include', async (req: Request, res: Response) => {
     try {
-      const autoController = coordinator.getAutoModeController();
-      const status = autoController.getStatus();
-      res.json(status);
+      const { deviceId } = req.params;
+      await inclusionManager.setIncluded(deviceId, true);
+      logger.info({ deviceId }, 'Device included (reload required)');
+      res.json({
+        success: true,
+        message: 'Device included. Reload devices to add to HomeKit.',
+        reloadRequired: true
+      });
     } catch (error) {
-      console.error('Error fetching auto-mode status:', error);
-      res.status(500).json({ error: 'Failed to fetch auto-mode status' });
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Failed to include device');
+      res.status(500).json({ error: 'Failed to include device' });
     }
   });
 
-  // Auto-mode decision with demand calculations
-  router.get('/auto-mode/decision', (req: Request, res: Response) => {
+  router.post('/:deviceId/exclude', async (req: Request, res: Response) => {
     try {
-      const autoController = coordinator.getAutoModeController();
-      const state = coordinator.getState();
-      const enrolledIds = autoController.getEnrolledDeviceIds();
-
-      if (enrolledIds.length === 0) {
-        return res.json({
-          enrolled: false,
-          decision: null,
-          message: 'No devices enrolled in auto mode'
-        });
-      }
-
-      // Gather device information for evaluation
-      const autoModeDevices = enrolledIds
-        .map(deviceId => {
-          const deviceState = state.deviceStates.get(deviceId);
-          if (!deviceState) return null;
-
-          const lowerBound = deviceState.heatingSetpoint || (deviceState.temperatureSetpoint - DEFAULT_TEMP_BAND_MARGIN);
-          const upperBound = deviceState.coolingSetpoint || (deviceState.temperatureSetpoint + DEFAULT_TEMP_BAND_MARGIN);
-
-          return {
-            id: deviceId,
-            name: deviceState.name,
-            currentTemperature: deviceState.currentTemperature,
-            lowerBound,
-            upperBound,
-            weight: 1.0,
-          };
-        })
-        .filter(device => device !== null);
-
-      if (autoModeDevices.length === 0) {
-        return res.json({
-          enrolled: true,
-          deviceCount: enrolledIds.length,
-          decision: null,
-          message: 'Enrolled devices have no valid state'
-        });
-      }
-
-      const decision = autoController.evaluate(autoModeDevices);
+      const { deviceId } = req.params;
+      await inclusionManager.setIncluded(deviceId, false);
+      logger.info({ deviceId }, 'Device excluded (reload required)');
       res.json({
-        enrolled: true,
-        deviceCount: enrolledIds.length,
-        enrolledDeviceIds: enrolledIds,
-        decision: {
-          mode: decision.mode,
-          totalHeatDemand: decision.totalHeatDemand,
-          totalCoolDemand: decision.totalCoolDemand,
-          reason: decision.reason,
-          switchSuppressed: decision.switchSuppressed,
-          secondsUntilSwitchAllowed: decision.secondsUntilSwitchAllowed,
-          deviceDemands: decision.deviceDemands.map(d => ({
-            deviceId: d.deviceId,
-            deviceName: d.deviceName,
-            heatDemand: d.heatDemand,
-            coolDemand: d.coolDemand,
-            rawHeatDelta: d.rawHeatDelta,
-            rawCoolDelta: d.rawCoolDelta,
-          })),
-        },
+        success: true,
+        message: 'Device excluded. Reload devices to remove from HomeKit.',
+        reloadRequired: true
       });
     } catch (error) {
-      console.error('Error fetching auto-mode decision:', error);
-      res.status(500).json({ error: 'Failed to fetch auto-mode decision' });
+      logger.error({ err: error, deviceId: req.params.deviceId }, 'Failed to exclude device');
+      res.status(500).json({ error: 'Failed to exclude device' });
     }
+  });
+
+  // Auto-mode routes have been moved to the HVAC plugin
+  // Access them at /api/plugins/hvac-auto-mode/status and /api/plugins/hvac-auto-mode/decision
+  router.get('/auto-mode/status', (req: Request, res: Response) => {
+    res.redirect(307, '/api/plugins/hvac-auto-mode/status');
+  });
+
+  router.get('/auto-mode/decision', (req: Request, res: Response) => {
+    res.redirect(307, '/api/plugins/hvac-auto-mode/decision');
   });
 
   return router;

@@ -259,6 +259,9 @@ export class SmartThingsAPI {
         mode: mode as 'heat' | 'cool' | 'auto' | 'off',
         lightOn: lightingStatus === 'on',
         lastUpdated: new Date(),
+        // Include separate setpoints for auto-mode coordination
+        heatingSetpoint: heatingSetpoint || undefined,
+        coolingSetpoint: coolingSetpoint || undefined,
       };
     } catch (error) {
       logger.error({ deviceId, err: error }, 'Error getting device status');
@@ -583,10 +586,10 @@ export class SmartThingsAPI {
   }
 
   /**
-   * Retrieves all HVAC devices with thermostat capabilities.
-   * Filters out ecobee devices and includes current state for paired devices.
+   * Retrieves all devices from SmartThings.
+   * Includes current state for paired devices and analyzes thermostat capabilities.
    * @param pairedDeviceIds - List of already paired device IDs to fetch state for
-   * @returns Array of unified devices with thermostat capabilities
+   * @returns Array of all unified devices
    */
   async getDevices(pairedDeviceIds: string[] = []): Promise<UnifiedDevice[]> {
     const allDevices = await this.getAllDevices();
@@ -623,17 +626,46 @@ export class SmartThingsAPI {
 
     const devices = await Promise.all(devicePromises);
 
-    const hasStandardThermostat = (caps: ThermostatCapabilities) =>
-      caps.temperatureMeasurement || caps.thermostat ||
-      caps.thermostatCoolingSetpoint || caps.thermostatHeatingSetpoint;
+    // Return ALL devices (no filtering)
+    // The thermostatCapabilities are included so the UI can determine which controls to show
+    return devices;
+  }
 
-    const hasSamsungAC = (caps: ThermostatCapabilities) =>
-      caps.airConditionerMode || caps.customThermostatSetpointControl;
+  /**
+   * Execute multiple commands on a device.
+   * Generic method for plugins to execute arbitrary commands.
+   *
+   * @param deviceId - Device to control
+   * @param commands - Array of commands to execute
+   * @returns Promise that resolves when commands are executed
+   */
+  async executeCommands(deviceId: string, commands: Array<{
+    component: string;
+    capability: string;
+    command: string;
+    arguments?: any[];
+  }>): Promise<void> {
+    const client = await this.getClient();
+    if (!client) {
+      throw new Error('No SmartThings client available');
+    }
 
-    return devices.filter(device => {
-      if (device.name.toLowerCase().includes('ecobee')) return false;
-      const caps = device.thermostatCapabilities;
-      return hasStandardThermostat(caps) || hasSamsungAC(caps);
-    });
+    try {
+      for (const cmd of commands) {
+        await withRetry(
+          () => client.devices.executeCommand(deviceId, {
+            component: cmd.component,
+            capability: cmd.capability,
+            command: cmd.command,
+            arguments: cmd.arguments || [],
+          }),
+          { maxRetries: 3, initialDelayMs: 1000 }
+        );
+        logger.debug({ deviceId, command: cmd }, 'Executed command');
+      }
+    } catch (error) {
+      logger.error({ err: error, deviceId, commands }, 'Error executing commands');
+      throw error;
+    }
   }
 }
