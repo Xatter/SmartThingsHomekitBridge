@@ -10,6 +10,7 @@ import { withRetry } from '@/utils/retry';
  */
 export class SmartThingsAPI {
   private client: SmartThingsClient | null = null;
+  private currentToken: string | null = null;
   private readonly auth: SmartThingsAuthentication;
 
   /**
@@ -33,13 +34,21 @@ export class SmartThingsAPI {
       return null;
     }
 
-    if (!this.client) {
-      const token = this.auth.getAccessToken();
-      if (!token) {
-        return null;
-      }
+    const token = this.auth.getAccessToken();
+    if (!token) {
+      return null;
+    }
 
+    // Invalidate cached client if token has changed
+    if (this.currentToken && this.currentToken !== token) {
+      logger.info('Access token changed, invalidating client cache');
+      this.invalidateClient();
+    }
+
+    if (!this.client) {
+      logger.debug('Creating new SmartThings API client');
       this.client = new SmartThingsClient(new BearerTokenAuthenticator(token));
+      this.currentToken = token;
     }
 
     return this.client;
@@ -582,7 +591,9 @@ export class SmartThingsAPI {
    * Useful after token refresh or auth changes.
    */
   invalidateClient(): void {
+    logger.debug('Invalidating SmartThings API client cache');
     this.client = null;
+    this.currentToken = null;
   }
 
   /**
