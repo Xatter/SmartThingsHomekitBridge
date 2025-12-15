@@ -14,6 +14,7 @@ import { SmartThingsHAPServer } from '@/hap/HAPServer';
 export class PluginManager {
   private readonly logger: Logger;
   private readonly plugins: Map<string, LoadedPlugin> = new Map();
+  private readonly discoveredPlugins: Map<string, LoadedPlugin> = new Map();
   private readonly contexts: Map<string, PluginContext> = new Map();
   private readonly config: any;
   private readonly api: SmartThingsAPI;
@@ -98,14 +99,30 @@ export class PluginManager {
           const plugin: Plugin = pluginModule.default?.default || pluginModule.default || pluginModule;
 
           // Check if plugin is enabled in persistent config
-          if (!this.pluginConfigManager.isEnabled(plugin.name)) {
+          const isEnabled = this.pluginConfigManager.isEnabled(plugin.name);
+
+          // Also check config file (for backwards compatibility)
+          const pluginConfig = this.config.plugins?.[plugin.name];
+          const configDisabled = pluginConfig?.enabled === false;
+
+          // Track all discovered plugins (even disabled ones) for the API
+          this.discoveredPlugins.set(plugin.name, {
+            plugin,
+            metadata: {
+              name: plugin.name,
+              version: plugin.version,
+              description: plugin.description,
+              source: 'builtin',
+              path: pluginDir,
+            },
+          });
+
+          if (!isEnabled) {
             this.logger.info({ plugin: plugin.name }, 'Plugin disabled, skipping');
             continue;
           }
 
-          // Also check config file (for backwards compatibility)
-          const pluginConfig = this.config.plugins?.[plugin.name];
-          if (pluginConfig?.enabled === false) {
+          if (configDisabled) {
             this.logger.info({ plugin: plugin.name }, 'Plugin disabled in config, skipping');
             continue;
           }
@@ -360,6 +377,14 @@ export class PluginManager {
    */
   getPlugins(): LoadedPlugin[] {
     return Array.from(this.plugins.values());
+  }
+
+  /**
+   * Get all discovered plugins (including disabled ones)
+   * This is useful for showing all available plugins in the UI
+   */
+  getAllDiscoveredPlugins(): LoadedPlugin[] {
+    return Array.from(this.discoveredPlugins.values());
   }
 
   /**

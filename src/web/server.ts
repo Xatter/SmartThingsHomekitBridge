@@ -72,8 +72,9 @@ export class WebServer {
       }
 
       // Plugin list endpoint (with enabled status)
+      // Returns ALL discovered plugins, including disabled ones, so users can enable them
       this.app.get('/api/plugins', (req, res) => {
-        const plugins = pluginManager.getPlugins().map(loaded => ({
+        const plugins = pluginManager.getAllDiscoveredPlugins().map(loaded => ({
           name: loaded.plugin.name,
           version: loaded.plugin.version,
           description: loaded.plugin.description,
