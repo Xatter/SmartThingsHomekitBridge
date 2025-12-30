@@ -368,6 +368,142 @@ describe('Regression Tests - DO NOT MODIFY WITHOUT UNDERSTANDING THE CONTEXT', (
  *
  * THE BACKWARDS NAMING IS INTENTIONAL AND CORRECT!
  */
+/**
+ * Samsung AC getDeviceStatus Tests
+ *
+ * These tests verify that the API correctly handles:
+ * 1. Mode translation (dry/wind → cool)
+ * 2. Switch state for Samsung ACs
+ * 3. Off detection when switch is off
+ */
+describe('Samsung AC getDeviceStatus - Mode Translation and Switch State', () => {
+  let api: SmartThingsAPI;
+  let mockClient: any;
+  let mockAuth: jest.Mocked<SmartThingsAuthentication>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockAuth = {
+      hasAuth: jest.fn().mockReturnValue(true),
+      ensureValidToken: jest.fn().mockResolvedValue(true),
+      getAccessToken: jest.fn().mockReturnValue('test-token'),
+      setAccessToken: jest.fn(),
+      refreshAccessToken: jest.fn()
+    } as any;
+
+    api = new SmartThingsAPI(mockAuth);
+
+    mockClient = {
+      devices: {
+        executeCommand: jest.fn().mockResolvedValue({ status: 'success' }),
+        get: jest.fn().mockResolvedValue({ name: 'Test AC', label: 'Test AC' }),
+        getStatus: jest.fn()
+      }
+    };
+    jest.spyOn(api as any, 'getClient').mockResolvedValue(mockClient);
+  });
+
+  test('given Samsung AC with "dry" mode, should translate to "cool" for HomeKit', async () => {
+    mockClient.devices.getStatus.mockResolvedValue({
+      components: {
+        main: {
+          temperatureMeasurement: { temperature: { value: 75 } },
+          thermostatCoolingSetpoint: { coolingSetpoint: { value: 72 } },
+          airConditionerMode: { airConditionerMode: { value: 'dry' } },
+          switch: { switch: { value: 'on' } },
+          'samsungce.airConditionerLighting': { lighting: { value: 'off' } }
+        }
+      }
+    });
+
+    const result = await api.getDeviceStatus('test-device');
+
+    expect(result).not.toBeNull();
+    expect(result?.mode).toBe('cool'); // dry → cool
+  });
+
+  test('given Samsung AC with "wind" mode, should translate to "cool" for HomeKit', async () => {
+    mockClient.devices.getStatus.mockResolvedValue({
+      components: {
+        main: {
+          temperatureMeasurement: { temperature: { value: 75 } },
+          thermostatCoolingSetpoint: { coolingSetpoint: { value: 72 } },
+          airConditionerMode: { airConditionerMode: { value: 'wind' } },
+          switch: { switch: { value: 'on' } },
+          'samsungce.airConditionerLighting': { lighting: { value: 'off' } }
+        }
+      }
+    });
+
+    const result = await api.getDeviceStatus('test-device');
+
+    expect(result).not.toBeNull();
+    expect(result?.mode).toBe('cool'); // wind → cool
+  });
+
+  test('given Samsung AC with switch off, should include switchState in result', async () => {
+    mockClient.devices.getStatus.mockResolvedValue({
+      components: {
+        main: {
+          temperatureMeasurement: { temperature: { value: 75 } },
+          thermostatCoolingSetpoint: { coolingSetpoint: { value: 72 } },
+          airConditionerMode: { airConditionerMode: { value: 'heat' } },
+          switch: { switch: { value: 'off' } },
+          'samsungce.airConditionerLighting': { lighting: { value: 'off' } }
+        }
+      }
+    });
+
+    const result = await api.getDeviceStatus('test-device');
+
+    expect(result).not.toBeNull();
+    expect(result?.switchState).toBe('off');
+    expect(result?.mode).toBe('off'); // When switch is off, mode should be 'off'
+  });
+
+  test('given Samsung AC with switch on, should include switchState "on" in result', async () => {
+    mockClient.devices.getStatus.mockResolvedValue({
+      components: {
+        main: {
+          temperatureMeasurement: { temperature: { value: 75 } },
+          thermostatCoolingSetpoint: { coolingSetpoint: { value: 72 } },
+          airConditionerMode: { airConditionerMode: { value: 'heat' } },
+          switch: { switch: { value: 'on' } },
+          'samsungce.airConditionerLighting': { lighting: { value: 'off' } }
+        }
+      }
+    });
+
+    const result = await api.getDeviceStatus('test-device');
+
+    expect(result).not.toBeNull();
+    expect(result?.switchState).toBe('on');
+    expect(result?.mode).toBe('heat'); // Mode should be preserved when switch is on
+  });
+
+  test('given Samsung AC preserves both heatingSetpoint and coolingSetpoint in result', async () => {
+    mockClient.devices.getStatus.mockResolvedValue({
+      components: {
+        main: {
+          temperatureMeasurement: { temperature: { value: 75 } },
+          thermostatCoolingSetpoint: { coolingSetpoint: { value: 72 } },
+          thermostatHeatingSetpoint: { heatingSetpoint: { value: 68 } },
+          airConditionerMode: { airConditionerMode: { value: 'auto' } },
+          switch: { switch: { value: 'on' } },
+          'samsungce.airConditionerLighting': { lighting: { value: 'off' } }
+        }
+      }
+    });
+
+    const result = await api.getDeviceStatus('test-device');
+
+    expect(result).not.toBeNull();
+    expect(result?.coolingSetpoint).toBe(72);
+    expect(result?.heatingSetpoint).toBe(68);
+  });
+});
+
 describe('🚨 STOP! Did you just try to "fix" the backwards light commands? 🚨', () => {
   let api: SmartThingsAPI;
   let mockClient: any;

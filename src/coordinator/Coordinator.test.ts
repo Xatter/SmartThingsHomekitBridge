@@ -501,6 +501,38 @@ describe('Coordinator', () => {
         },
       ]);
     });
+
+    test('given heatingSetpoint for Samsung AC without thermostatHeatingSetpoint, should fallback to coolingSetpoint', async () => {
+      // Samsung ACs do NOT have thermostatHeatingSetpoint capability
+      // They use thermostatCoolingSetpoint for ALL temperature changes
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'heat', switchState: 'on' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({
+        deviceId: 'device-1',
+        thermostatCapabilities: {
+          airConditionerMode: true,
+          thermostatMode: false,
+          temperatureMeasurement: true,
+          thermostatCoolingSetpoint: true,
+          thermostatHeatingSetpoint: false, // Samsung AC does NOT have this
+        },
+      }));
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'temperature',
+        heatingSetpoint: 68,
+      });
+
+      // Should fallback to using coolingSetpoint capability since heatingSetpoint is unavailable
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'thermostatCoolingSetpoint',
+          command: 'setCoolingSetpoint',
+          arguments: [68],
+        },
+      ]);
+    });
   });
 
   describe('getDevices', () => {
