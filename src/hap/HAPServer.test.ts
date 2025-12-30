@@ -108,7 +108,7 @@ describe('SmartThingsHAPServer', () => {
 
     // Create mock coordinator
     mockCoordinator = {
-      handleHAPThermostatEvent: jest.fn().mockResolvedValue(undefined),
+      handleThermostatEvent: jest.fn().mockResolvedValue(undefined),
     } as any;
 
     // Create mock accessory cache
@@ -506,7 +506,7 @@ describe('SmartThingsHAPServer', () => {
     });
   });
 
-  describe('handleHAPThermostatEvent callbacks', () => {
+  describe('handleThermostatEvent callbacks', () => {
     beforeEach(async () => {
       await hapServer.initialize(mockCoordinator);
       await hapServer.start();
@@ -520,7 +520,7 @@ describe('SmartThingsHAPServer', () => {
       await handleTemperatureChange('device-123', 22, mockCallback); // 22°C
 
       expect(mockCallback).toHaveBeenCalled();
-      expect(mockCoordinator.handleHAPThermostatEvent).toHaveBeenCalledWith({
+      expect(mockCoordinator.handleThermostatEvent).toHaveBeenCalledWith({
         deviceId: 'device-123',
         type: 'temperature',
         temperature: expect.any(Number),
@@ -534,7 +534,7 @@ describe('SmartThingsHAPServer', () => {
       await handleModeChange('device-123', 1, mockCallback); // HEAT
 
       expect(mockCallback).toHaveBeenCalled();
-      expect(mockCoordinator.handleHAPThermostatEvent).toHaveBeenCalledWith({
+      expect(mockCoordinator.handleThermostatEvent).toHaveBeenCalledWith({
         deviceId: 'device-123',
         type: 'mode',
         mode: 'heat',

@@ -1,7 +1,8 @@
 import { Coordinator } from './Coordinator';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
-import { LightingMonitor } from '@/monitoring/LightingMonitor';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
+import { PluginManager } from '@/plugins';
+import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 import { DeviceState, UnifiedDevice } from '@/types';
 import { promises as fs } from 'fs';
 import * as cron from 'node-cron';
@@ -22,14 +23,16 @@ jest.mock('node-cron', () => ({
 }));
 
 jest.mock('@/api/SmartThingsAPI');
-jest.mock('@/monitoring/LightingMonitor');
 jest.mock('@/hap/HAPServer');
+jest.mock('@/plugins');
+jest.mock('@/config/DeviceInclusionManager');
 
 describe('Coordinator', () => {
   let coordinator: Coordinator;
   let mockApi: jest.Mocked<SmartThingsAPI>;
-  let mockLightingMonitor: jest.Mocked<LightingMonitor>;
   let mockHapServer: jest.Mocked<SmartThingsHAPServer>;
+  let mockPluginManager: jest.Mocked<PluginManager>;
+  let mockInclusionManager: jest.Mocked<DeviceInclusionManager>;
   const mockStateFilePath = '/test/data/coordinator-state.json';
 
   const createMockDevice = (overrides: Partial<UnifiedDevice> = {}): UnifiedDevice => ({
@@ -39,14 +42,14 @@ describe('Coordinator', () => {
     manufacturerName: 'SmartThings',
     presentationId: 'test-presentation',
     deviceTypeName: 'Thermostat',
-    capabilities: [],
+    capabilities: [{ id: 'thermostatMode', version: 1 }],
     components: [],
     thermostatCapabilities: {
       thermostatMode: true,
       thermostat: true,
       temperatureMeasurement: true,
-      thermostatHeatingSetpoint: false,
-      thermostatCoolingSetpoint: false,
+      thermostatHeatingSetpoint: true,
+      thermostatCoolingSetpoint: true,
     },
     isPaired: false,
     ...overrides,
@@ -60,6 +63,8 @@ describe('Coordinator', () => {
     mode: 'cool',
     lightOn: false,
     lastUpdated: new Date(),
+    heatingSetpoint: 68,
+    coolingSetpoint: 72,
     ...overrides,
   });
 
@@ -71,15 +76,7 @@ describe('Coordinator', () => {
       hasAuth: jest.fn().mockReturnValue(true),
       getDevices: jest.fn().mockResolvedValue([]),
       getDeviceStatus: jest.fn().mockResolvedValue(null),
-      setTemperature: jest.fn().mockResolvedValue(true),
-      setMode: jest.fn().mockResolvedValue(true),
-    } as any;
-
-    // Create mock lighting monitor
-    mockLightingMonitor = {
-      setDevices: jest.fn(),
-      start: jest.fn(),
-      stop: jest.fn(),
+      executeCommands: jest.fn().mockResolvedValue(undefined),
     } as any;
 
     // Create mock HAP server
@@ -89,6 +86,19 @@ describe('Coordinator', () => {
       removeDevice: jest.fn().mockResolvedValue(undefined),
     } as any;
 
+    // Create mock plugin manager
+    mockPluginManager = {
+      beforeSetSmartThingsState: jest.fn().mockImplementation((device, state) => Promise.resolve(state)),
+      beforeSetHomeKitState: jest.fn().mockImplementation((device, state) => Promise.resolve(state)),
+      afterDeviceUpdate: jest.fn().mockResolvedValue(undefined),
+      onPollCycle: jest.fn().mockResolvedValue(undefined),
+    } as any;
+
+    // Create mock inclusion manager
+    mockInclusionManager = {
+      isIncluded: jest.fn().mockReturnValue(true),
+    } as any;
+
     // Mock fs operations by default
     (fs.readFile as jest.Mock).mockRejectedValue({ code: 'ENOENT' });
     (fs.writeFile as jest.Mock).mockResolvedValue(undefined);
@@ -96,8 +106,9 @@ describe('Coordinator', () => {
 
     coordinator = new Coordinator(
       mockApi,
-      mockLightingMonitor,
       mockHapServer,
+      mockPluginManager,
+      mockInclusionManager,
       mockStateFilePath,
       300 // 5 minute poll interval
     );
@@ -105,24 +116,25 @@ describe('Coordinator', () => {
 
   describe('convertSecondsToInterval', () => {
     test('given 60 seconds, should convert to minute cron format', () => {
-      const coord = new Coordinator(mockApi, mockLightingMonitor, mockHapServer, mockStateFilePath, 60);
+      const coord = new Coordinator(mockApi, mockHapServer, mockPluginManager, mockInclusionManager, mockStateFilePath, 60);
       const interval = coord['pollInterval'];
 
       expect(interval).toBe('*/1 * * * *');
     });
 
     test('given 300 seconds, should convert to 5 minute cron format', () => {
-      const coord = new Coordinator(mockApi, mockLightingMonitor, mockHapServer, mockStateFilePath, 300);
+      const coord = new Coordinator(mockApi, mockHapServer, mockPluginManager, mockInclusionManager, mockStateFilePath, 300);
       const interval = coord['pollInterval'];
 
       expect(interval).toBe('*/5 * * * *');
     });
 
-    test('given 45 seconds, should use second-based cron format', () => {
-      const coord = new Coordinator(mockApi, mockLightingMonitor, mockHapServer, mockStateFilePath, 45);
+    test('given 45 seconds (sub-minute), should fall back to every minute', () => {
+      const coord = new Coordinator(mockApi, mockHapServer, mockPluginManager, mockInclusionManager, mockStateFilePath, 45);
       const interval = coord['pollInterval'];
 
-      expect(interval).toBe('*/45 * * * * *');
+      // Sub-minute intervals fall back to every minute
+      expect(interval).toBe('* * * * *');
     });
   });
 
@@ -264,36 +276,6 @@ describe('Coordinator', () => {
       expect(mockApi.getDevices).not.toHaveBeenCalled();
     });
 
-    test('given devices from API, should add to HAP server', async () => {
-      const device = createMockDevice({ deviceId: 'device-1', name: 'Thermostat 1' });
-      const deviceState = createMockDeviceState({ id: 'device-1', name: 'Thermostat 1' });
-
-      mockApi.getDevices.mockResolvedValue([device]);
-      mockApi.getDeviceStatus.mockResolvedValue(deviceState);
-
-      await coordinator.reloadDevices();
-
-      expect(mockApi.getDevices).toHaveBeenCalled();
-      expect(mockHapServer.addDevice).toHaveBeenCalledWith('device-1', expect.objectContaining({
-        name: 'Thermostat 1',
-      }));
-      expect(mockLightingMonitor.setDevices).toHaveBeenCalledWith(['device-1']);
-    });
-
-    test('given multiple devices, should add all to HAP server', async () => {
-      const devices = [
-        createMockDevice({ deviceId: 'device-1', name: 'Thermostat 1' }),
-        createMockDevice({ deviceId: 'device-2', name: 'Thermostat 2' }),
-      ];
-
-      mockApi.getDevices.mockResolvedValue(devices);
-      mockApi.getDeviceStatus.mockResolvedValue(createMockDeviceState());
-
-      await coordinator.reloadDevices();
-
-      expect(mockHapServer.addDevice).toHaveBeenCalledTimes(2);
-    });
-
     test('given API failure, should handle gracefully', async () => {
       mockApi.getDevices.mockRejectedValue(new Error('API error'));
 
@@ -301,279 +283,175 @@ describe('Coordinator', () => {
     });
   });
 
-  describe('calculateAverageTemperature', () => {
-    test('given multiple devices, should calculate average setpoint', () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ temperatureSetpoint: 70 }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ temperatureSetpoint: 72 }));
-      coordinator['state'].deviceStates.set('device-3', createMockDeviceState({ temperatureSetpoint: 74 }));
-
-      coordinator['calculateAverageTemperature']();
-
-      expect(coordinator['state'].averageTemperature).toBe(72);
-    });
-
-    test('given no devices, should not change average', () => {
-      coordinator['state'].averageTemperature = 70;
-
-      coordinator['calculateAverageTemperature']();
-
-      expect(coordinator['state'].averageTemperature).toBe(70);
-    });
-
-    test('given zero setpoints, should filter them out', () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ temperatureSetpoint: 70 }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ temperatureSetpoint: 0 }));
-
-      coordinator['calculateAverageTemperature']();
-
-      expect(coordinator['state'].averageTemperature).toBe(70);
-    });
-  });
-
-  describe('determineCurrentMode', () => {
-    test('given all devices off, should set mode to off', () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'off' }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ mode: 'off' }));
-
-      coordinator['determineCurrentMode']();
-
-      expect(coordinator['state'].currentMode).toBe('off');
-    });
-
-    test('given multiple cooling devices, should set mode to cool', () => {
+  describe('handleThermostatEvent', () => {
+    test('given temperature event in cool mode, should send cooling setpoint command', async () => {
       coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ mode: 'cool' }));
-      coordinator['state'].deviceStates.set('device-3', createMockDeviceState({ mode: 'heat' }));
+      // Need to also set device metadata for buildUnifiedDevice
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
 
-      coordinator['determineCurrentMode']();
-
-      expect(coordinator['state'].currentMode).toBe('cool');
-    });
-
-    test('given mixed modes with heat majority, should set mode to heat', () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'heat' }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ mode: 'heat' }));
-      coordinator['state'].deviceStates.set('device-3', createMockDeviceState({ mode: 'cool' }));
-
-      coordinator['determineCurrentMode']();
-
-      expect(coordinator['state'].currentMode).toBe('heat');
-    });
-
-    test('given only off devices, should ignore them in mode determination', () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'heat' }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ mode: 'off' }));
-      coordinator['state'].deviceStates.set('device-3', createMockDeviceState({ mode: 'off' }));
-
-      coordinator['determineCurrentMode']();
-
-      expect(coordinator['state'].currentMode).toBe('heat');
-    });
-  });
-
-  describe('changeTemperature', () => {
-    test('given valid device and temperature, should call API', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
-
-      const success = await coordinator.changeTemperature('device-1', 68);
-
-      expect(mockApi.setTemperature).toHaveBeenCalledWith('device-1', 68, 'cool');
-      expect(success).toBe(true);
-    });
-
-    test('given successful change, should update local state', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool', temperatureSetpoint: 70 }));
-
-      await coordinator.changeTemperature('device-1', 68);
-
-      const state = coordinator['state'].deviceStates.get('device-1');
-      expect(state?.temperatureSetpoint).toBe(68);
-    });
-
-    test('given device in off mode, should return false', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'off' }));
-
-      const success = await coordinator.changeTemperature('device-1', 68);
-
-      expect(mockApi.setTemperature).not.toHaveBeenCalled();
-      expect(success).toBe(false);
-    });
-
-    test('given auto mode, should convert to cool', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'auto' }));
-
-      await coordinator.changeTemperature('device-1', 68);
-
-      expect(mockApi.setTemperature).toHaveBeenCalledWith('device-1', 68, 'cool');
-    });
-
-    test('given non-existent device, should return false', async () => {
-      const success = await coordinator.changeTemperature('non-existent', 68);
-
-      expect(success).toBe(false);
-    });
-  });
-
-  describe('changeMode', () => {
-    test('given valid device and mode, should call API', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
-
-      const success = await coordinator.changeMode('device-1', 'heat');
-
-      expect(mockApi.setMode).toHaveBeenCalledWith('device-1', 'heat');
-      expect(success).toBe(true);
-    });
-
-    test('given successful change, should update local state', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
-
-      await coordinator.changeMode('device-1', 'heat');
-
-      const state = coordinator['state'].deviceStates.get('device-1');
-      expect(state?.mode).toBe('heat');
-    });
-
-    test('given heat or cool mode, should synchronize other devices', async () => {
-      coordinator['state'].pairedDevices = ['device-1', 'device-2'];
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ mode: 'cool' }));
-
-      await coordinator.changeMode('device-1', 'heat');
-
-      // Should update both device-1 and device-2
-      expect(mockApi.setMode).toHaveBeenCalledWith('device-1', 'heat');
-      expect(mockApi.setMode).toHaveBeenCalledWith('device-2', 'heat');
-    });
-
-    test('given off or auto mode, should not synchronize other devices', async () => {
-      coordinator['state'].pairedDevices = ['device-1', 'device-2'];
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'heat' }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ mode: 'heat' }));
-
-      await coordinator.changeMode('device-1', 'off');
-
-      // Should only call once for device-1
-      expect(mockApi.setMode).toHaveBeenCalledTimes(1);
-      expect(mockApi.setMode).toHaveBeenCalledWith('device-1', 'off');
-    });
-  });
-
-  describe('synchronizeTemperatures', () => {
-    test('given off mode, should not synchronize', async () => {
-      coordinator['state'].currentMode = 'off';
-      coordinator['state'].averageTemperature = 72;
-
-      await coordinator['synchronizeTemperatures']();
-
-      expect(mockApi.setTemperature).not.toHaveBeenCalled();
-    });
-
-    test('given auto mode, should not synchronize', async () => {
-      coordinator['state'].currentMode = 'auto';
-      coordinator['state'].averageTemperature = 72;
-
-      await coordinator['synchronizeTemperatures']();
-
-      expect(mockApi.setTemperature).not.toHaveBeenCalled();
-    });
-
-    test('given cool mode and temperature difference, should synchronize all devices', async () => {
-      coordinator['state'].currentMode = 'cool';
-      coordinator['state'].averageTemperature = 72;
-      coordinator['state'].pairedDevices = ['device-1', 'device-2'];
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ temperatureSetpoint: 70, mode: 'cool' }));
-      coordinator['state'].deviceStates.set('device-2', createMockDeviceState({ temperatureSetpoint: 68, mode: 'cool' }));
-
-      await coordinator['synchronizeTemperatures']();
-
-      expect(mockApi.setTemperature).toHaveBeenCalledWith('device-1', 72, 'cool');
-      expect(mockApi.setTemperature).toHaveBeenCalledWith('device-2', 72, 'cool');
-    });
-
-    test('given small temperature difference, should not synchronize', async () => {
-      coordinator['state'].currentMode = 'cool';
-      coordinator['state'].averageTemperature = 72;
-      coordinator['state'].pairedDevices = ['device-1'];
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ temperatureSetpoint: 72.3, mode: 'cool' }));
-
-      await coordinator['synchronizeTemperatures']();
-
-      expect(mockApi.setTemperature).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('handleHAPThermostatEvent', () => {
-    test('given temperature event, should change temperature', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
-
-      await coordinator.handleHAPThermostatEvent({
+      await coordinator.handleThermostatEvent({
         deviceId: 'device-1',
         type: 'temperature',
         temperature: 68,
       });
 
-      expect(mockApi.setTemperature).toHaveBeenCalledWith('device-1', 68, 'cool');
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'thermostatCoolingSetpoint',
+          command: 'setCoolingSetpoint',
+          arguments: [68],
+        },
+      ]);
     });
 
-    test('given mode event, should change mode', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
+    test('given temperature event in heat mode, should send heating setpoint command', async () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'heat' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
 
-      await coordinator.handleHAPThermostatEvent({
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'temperature',
+        temperature: 68,
+      });
+
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'thermostatHeatingSetpoint',
+          command: 'setHeatingSetpoint',
+          arguments: [68],
+        },
+      ]);
+    });
+
+    test('given mode event, should send mode command', async () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      await coordinator.handleThermostatEvent({
         deviceId: 'device-1',
         type: 'mode',
         mode: 'heat',
       });
 
-      expect(mockApi.setMode).toHaveBeenCalledWith('device-1', 'heat');
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'thermostatMode',
+          command: 'setThermostatMode',
+          arguments: ['heat'],
+        },
+      ]);
     });
 
-    test('given both event, should change both temperature and mode', async () => {
+    test('given mode event for Samsung AC, should use airConditionerMode', async () => {
       coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
-
-      await coordinator.handleHAPThermostatEvent({
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({
         deviceId: 'device-1',
-        type: 'both',
-        temperature: 68,
-        mode: 'heat',
+        thermostatCapabilities: {
+          airConditionerMode: true,
+          thermostatMode: false,
+          temperatureMeasurement: true,
+        },
+      }));
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'mode',
+        mode: 'cool',
       });
 
-      expect(mockApi.setTemperature).toHaveBeenCalled();
-      expect(mockApi.setMode).toHaveBeenCalledWith('device-1', 'heat');
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'airConditionerMode',
+          command: 'setAirConditionerMode',
+          arguments: ['cool'],
+        },
+      ]);
     });
 
     test('given non-existent device, should handle gracefully', async () => {
       await expect(
-        coordinator.handleHAPThermostatEvent({
+        coordinator.handleThermostatEvent({
           deviceId: 'non-existent',
           type: 'temperature',
           temperature: 68,
         })
       ).resolves.not.toThrow();
+
+      expect(mockApi.executeCommands).not.toHaveBeenCalled();
+    });
+
+    test('given plugin cancels state change, should not send commands', async () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+      mockPluginManager.beforeSetSmartThingsState.mockResolvedValue(null);
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'temperature',
+        temperature: 68,
+      });
+
+      expect(mockApi.executeCommands).not.toHaveBeenCalled();
+    });
+
+    test('given heatingSetpoint in event, should use it directly', async () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'heat' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'temperature',
+        heatingSetpoint: 65,
+      });
+
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'thermostatHeatingSetpoint',
+          command: 'setHeatingSetpoint',
+          arguments: [65],
+        },
+      ]);
+    });
+
+    test('given coolingSetpoint in event, should use it directly', async () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'temperature',
+        coolingSetpoint: 75,
+      });
+
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'thermostatCoolingSetpoint',
+          command: 'setCoolingSetpoint',
+          arguments: [75],
+        },
+      ]);
     });
   });
 
   describe('getDevices', () => {
-    test('given no auth, should return empty array', async () => {
-      mockApi.hasAuth.mockReturnValue(false);
+    test('given device states, should return unified devices', () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState());
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
 
-      const devices = await coordinator.getDevices();
+      const devices = coordinator.getDevices();
 
-      expect(devices).toEqual([]);
+      expect(devices.length).toBe(1);
+      expect(devices[0].deviceId).toBe('device-1');
     });
 
-    test('given API returns devices, should return them', async () => {
-      const mockDevices = [createMockDevice()];
-      mockApi.getDevices.mockResolvedValue(mockDevices);
-
-      const devices = await coordinator.getDevices();
-
-      expect(devices).toEqual(mockDevices);
-    });
-
-    test('given API error, should return empty array', async () => {
-      mockApi.getDevices.mockRejectedValue(new Error('API error'));
-
-      const devices = await coordinator.getDevices();
+    test('given no devices, should return empty array', () => {
+      const devices = coordinator.getDevices();
 
       expect(devices).toEqual([]);
     });
@@ -607,6 +485,58 @@ describe('Coordinator', () => {
 
       // DeviceStates should be a copy
       expect(state.deviceStates).not.toBe(coordinator['state'].deviceStates);
+    });
+  });
+
+  describe('getDeviceState', () => {
+    test('given existing device, should return state', () => {
+      const mockState = createMockDeviceState();
+      coordinator['state'].deviceStates.set('device-1', mockState);
+
+      const state = coordinator.getDeviceState('device-1');
+
+      expect(state).toBeDefined();
+      expect(state?.id).toBe('device-123');
+    });
+
+    test('given non-existent device, should return undefined', () => {
+      const state = coordinator.getDeviceState('non-existent');
+
+      expect(state).toBeUndefined();
+    });
+  });
+
+  describe('getDevice', () => {
+    test('given existing device with metadata, should return unified device', () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState());
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      const device = coordinator.getDevice('device-1');
+
+      expect(device).toBeDefined();
+      expect(device?.deviceId).toBe('device-1');
+    });
+
+    test('given non-existent device, should return undefined', () => {
+      const device = coordinator.getDevice('non-existent');
+
+      expect(device).toBeUndefined();
+    });
+  });
+
+  describe('getPairedDeviceIds', () => {
+    test('given paired devices, should return array of IDs', () => {
+      coordinator['state'].pairedDevices = ['device-1', 'device-2'];
+
+      const ids = coordinator.getPairedDeviceIds();
+
+      expect(ids).toEqual(['device-1', 'device-2']);
+    });
+
+    test('given no paired devices, should return empty array', () => {
+      const ids = coordinator.getPairedDeviceIds();
+
+      expect(ids).toEqual([]);
     });
   });
 

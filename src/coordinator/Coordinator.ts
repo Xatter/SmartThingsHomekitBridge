@@ -408,10 +408,31 @@ export class Coordinator {
       }
 
       const device = this.buildUnifiedDevice(event.deviceId, currentState);
+
+      // Map generic temperature to appropriate setpoint based on current mode
+      // HAPServer sends 'temperature' for single setpoint changes, which we need to
+      // convert to heatingSetpoint or coolingSetpoint based on the device's current mode
+      let heatingSetpoint = event.heatingSetpoint;
+      let coolingSetpoint = event.coolingSetpoint;
+
+      if (event.temperature !== undefined && heatingSetpoint === undefined && coolingSetpoint === undefined) {
+        const currentMode = event.mode || currentState.mode;
+        if (currentMode === 'heat') {
+          heatingSetpoint = event.temperature;
+          logger.debug({ deviceId: event.deviceId, temperature: event.temperature },
+            'Mapping temperature to heatingSetpoint (device in heat mode)');
+        } else {
+          // For cool, auto, or off modes, use cooling setpoint
+          coolingSetpoint = event.temperature;
+          logger.debug({ deviceId: event.deviceId, temperature: event.temperature },
+            'Mapping temperature to coolingSetpoint (device in cool/auto/off mode)');
+        }
+      }
+
       const proposedState = {
         thermostatMode: event.mode,
-        heatingSetpoint: event.heatingSetpoint,
-        coolingSetpoint: event.coolingSetpoint,
+        heatingSetpoint,
+        coolingSetpoint,
       };
 
       // Let plugins intercept the state change
@@ -487,9 +508,17 @@ export class Coordinator {
         currentState.mode = finalState.thermostatMode || currentState.mode;
         if (finalState.heatingSetpoint !== undefined) {
           currentState.heatingSetpoint = finalState.heatingSetpoint;
+          // Update temperatureSetpoint if in heat mode
+          if (currentState.mode === 'heat') {
+            currentState.temperatureSetpoint = finalState.heatingSetpoint;
+          }
         }
         if (finalState.coolingSetpoint !== undefined) {
           currentState.coolingSetpoint = finalState.coolingSetpoint;
+          // Update temperatureSetpoint if in cool/auto/off mode
+          if (currentState.mode !== 'heat') {
+            currentState.temperatureSetpoint = finalState.coolingSetpoint;
+          }
         }
         currentState.lastUpdated = new Date();
         this.state.deviceStates.set(event.deviceId, currentState);
