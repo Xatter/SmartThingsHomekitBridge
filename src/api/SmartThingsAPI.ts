@@ -271,6 +271,8 @@ export class SmartThingsAPI {
         // Include separate setpoints for auto-mode coordination
         heatingSetpoint: heatingSetpoint || undefined,
         coolingSetpoint: coolingSetpoint || undefined,
+        // Samsung AC switch state for on/off control
+        switchState: switchStatus as 'on' | 'off',
       };
     } catch (error) {
       logger.error({ deviceId, err: error }, 'Error getting device status');

@@ -460,15 +460,38 @@ export class Coordinator {
         }, 'Determining which mode capability to use');
 
         if (usesAirConditionerMode) {
-          // Samsung air conditioner - use airConditionerMode capability
-          logger.info({ deviceId: event.deviceId, mode: finalState.thermostatMode },
-            '🌡️  Using airConditionerMode for Samsung AC');
-          commands.push({
-            component: 'main',
-            capability: 'airConditionerMode',
-            command: 'setAirConditionerMode',
-            arguments: [finalState.thermostatMode],
-          });
+          // Samsung air conditioner - uses switch for on/off, airConditionerMode for heat/cool/etc.
+          if (finalState.thermostatMode === 'off') {
+            // Turn off using switch capability (Samsung ACs don't have "off" as a mode)
+            logger.info({ deviceId: event.deviceId },
+              '🔌 Turning off Samsung AC via switch');
+            commands.push({
+              component: 'main',
+              capability: 'switch',
+              command: 'off',
+              arguments: [],
+            });
+          } else {
+            // First turn on the AC if it's off, then set the mode
+            if (currentState.switchState === 'off' || currentState.switchState === undefined) {
+              logger.info({ deviceId: event.deviceId },
+                '🔌 Turning on Samsung AC via switch');
+              commands.push({
+                component: 'main',
+                capability: 'switch',
+                command: 'on',
+                arguments: [],
+              });
+            }
+            logger.info({ deviceId: event.deviceId, mode: finalState.thermostatMode },
+              '🌡️  Setting airConditionerMode for Samsung AC');
+            commands.push({
+              component: 'main',
+              capability: 'airConditionerMode',
+              command: 'setAirConditionerMode',
+              arguments: [finalState.thermostatMode],
+            });
+          }
         } else {
           // Traditional thermostat - use thermostatMode capability
           logger.info({ deviceId: event.deviceId, mode: finalState.thermostatMode },
@@ -483,12 +506,26 @@ export class Coordinator {
       }
 
       if (finalState.heatingSetpoint !== undefined) {
-        commands.push({
-          component: 'main',
-          capability: 'thermostatHeatingSetpoint',
-          command: 'setHeatingSetpoint',
-          arguments: [finalState.heatingSetpoint],
-        });
+        const caps = device.thermostatCapabilities;
+        // Samsung ACs don't have thermostatHeatingSetpoint - use coolingSetpoint for all temps
+        if (caps.thermostatHeatingSetpoint) {
+          commands.push({
+            component: 'main',
+            capability: 'thermostatHeatingSetpoint',
+            command: 'setHeatingSetpoint',
+            arguments: [finalState.heatingSetpoint],
+          });
+        } else if (caps.thermostatCoolingSetpoint) {
+          // Fallback: use cooling setpoint (Samsung ACs use this for all modes)
+          logger.info({ deviceId: event.deviceId, setpoint: finalState.heatingSetpoint },
+            '🌡️  Using coolingSetpoint for heating (Samsung AC)');
+          commands.push({
+            component: 'main',
+            capability: 'thermostatCoolingSetpoint',
+            command: 'setCoolingSetpoint',
+            arguments: [finalState.heatingSetpoint],
+          });
+        }
       }
 
       if (finalState.coolingSetpoint !== undefined) {

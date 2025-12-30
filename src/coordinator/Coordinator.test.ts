@@ -346,7 +346,8 @@ describe('Coordinator', () => {
     });
 
     test('given mode event for Samsung AC, should use airConditionerMode', async () => {
-      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
+      // Set switchState to 'on' so it doesn't need to turn on first
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool', switchState: 'on' }));
       coordinator['deviceMetadata'].set('device-1', createMockDevice({
         deviceId: 'device-1',
         thermostatCapabilities: {
@@ -368,6 +369,69 @@ describe('Coordinator', () => {
           capability: 'airConditionerMode',
           command: 'setAirConditionerMode',
           arguments: ['cool'],
+        },
+      ]);
+    });
+
+    test('given off mode event for Samsung AC, should use switch.off', async () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool', switchState: 'on' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({
+        deviceId: 'device-1',
+        thermostatCapabilities: {
+          airConditionerMode: true,
+          thermostatMode: false,
+          temperatureMeasurement: true,
+          switch: true,
+        },
+      }));
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'mode',
+        mode: 'off',
+      });
+
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'switch',
+          command: 'off',
+          arguments: [],
+        },
+      ]);
+    });
+
+    test('given mode event for Samsung AC when off, should turn on first', async () => {
+      // switchState is 'off', so it should turn on before setting mode
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'off', switchState: 'off' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({
+        deviceId: 'device-1',
+        thermostatCapabilities: {
+          airConditionerMode: true,
+          thermostatMode: false,
+          temperatureMeasurement: true,
+          switch: true,
+        },
+      }));
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'mode',
+        mode: 'heat',
+      });
+
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'switch',
+          command: 'on',
+          arguments: [],
+        },
+        {
+          component: 'main',
+          capability: 'airConditionerMode',
+          command: 'setAirConditionerMode',
+          arguments: ['heat'],
         },
       ]);
     });

@@ -12,6 +12,8 @@ export interface DeviceState {
   operatingState?: 'idle' | 'heating' | 'cooling';
   humidity?: number;
   outdoorTemperature?: number;
+  // Samsung AC specific - switch state for on/off
+  switchState?: 'on' | 'off';
 }
 
 export interface CoordinatorState {
