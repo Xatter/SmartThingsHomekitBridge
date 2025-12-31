@@ -234,6 +234,51 @@ A test script is available at `scripts/test-commands.sh`:
 
 ---
 
+## Critical Implementation Notes
+
+### All Command Paths Must Use Coordinator
+
+**IMPORTANT:** All temperature and mode changes—whether from HomeKit, the web UI, or any other source—MUST route through `Coordinator.handleThermostatEvent()`.
+
+**Why:** The Coordinator contains the Samsung AC fallback logic:
+- Detects when a device lacks `thermostatHeatingSetpoint` capability
+- Falls back to `thermostatCoolingSetpoint` for temperature changes in heat mode
+- Uses `switch:off` instead of invalid mode commands for Samsung ACs
+
+**What happens if you bypass the Coordinator:**
+```
+SmartThings API returns 422 error:
+"thermostatHeatingSetpoint is not a valid value"
+```
+
+**Correct pattern:**
+```typescript
+// ✅ CORRECT - Routes through Coordinator
+await coordinator.handleThermostatEvent({
+  deviceId,
+  type: 'temperature',
+  temperature: 72,
+});
+
+// ❌ WRONG - Bypasses Samsung AC logic
+await api.setTemperature(deviceId, 72, 'heat');
+```
+
+### Samsung AC Capability Detection
+
+Samsung ACs are identified by having `airConditionerMode` but NOT `thermostatMode`:
+
+```typescript
+const isSamsungAC = caps.airConditionerMode && !caps.thermostatMode;
+```
+
+When `isSamsungAC` is true:
+- **Temperature:** Always use `thermostatCoolingSetpoint`, never `thermostatHeatingSetpoint`
+- **Off mode:** Use `switch:off`, not `airConditionerMode:setAirConditionerMode:off`
+- **Other modes:** Turn on switch first if device is off, then set mode
+
+---
+
 ## Known Limitations
 
 1. **Samsung AC "dry" and "wind" modes** - Mapped to "cool" in HomeKit since there's no equivalent
