@@ -228,18 +228,19 @@ export function createDevicesRoutes(
         return res.status(404).json({ error: 'Device not found' });
       }
 
-      const mode = deviceState.mode === 'auto' ? 'cool' : deviceState.mode;
-      if (mode === 'off') {
+      if (deviceState.mode === 'off') {
         return res.status(400).json({ error: 'Cannot set temperature when device is off' });
       }
 
-      const success = await api.setTemperature(deviceId, temperature, mode as 'heat' | 'cool');
+      // Route through Coordinator to handle Samsung AC quirks
+      // (Samsung ACs only have thermostatCoolingSetpoint, not thermostatHeatingSetpoint)
+      await coordinator.handleThermostatEvent({
+        deviceId,
+        type: 'temperature',
+        temperature: temperature,
+      });
 
-      if (success) {
-        res.json({ success: true, temperature });
-      } else {
-        res.status(500).json({ error: 'Failed to change temperature' });
-      }
+      res.json({ success: true, temperature });
     } catch (error) {
       logger.error({ err: error, deviceId: req.params.deviceId }, 'Error changing temperature');
       res.status(500).json({ error: 'Failed to change temperature' });
@@ -259,13 +260,15 @@ export function createDevicesRoutes(
         return res.status(400).json({ error: 'Invalid mode value' });
       }
 
-      const success = await api.setMode(deviceId, mode);
+      // Route through Coordinator to handle Samsung AC quirks
+      // (Samsung ACs use switch for on/off, airConditionerMode for heat/cool/auto)
+      await coordinator.handleThermostatEvent({
+        deviceId,
+        type: 'mode',
+        mode: mode,
+      });
 
-      if (success) {
-        res.json({ success: true, mode });
-      } else {
-        res.status(500).json({ error: 'Failed to change mode' });
-      }
+      res.json({ success: true, mode });
     } catch (error) {
       logger.error({ err: error, deviceId: req.params.deviceId }, 'Error changing mode');
       res.status(500).json({ error: 'Failed to change mode' });
