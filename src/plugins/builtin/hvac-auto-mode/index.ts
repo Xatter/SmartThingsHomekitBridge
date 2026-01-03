@@ -140,9 +140,124 @@ class HVACAutoModePlugin implements Plugin {
   }
 
   /**
+   * Detect devices reporting "auto" mode from SmartThings and correct them.
+   * Mini splits should never be in auto mode on the device itself.
+   *
+   * Heuristic for determining correct mode:
+   * 1. If any other thermostat is in heat/cool mode, use that mode
+   * 2. If we're the only node or all others are off, use temp vs setpoint
+   */
+  private async detectAndCorrectAutoMode(devices: UnifiedDevice[]): Promise<void> {
+    // Get all thermostat-like devices
+    const thermostatDevices = devices.filter(d => isThermostatLikeDevice(d));
+
+    // Find devices currently in auto mode (from SmartThings state)
+    const devicesInAutoMode = thermostatDevices.filter(d => {
+      const mode = (d.mode || '').toLowerCase();
+      return mode === 'auto';
+    });
+
+    if (devicesInAutoMode.length === 0) {
+      return;
+    }
+
+    this.context.logger.info(
+      { count: devicesInAutoMode.length, devices: devicesInAutoMode.map(d => d.label) },
+      '⚠️  Detected devices in auto mode from SmartThings - correcting'
+    );
+
+    // Determine what mode to use based on other devices
+    const correctMode = this.determineCorrectMode(thermostatDevices, devicesInAutoMode);
+
+    if (!correctMode) {
+      this.context.logger.warn(
+        'Could not determine correct mode for auto-mode devices, skipping correction'
+      );
+      return;
+    }
+
+    this.context.logger.info(
+      { mode: correctMode },
+      '🔧 Correcting auto-mode devices to mode'
+    );
+
+    // Correct each device
+    for (const device of devicesInAutoMode) {
+      try {
+        // Use thermostatMode for the correction
+        await this.context.setSmartThingsState(device.deviceId, {
+          thermostatMode: correctMode,
+        });
+        this.context.logger.info(
+          { deviceId: device.deviceId, deviceName: device.label, mode: correctMode },
+          '✅ Corrected device from auto mode'
+        );
+      } catch (error) {
+        this.context.logger.error(
+          { err: error, deviceId: device.deviceId, deviceName: device.label },
+          '❌ Failed to correct device from auto mode'
+        );
+      }
+    }
+  }
+
+  /**
+   * Determine the correct mode to use for devices stuck in auto.
+   *
+   * Priority:
+   * 1. If any other thermostat is actively heating/cooling, copy that mode
+   * 2. Otherwise, use temperature vs setpoint heuristic
+   */
+  private determineCorrectMode(
+    allDevices: UnifiedDevice[],
+    devicesInAutoMode: UnifiedDevice[]
+  ): 'heat' | 'cool' | 'off' | null {
+    const autoModeIds = new Set(devicesInAutoMode.map(d => d.deviceId));
+
+    // Check other devices (not in auto mode) for their current mode
+    const otherDevices = allDevices.filter(d => !autoModeIds.has(d.deviceId));
+
+    for (const device of otherDevices) {
+      const mode = (device.mode || '').toLowerCase();
+      if (mode === 'heat' || mode === 'cool') {
+        this.context.logger.debug(
+          { deviceId: device.deviceId, deviceName: device.label, mode },
+          'Using mode from other active device'
+        );
+        return mode;
+      }
+    }
+
+    // No other device is actively heating/cooling
+    // Use temperature vs setpoint heuristic from the first auto-mode device
+    const device = devicesInAutoMode[0];
+    const temp = device.currentTemperature;
+    const setpoint = device.coolingSetpoint ?? device.heatingSetpoint;
+
+    if (temp === undefined || setpoint === undefined) {
+      this.context.logger.warn(
+        { deviceId: device.deviceId, deviceName: device.label, temp, setpoint },
+        'Cannot determine mode: missing temperature or setpoint data'
+      );
+      return null;
+    }
+
+    // Simple heuristic: if current temp is below setpoint, heat; otherwise cool
+    const mode = temp < setpoint ? 'heat' : 'cool';
+    this.context.logger.debug(
+      { deviceId: device.deviceId, temp, setpoint, mode },
+      'Determined mode from temperature vs setpoint heuristic'
+    );
+    return mode;
+  }
+
+  /**
    * Run auto-mode coordination on each poll cycle
    */
   async onPollCycle(devices: UnifiedDevice[]): Promise<void> {
+    // First, detect and correct any devices in "auto" mode from SmartThings
+    await this.detectAndCorrectAutoMode(devices);
+
     const enrolledIds = this.controller.getEnrolledDeviceIds();
     if (enrolledIds.length === 0) {
       // No devices enrolled
