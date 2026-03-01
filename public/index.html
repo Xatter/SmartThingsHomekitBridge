@@ -1295,21 +1295,18 @@
         }
 
         function PluginsPage({ plugins, loading, onRefresh }) {
-            const [restartNotice, setRestartNotice] = React.useState(null);
             const [togglingPlugin, setTogglingPlugin] = React.useState(null);
-            const [isRestarting, setIsRestarting] = React.useState(false);
 
             async function handleTogglePlugin(plugin) {
                 try {
                     setTogglingPlugin(plugin.name);
-                    const action = plugin.enabled ? 'disable' : 'enable';
+                    const action = plugin.running ? 'disable' : 'enable';
                     const response = await fetch(`/api/plugins/${plugin.name}/${action}`, {
                         method: 'POST',
                     });
                     const result = await response.json();
 
                     if (result.success) {
-                        setRestartNotice('Plugin settings updated. Restart required to take effect.');
                         onRefresh();
                     } else {
                         alert('Failed to update plugin: ' + (result.error || 'Unknown error'));
@@ -1319,31 +1316,6 @@
                     alert('Failed to update plugin: ' + error.message);
                 } finally {
                     setTogglingPlugin(null);
-                }
-            }
-
-            async function handleRestart() {
-                if (!confirm('Restart the SmartThings HomeKit Bridge? This will briefly interrupt HomeKit connectivity.')) {
-                    return;
-                }
-
-                try {
-                    setIsRestarting(true);
-                    const response = await fetch('/api/system/restart', {
-                        method: 'POST',
-                    });
-                    const result = await response.json();
-
-                    if (result.success) {
-                        alert('Bridge is restarting... The page will reload in 10 seconds.');
-                        setTimeout(() => {
-                            window.location.reload();
-                        }, 10000);
-                    }
-                } catch (error) {
-                    console.error('Error restarting:', error);
-                    alert('Failed to restart: ' + error.message);
-                    setIsRestarting(false);
                 }
             }
 
@@ -1359,20 +1331,6 @@
                             Refresh
                         </button>
                     </div>
-
-                    {restartNotice && (
-                        <div className="info-box" style={{backgroundColor: '#fff3cd', borderColor: '#ffc107', marginBottom: '20px'}}>
-                            <p style={{color: '#856404', margin: '0 0 8px 0'}}>⚠️ {restartNotice}</p>
-                            <button
-                                className="primary-button"
-                                onClick={handleRestart}
-                                disabled={isRestarting}
-                                style={{marginTop: '8px'}}
-                            >
-                                {isRestarting ? 'Restarting...' : 'Restart Bridge'}
-                            </button>
-                        </div>
-                    )}
 
                     {plugins.length === 0 ? (
                         <div className="info-box">
@@ -1394,7 +1352,7 @@
                                         <label className="toggle-switch">
                                             <input
                                                 type="checkbox"
-                                                checked={plugin.enabled}
+                                                checked={plugin.running}
                                                 disabled={togglingPlugin === plugin.name}
                                                 onChange={() => handleTogglePlugin(plugin)}
                                             />
@@ -1418,7 +1376,7 @@
                                         <div className="device-info-row">
                                             <span className="label">Status:</span>
                                             <span className="value">
-                                                {plugin.enabled ? '✅ Enabled' : '⏸️ Disabled'}
+                                                {plugin.running ? '✅ Running' : '⏸️ Stopped'}
                                             </span>
                                         </div>
                                     </div>

@@ -71,29 +71,28 @@ export class WebServer {
         logger.info({ plugin: pluginName, routeCount: routes.length }, 'Registered plugin routes');
       }
 
-      // Plugin list endpoint (with enabled status)
-      // Returns ALL discovered plugins, including disabled ones, so users can enable them
+      // Plugin list endpoint (with enabled and running status)
       this.app.get('/api/plugins', (req, res) => {
-        const plugins = pluginManager.getAllDiscoveredPlugins().map(loaded => ({
+        const plugins = pluginManager.getPlugins().map(loaded => ({
           name: loaded.plugin.name,
           version: loaded.plugin.version,
           description: loaded.plugin.description,
           source: loaded.metadata.source,
           enabled: pluginManager.isPluginEnabled(loaded.plugin.name),
+          running: pluginManager.isPluginRunning(loaded.plugin.name),
         }));
         res.json(plugins);
       });
 
-      // Enable plugin endpoint
+      // Enable plugin endpoint (starts at runtime, no restart needed)
       this.app.post('/api/plugins/:name/enable', async (req, res) => {
         try {
           const { name } = req.params;
           await pluginManager.enablePlugin(name);
-          logger.info({ plugin: name }, 'Plugin enabled (restart required)');
+          logger.info({ plugin: name }, 'Plugin enabled and started');
           res.json({
             success: true,
-            message: 'Plugin enabled. Restart required to take effect.',
-            restartRequired: true
+            message: 'Plugin enabled and started.',
           });
         } catch (error) {
           logger.error({ err: error, plugin: req.params.name }, 'Failed to enable plugin');
@@ -101,16 +100,15 @@ export class WebServer {
         }
       });
 
-      // Disable plugin endpoint
+      // Disable plugin endpoint (stops at runtime, no restart needed)
       this.app.post('/api/plugins/:name/disable', async (req, res) => {
         try {
           const { name } = req.params;
           await pluginManager.disablePlugin(name);
-          logger.info({ plugin: name }, 'Plugin disabled (restart required)');
+          logger.info({ plugin: name }, 'Plugin disabled and stopped');
           res.json({
             success: true,
-            message: 'Plugin disabled. Restart required to take effect.',
-            restartRequired: true
+            message: 'Plugin disabled and stopped.',
           });
         } catch (error) {
           logger.error({ err: error, plugin: req.params.name }, 'Failed to disable plugin');

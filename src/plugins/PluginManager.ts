@@ -9,12 +9,16 @@ import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 
 /**
- * Manages plugin lifecycle and coordination
+ * Manages plugin lifecycle and coordination.
+ *
+ * All builtin plugins are always loaded and initialized into `plugins`.
+ * The `runningPlugins` Set tracks which have been start()ed.
+ * The `enabled` config flag only controls whether start() is called.
  */
 export class PluginManager {
   private readonly logger: Logger;
   private readonly plugins: Map<string, LoadedPlugin> = new Map();
-  private readonly discoveredPlugins: Map<string, LoadedPlugin> = new Map();
+  private readonly runningPlugins: Set<string> = new Set();
   private readonly contexts: Map<string, PluginContext> = new Map();
   private readonly config: any;
   private readonly api: SmartThingsAPI;
@@ -43,7 +47,6 @@ export class PluginManager {
     this.getDeviceImpl = getDeviceImpl;
     this.persistPath = persistPath;
     this.dataPath = dataPath || './data';
-    // Use dataPath for plugin config
     this.pluginConfigManager = new PluginConfigManager(this.dataPath, logger);
   }
 
@@ -66,7 +69,7 @@ export class PluginManager {
   }
 
   /**
-   * Load built-in plugins from src/plugins/builtin/
+   * Load ALL built-in plugins from src/plugins/builtin/ regardless of enabled state
    */
   private async loadBuiltinPlugins(): Promise<void> {
     const builtinPath = path.join(__dirname, 'builtin');
@@ -98,34 +101,7 @@ export class PluginManager {
           // Handle ES6 module / CommonJS interop - check for double default wrapping
           const plugin: Plugin = pluginModule.default?.default || pluginModule.default || pluginModule;
 
-          // Check if plugin is enabled in persistent config
-          const isEnabled = this.pluginConfigManager.isEnabled(plugin.name);
-
-          // Also check config file (for backwards compatibility)
           const pluginConfig = this.config.plugins?.[plugin.name];
-          const configDisabled = pluginConfig?.enabled === false;
-
-          // Track all discovered plugins (even disabled ones) for the API
-          this.discoveredPlugins.set(plugin.name, {
-            plugin,
-            metadata: {
-              name: plugin.name,
-              version: plugin.version,
-              description: plugin.description,
-              source: 'builtin',
-              path: pluginDir,
-            },
-          });
-
-          if (!isEnabled) {
-            this.logger.info({ plugin: plugin.name }, 'Plugin disabled, skipping');
-            continue;
-          }
-
-          if (configDisabled) {
-            this.logger.info({ plugin: plugin.name }, 'Plugin disabled in config, skipping');
-            continue;
-          }
 
           // Create plugin context
           const context = new PluginContextImpl(
@@ -141,7 +117,7 @@ export class PluginManager {
 
           this.contexts.set(plugin.name, context);
 
-          // Store loaded plugin
+          // Store loaded plugin (ALL plugins, regardless of enabled state)
           this.plugins.set(plugin.name, {
             plugin,
             metadata: {
@@ -193,14 +169,20 @@ export class PluginManager {
   }
 
   /**
-   * Start all loaded plugins
+   * Start plugins that are enabled in config
    */
   async startPlugins(): Promise<void> {
     this.logger.info('Starting plugins...');
 
     for (const [name, loaded] of this.plugins) {
+      if (!this.pluginConfigManager.isEnabled(name)) {
+        this.logger.info({ plugin: name }, 'Plugin disabled, not starting');
+        continue;
+      }
+
       try {
         await loaded.plugin.start();
+        this.runningPlugins.add(name);
         this.logger.info({ plugin: name }, 'Plugin started');
       } catch (error) {
         this.logger.error({ err: error, plugin: name }, 'Failed to start plugin');
@@ -209,12 +191,15 @@ export class PluginManager {
   }
 
   /**
-   * Stop all loaded plugins
+   * Stop all running plugins
    */
   async stopPlugins(): Promise<void> {
     this.logger.info('Stopping plugins...');
 
-    for (const [name, loaded] of this.plugins) {
+    for (const name of this.runningPlugins) {
+      const loaded = this.plugins.get(name);
+      if (!loaded) continue;
+
       try {
         await loaded.plugin.stop();
         this.logger.info({ plugin: name }, 'Plugin stopped');
@@ -222,15 +207,19 @@ export class PluginManager {
         this.logger.error({ err: error, plugin: name }, 'Failed to stop plugin');
       }
     }
+
+    this.runningPlugins.clear();
   }
 
   /**
-   * Get plugins that should handle a specific device
+   * Get plugins that should handle a specific device (only running plugins)
    */
   getPluginsForDevice(device: UnifiedDevice): Plugin[] {
     const plugins: Plugin[] = [];
 
     for (const loaded of this.plugins.values()) {
+      if (!this.runningPlugins.has(loaded.plugin.name)) continue;
+
       if (loaded.plugin.shouldHandleDevice) {
         try {
           if (loaded.plugin.shouldHandleDevice(device)) {
@@ -249,8 +238,7 @@ export class PluginManager {
   }
 
   /**
-   * Call beforeSetSmartThingsState hooks for plugins handling this device
-   * Returns the final state to apply, or null to cancel
+   * Call beforeSetSmartThingsState hooks for running plugins handling this device
    */
   async beforeSetSmartThingsState(device: UnifiedDevice, state: any): Promise<any | null> {
     let currentState = state;
@@ -281,8 +269,7 @@ export class PluginManager {
   }
 
   /**
-   * Call beforeSetHomeKitState hooks for plugins handling this device
-   * Returns the final state to apply, or null to cancel
+   * Call beforeSetHomeKitState hooks for running plugins handling this device
    */
   async beforeSetHomeKitState(device: UnifiedDevice, state: any): Promise<any | null> {
     let currentState = state;
@@ -313,7 +300,7 @@ export class PluginManager {
   }
 
   /**
-   * Call afterDeviceUpdate hooks for plugins handling this device
+   * Call afterDeviceUpdate hooks for running plugins handling this device
    */
   async afterDeviceUpdate(device: UnifiedDevice, newState: any, oldState: any): Promise<void> {
     const plugins = this.getPluginsForDevice(device);
@@ -332,10 +319,12 @@ export class PluginManager {
   }
 
   /**
-   * Call onPollCycle hooks for all plugins
+   * Call onPollCycle hooks for running plugins only
    */
   async onPollCycle(devices: UnifiedDevice[]): Promise<void> {
     for (const loaded of this.plugins.values()) {
+      if (!this.runningPlugins.has(loaded.plugin.name)) continue;
+
       if (loaded.plugin.onPollCycle) {
         try {
           await loaded.plugin.onPollCycle(devices);
@@ -350,7 +339,7 @@ export class PluginManager {
   }
 
   /**
-   * Get all web routes provided by plugins
+   * Get all web routes provided by ALL loaded plugins (not just running)
    */
   getAllWebRoutes(): Map<string, PluginWebRoute[]> {
     const routes = new Map<string, PluginWebRoute[]>();
@@ -380,14 +369,6 @@ export class PluginManager {
   }
 
   /**
-   * Get all discovered plugins (including disabled ones)
-   * This is useful for showing all available plugins in the UI
-   */
-  getAllDiscoveredPlugins(): LoadedPlugin[] {
-    return Array.from(this.discoveredPlugins.values());
-  }
-
-  /**
    * Get a specific plugin by name
    */
   getPlugin(name: string): LoadedPlugin | undefined {
@@ -395,36 +376,64 @@ export class PluginManager {
   }
 
   /**
-   * Check if a plugin is enabled
+   * Check if a plugin is enabled in config
    */
   isPluginEnabled(name: string): boolean {
     return this.pluginConfigManager.isEnabled(name);
   }
 
   /**
-   * Enable a plugin
-   * Note: Requires application restart to take effect
+   * Check if a plugin is currently running
+   */
+  isPluginRunning(name: string): boolean {
+    return this.runningPlugins.has(name);
+  }
+
+  /**
+   * Enable a plugin: save config + start at runtime
    */
   async enablePlugin(name: string): Promise<void> {
     await this.pluginConfigManager.setEnabled(name, true);
+
+    const loaded = this.plugins.get(name);
+    if (loaded && !this.runningPlugins.has(name)) {
+      try {
+        await loaded.plugin.start();
+        this.runningPlugins.add(name);
+        this.logger.info({ plugin: name }, 'Plugin enabled and started at runtime');
+      } catch (error) {
+        this.logger.error({ err: error, plugin: name }, 'Failed to start plugin at runtime');
+      }
+    }
   }
 
   /**
-   * Disable a plugin
-   * Note: Requires application restart to take effect
+   * Disable a plugin: save config + stop at runtime
    */
   async disablePlugin(name: string): Promise<void> {
     await this.pluginConfigManager.setEnabled(name, false);
+
+    const loaded = this.plugins.get(name);
+    if (loaded && this.runningPlugins.has(name)) {
+      try {
+        await loaded.plugin.stop();
+        this.runningPlugins.delete(name);
+        this.logger.info({ plugin: name }, 'Plugin disabled and stopped at runtime');
+      } catch (error) {
+        this.logger.error({ err: error, plugin: name }, 'Failed to stop plugin at runtime');
+      }
+    }
   }
 
   /**
-   * Get plugins with their enabled status
+   * Get plugins with their enabled and running status
    */
-  getPluginsWithStatus(): Array<LoadedPlugin & { enabled: boolean }> {
+  getPluginsWithStatus(): Array<LoadedPlugin & { enabled: boolean; running: boolean }> {
     const loaded = this.getPlugins();
     return loaded.map(plugin => ({
       ...plugin,
-      enabled: this.isPluginEnabled(plugin.plugin.name)
+      enabled: this.isPluginEnabled(plugin.plugin.name),
+      running: this.isPluginRunning(plugin.plugin.name),
     }));
   }
 }
