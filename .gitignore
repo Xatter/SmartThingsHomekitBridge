@@ -45,5 +45,8 @@ storage/
 tmp/
 temp/
 
+# Deploy script (contains credentials, not for open source)
+deploy.sh
+
 # Worktrees
 .worktrees/
