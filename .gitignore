@@ -44,3 +44,6 @@ storage/
 # Temporary files
 tmp/
 temp/
+
+# Worktrees
+.worktrees/
