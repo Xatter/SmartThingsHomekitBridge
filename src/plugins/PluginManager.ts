@@ -398,6 +398,10 @@ export class PluginManager {
     const loaded = this.plugins.get(name);
     if (loaded && !this.runningPlugins.has(name)) {
       try {
+        const context = this.contexts.get(name);
+        if (context) {
+          await loaded.plugin.init(context);
+        }
         await loaded.plugin.start();
         this.runningPlugins.add(name);
         this.logger.info({ plugin: name }, 'Plugin enabled and started at runtime');

@@ -220,7 +220,7 @@ describe('PluginManager', () => {
   });
 
   describe('enablePlugin', () => {
-    it('calls start() at runtime and adds to running plugins', async () => {
+    it('calls init() then start() at runtime and adds to running plugins', async () => {
       await loadPluginsWithMocks();
       // plugin-b is not running
       mockConfigManager.isEnabled.mockImplementation((name: string) => name === 'plugin-a');
@@ -230,8 +230,23 @@ describe('PluginManager', () => {
       await pluginManager.enablePlugin('plugin-b');
 
       expect(mockConfigManager.setEnabled).toHaveBeenCalledWith('plugin-b', true);
+      expect(pluginB.init).toHaveBeenCalled();
       expect(pluginB.start).toHaveBeenCalled();
       expect(pluginManager.isPluginRunning('plugin-b')).toBe(true);
+    });
+
+    it('calls init() before start() in correct order', async () => {
+      await loadPluginsWithMocks();
+      mockConfigManager.isEnabled.mockImplementation((name: string) => name === 'plugin-a');
+      await pluginManager.startPlugins();
+
+      const callOrder: string[] = [];
+      (pluginB.init as jest.Mock).mockImplementation(async () => { callOrder.push('init'); });
+      (pluginB.start as jest.Mock).mockImplementation(async () => { callOrder.push('start'); });
+
+      await pluginManager.enablePlugin('plugin-b');
+
+      expect(callOrder).toEqual(['init', 'start']);
     });
   });
 
@@ -320,6 +335,51 @@ describe('PluginManager', () => {
       expect(pluginAStatus?.enabled).toBe(true);
       expect(pluginBStatus?.running).toBe(false);
       expect(pluginBStatus?.enabled).toBe(false);
+    });
+  });
+
+  describe('beforeSetSmartThingsState hook chaining', () => {
+    it('chains state through multiple running plugins', async () => {
+      const device = createMockDevice();
+      pluginA.shouldHandleDevice = jest.fn().mockReturnValue(true);
+      pluginB.shouldHandleDevice = jest.fn().mockReturnValue(true);
+      pluginA.beforeSetSmartThingsState = jest.fn().mockResolvedValue({ thermostatMode: 'cool', modified: 'by-a' });
+      pluginB.beforeSetSmartThingsState = jest.fn().mockResolvedValue({ thermostatMode: 'cool', modified: 'by-b' });
+
+      await loadPluginsWithMocks();
+      mockConfigManager.isEnabled.mockReturnValue(true);
+      await pluginManager.startPlugins();
+
+      const result = await pluginManager.beforeSetSmartThingsState(device, { thermostatMode: 'heat' });
+
+      // Plugin A receives original state
+      expect(pluginA.beforeSetSmartThingsState).toHaveBeenCalledWith(device, { thermostatMode: 'heat' });
+      // Plugin B receives Plugin A's output
+      expect(pluginB.beforeSetSmartThingsState).toHaveBeenCalledWith(device, { thermostatMode: 'cool', modified: 'by-a' });
+      // Final result is Plugin B's output
+      expect(result).toEqual({ thermostatMode: 'cool', modified: 'by-b' });
+    });
+  });
+
+  describe('disable/re-enable lifecycle', () => {
+    it('restores plugin to working state after disable then re-enable', async () => {
+      await loadPluginsWithMocks();
+      mockConfigManager.isEnabled.mockReturnValue(true);
+      await pluginManager.initializePlugins();
+      await pluginManager.startPlugins();
+
+      // Disable plugin-a
+      await pluginManager.disablePlugin('plugin-a');
+      expect(pluginA.stop).toHaveBeenCalled();
+      expect(pluginManager.isPluginRunning('plugin-a')).toBe(false);
+
+      // Re-enable plugin-a
+      await pluginManager.enablePlugin('plugin-a');
+
+      // Should have called init again (re-initialization) then start
+      expect(pluginA.init).toHaveBeenCalledTimes(2); // once in initializePlugins, once in enablePlugin
+      expect(pluginA.start).toHaveBeenCalledTimes(2); // once in startPlugins, once in enablePlugin
+      expect(pluginManager.isPluginRunning('plugin-a')).toBe(true);
     });
   });
 
