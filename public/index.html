@@ -676,6 +676,20 @@
                         >
                             HomeKit Setup
                         </button>
+                        {authStatus.authenticated && (
+                            <button
+                                className="nav-button"
+                                onClick={() => {
+                                    if (confirm('Re-authenticate with SmartThings? You will be redirected to SmartThings to sign in again.')) {
+                                        initiateAuth();
+                                    }
+                                }}
+                                style={{backgroundColor: '#8e8e93'}}
+                                title="Force a fresh SmartThings OAuth token"
+                            >
+                                Re-auth
+                            </button>
+                        )}
                     </div>
 
                     {error && (

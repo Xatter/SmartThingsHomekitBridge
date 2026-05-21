@@ -4,6 +4,16 @@ import { AutoModeController, AutoModeDevice } from './AutoModeController';
 import { Request, Response } from 'express';
 import { isThermostatLikeDevice } from '@/utils/deviceUtils';
 
+interface PendingFlip {
+  targetMode: 'heat' | 'cool';
+  phase: 'awaiting_off' | 'awaiting_min_off_time';
+  startedAt: number;
+  allOffAt?: number;
+  deviceIds: string[];
+}
+
+const OFF_CYCLE_TIMEOUT_MS = 30_000;
+
 /**
  * HVAC Auto-Mode Plugin
  *
@@ -28,6 +38,7 @@ class HVACAutoModePlugin implements Plugin {
   private context!: PluginContext;
   private controller!: AutoModeController;
   private readonly AUTO_MODE_MARKER = 'auto';
+  private pendingFlip: PendingFlip | null = null;
 
   async init(context: PluginContext): Promise<void> {
     this.context = context;
@@ -145,6 +156,13 @@ class HVACAutoModePlugin implements Plugin {
    * This plugin focuses on enrollment-based coordination via the AutoModeController.
    */
   async onPollCycle(devices: UnifiedDevice[]): Promise<void> {
+    // If a heat<->cool flip is in progress, drive its state machine and
+    // skip demand evaluation until it completes or aborts.
+    if (this.pendingFlip) {
+      await this.drivePendingFlip(devices);
+      return;
+    }
+
     const enrolledIds = this.controller.getEnrolledDeviceIds();
     if (enrolledIds.length === 0) {
       // No devices enrolled
@@ -237,35 +255,197 @@ class HVACAutoModePlugin implements Plugin {
       '🤖 Auto-mode evaluation'
     );
 
-    // Apply decision (updates controller state)
-    const modeChanged = await this.controller.applyDecision(decision);
+    const previousMode = this.controller.getCurrentMode();
+    const isHeatCoolFlip =
+      decision.mode !== previousMode &&
+      previousMode !== 'off' &&
+      decision.mode !== 'off';
 
-    if (modeChanged) {
-      // Mode switched - update all enrolled devices in SmartThings
-      this.context.logger.info(
-        { mode: decision.mode, enrolledCount: autoModeDevices.length },
-        '🎯 Applying mode to all enrolled devices'
-      );
+    if (isHeatCoolFlip) {
+      // Samsung multi-zone compressor can only run one mode at a time.
+      // Disagreeing units get powered off by the system. To actually flip,
+      // we must turn everything off, wait min-off-time, then bring units
+      // back up in the new mode so the first one establishes the system mode.
+      await this.startFlip(decision.mode as 'heat' | 'cool', autoModeDevices, devices);
+    } else {
+      // No mode change, or transitions to/from off — no off-cycle needed
+      const modeChanged = await this.controller.applyDecision(decision);
 
-      for (const device of autoModeDevices) {
-        try {
-          await this.context.setSmartThingsState(device.id, {
-            thermostatMode: decision.mode,
-          });
-          this.context.logger.debug(
-            { deviceId: device.id, deviceName: device.name, mode: decision.mode },
-            '✅ Device mode updated'
-          );
-        } catch (error) {
-          this.context.logger.error(
-            { err: error, deviceId: device.id, deviceName: device.name },
-            '❌ Failed to update device mode'
-          );
+      if (modeChanged) {
+        this.context.logger.info(
+          { mode: decision.mode, enrolledCount: autoModeDevices.length },
+          '🎯 Applying mode to all enrolled devices'
+        );
+
+        for (const device of autoModeDevices) {
+          try {
+            await this.context.setSmartThingsState(device.id, {
+              thermostatMode: decision.mode,
+            });
+            this.context.logger.debug(
+              { deviceId: device.id, deviceName: device.name, mode: decision.mode },
+              '✅ Device mode updated'
+            );
+          } catch (error) {
+            this.context.logger.error(
+              { err: error, deviceId: device.id, deviceName: device.name },
+              '❌ Failed to update device mode'
+            );
+          }
         }
       }
     }
 
     // Save controller state after each evaluation
+    await this.saveControllerState();
+  }
+
+  /**
+   * Start a heat<->cool flip by sending off to all enrolled devices and
+   * entering the awaiting_off phase of the state machine.
+   */
+  private async startFlip(
+    targetMode: 'heat' | 'cool',
+    enrolledDevices: AutoModeDevice[],
+    allDevices: UnifiedDevice[]
+  ): Promise<void> {
+    const enrolledIds = enrolledDevices.map(d => d.id);
+
+    // Warn if any non-enrolled HVAC unit is on in a conflicting mode — it
+    // will anchor the system mode and our flip will not actually take.
+    const conflicting = allDevices.filter(d =>
+      isThermostatLikeDevice(d) &&
+      !enrolledIds.includes(d.deviceId) &&
+      d.currentState?.switchState === 'on' &&
+      d.currentState?.mode &&
+      d.currentState.mode !== 'off' &&
+      d.currentState.mode !== targetMode
+    );
+    if (conflicting.length > 0) {
+      this.context.logger.warn(
+        {
+          targetMode,
+          conflictingDevices: conflicting.map(d => ({
+            deviceId: d.deviceId,
+            name: d.label,
+            mode: d.currentState?.mode,
+          })),
+        },
+        '⚠️  Non-enrolled HVAC unit(s) on in conflicting mode — flip may not take effect at the Samsung compressor'
+      );
+    }
+
+    this.context.logger.info(
+      { targetMode, deviceCount: enrolledDevices.length },
+      '🔻 Mode flip starting — sending OFF to all enrolled devices'
+    );
+
+    for (const device of enrolledDevices) {
+      try {
+        await this.context.setSmartThingsState(device.id, {
+          thermostatMode: 'off',
+        });
+      } catch (error) {
+        this.context.logger.error(
+          { err: error, deviceId: device.id, deviceName: device.name },
+          '❌ Failed to send OFF during flip start'
+        );
+      }
+    }
+
+    this.pendingFlip = {
+      targetMode,
+      phase: 'awaiting_off',
+      startedAt: Date.now(),
+      deviceIds: enrolledIds,
+    };
+  }
+
+  /**
+   * Drive the pending flip state machine. Called instead of demand
+   * evaluation while a flip is in progress.
+   */
+  private async drivePendingFlip(devices: UnifiedDevice[]): Promise<void> {
+    const flip = this.pendingFlip!;
+    const now = Date.now();
+    const flipDevices = devices.filter(d => flip.deviceIds.includes(d.deviceId));
+
+    if (flip.phase === 'awaiting_off') {
+      const allOff = flipDevices.length > 0 &&
+        flipDevices.every(d => d.currentState?.switchState === 'off');
+
+      if (allOff) {
+        flip.phase = 'awaiting_min_off_time';
+        flip.allOffAt = now;
+        this.context.logger.info(
+          { targetMode: flip.targetMode, minOffSeconds: this.controller.getConfig().minOffTime },
+          '✅ All enrolled devices off — waiting min-off-time before flipping mode'
+        );
+        return;
+      }
+
+      if (now - flip.startedAt >= OFF_CYCLE_TIMEOUT_MS) {
+        const stillOn = flipDevices
+          .filter(d => d.currentState?.switchState !== 'off')
+          .map(d => ({ deviceId: d.deviceId, name: d.label, switch: d.currentState?.switchState }));
+        this.context.logger.warn(
+          { targetMode: flip.targetMode, timeoutMs: OFF_CYCLE_TIMEOUT_MS, stillOn },
+          '❌ Off-cycle timeout — aborting flip, controller mode unchanged'
+        );
+        this.pendingFlip = null;
+        return;
+      }
+
+      this.context.logger.debug(
+        { elapsedMs: now - flip.startedAt },
+        '⏳ Waiting for all enrolled devices to report off'
+      );
+      return;
+    }
+
+    // awaiting_min_off_time
+    const minOffMs = this.controller.getConfig().minOffTime * 1000;
+    const elapsedSinceOff = now - (flip.allOffAt ?? now);
+
+    if (elapsedSinceOff < minOffMs) {
+      this.context.logger.debug(
+        { remainingMs: minOffMs - elapsedSinceOff },
+        '⏳ Holding off-cycle for compressor min-off-time'
+      );
+      return;
+    }
+
+    // Min-off elapsed: bring units up in the new mode.
+    this.context.logger.info(
+      { targetMode: flip.targetMode, deviceCount: flip.deviceIds.length },
+      '🔺 Min-off-time elapsed — applying new mode to enrolled devices'
+    );
+
+    for (const deviceId of flip.deviceIds) {
+      try {
+        await this.context.setSmartThingsState(deviceId, {
+          thermostatMode: flip.targetMode,
+        });
+      } catch (error) {
+        this.context.logger.error(
+          { err: error, deviceId },
+          '❌ Failed to apply target mode after flip'
+        );
+      }
+    }
+
+    // Commit the mode change to the controller now that the flip has executed.
+    await this.controller.applyDecision({
+      mode: flip.targetMode,
+      totalHeatDemand: 0,
+      totalCoolDemand: 0,
+      deviceDemands: [],
+      reason: 'Flip committed after off-cycle',
+      switchSuppressed: false,
+      secondsUntilSwitchAllowed: 0,
+    });
+
+    this.pendingFlip = null;
     await this.saveControllerState();
   }
 
