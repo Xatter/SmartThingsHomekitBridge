@@ -58,6 +58,8 @@ elif [[ "$RUNTIME" == "docker-buildx" ]]; then
         --platform linux/amd64,linux/arm64 \
         --cache-from type=registry,ref=${CACHE_IMAGE} \
         --cache-to type=registry,ref=${CACHE_IMAGE},mode=max \
+        --provenance=false \
+        --sbom=false \
         -t docker.revealedpreferences.com/smartthings-homekit-bridge:latest \
         -t ${FULL_IMAGE} \
         --push \
