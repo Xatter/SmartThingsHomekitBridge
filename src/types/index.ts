@@ -1,8 +1,8 @@
 export interface DeviceState {
   id: string;
   name: string;
-  temperatureSetpoint: number;
-  currentTemperature: number;
+  temperatureSetpoint: number | undefined;
+  currentTemperature: number | undefined;
   mode: 'heat' | 'cool' | 'auto' | 'off';
   lightOn: boolean;
   lastUpdated: Date;

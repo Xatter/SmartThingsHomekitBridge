@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { Logger } from 'pino';
+import { atomicWriteJson } from '@/utils/atomicWrite';
 
 export interface PluginConfig {
   enabled: boolean;
@@ -48,10 +49,7 @@ export class PluginConfigManager {
    */
   async save(): Promise<void> {
     try {
-      // Ensure directory exists
-      await fs.mkdir(path.dirname(this.configPath), { recursive: true });
-
-      await fs.writeFile(this.configPath, JSON.stringify(this.config, null, 2), 'utf-8');
+      await atomicWriteJson(this.configPath, this.config);
       this.logger.info({ count: Object.keys(this.config).length }, 'Saved plugin configuration');
     } catch (error) {
       this.logger.error({ err: error }, 'Failed to save plugin configuration');

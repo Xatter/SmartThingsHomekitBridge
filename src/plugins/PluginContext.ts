@@ -5,6 +5,7 @@ import { PluginContext as IPluginContext } from './types';
 import { UnifiedDevice } from '@/types';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
+import { atomicWriteJson } from '@/utils/atomicWrite';
 
 /**
  * Implementation of PluginContext interface
@@ -155,9 +156,8 @@ export class PluginContextImpl implements IPluginContext {
   }
 
   async saveState(key: string, data: any): Promise<void> {
-    await fs.mkdir(this.persistPath, { recursive: true });
     const filePath = path.join(this.persistPath, `${key}.json`);
-    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    await atomicWriteJson(filePath, data);
     this.logger.debug({ key, filePath }, 'Plugin state saved');
   }
 

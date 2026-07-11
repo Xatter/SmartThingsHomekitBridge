@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { Logger } from 'pino';
+import { atomicWriteJson } from '@/utils/atomicWrite';
 
 /**
  * Storage structure for device inclusion configuration
@@ -49,8 +50,7 @@ export class DeviceInclusionManager {
    */
   private async save(): Promise<void> {
     try {
-      await fs.mkdir(path.dirname(this.configPath), { recursive: true });
-      await fs.writeFile(this.configPath, JSON.stringify(this.config, null, 2), 'utf-8');
+      await atomicWriteJson(this.configPath, this.config);
       this.logger.info('Saved device inclusion configuration');
     } catch (error) {
       this.logger.error({ err: error }, 'Failed to save device inclusion configuration');

@@ -23,6 +23,17 @@ jest.mock('node-cron', () => ({
 import plugin from './index';
 import * as cron from 'node-cron';
 
+/**
+ * Flush all pending microtasks (including ones scheduled by other
+ * microtasks, e.g. chained `await`s inside a `finally` block). Node drains
+ * the entire microtask queue before running a macrotask callback like
+ * setImmediate, so awaiting this guarantees any fire-and-forget async work
+ * kicked off synchronously (e.g. plugin.start()'s initial check) has fully
+ * settled — including releasing the isChecking latch — before the test
+ * continues.
+ */
+const flushMicrotasks = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+
 describe('AutoModeMonitorPlugin', () => {
   let mockContext: jest.Mocked<PluginContext>;
   let mockTask: { start: jest.Mock; stop: jest.Mock };
@@ -136,8 +147,20 @@ describe('AutoModeMonitorPlugin', () => {
   });
 
   describe('checkAndCorrectAutoMode', () => {
+    // These tests drive the shared check-and-correct logic through
+    // manualCheck() rather than onPollCycle(). onPollCycle is now a no-op
+    // (the cron task started below is the single trigger for real checks);
+    // manualCheck() and the cron task both run the exact same core logic
+    // (see runCheck / runCheckWithLatch in index.ts), so exercising it via
+    // manualCheck() is equivalent and avoids re-implementing the trigger
+    // plumbing in every test.
     beforeEach(async () => {
       await plugin.start();
+      // plugin.start() fires an initial check in the background (fire-and-
+      // forget). Flush pending microtasks so that check fully settles -
+      // including releasing the isChecking latch - before each test drives
+      // its own check via manualCheck().
+      await flushMicrotasks();
     });
 
     it('should not take action when no devices are in auto mode', async () => {
@@ -153,8 +176,8 @@ describe('AutoModeMonitorPlugin', () => {
         .mockResolvedValueOnce(device1State)
         .mockResolvedValueOnce(device2State);
 
-      // Trigger check via onPollCycle
-      await plugin.onPollCycle!([]);
+      // Trigger check via manualCheck (see describe-level comment above)
+      await plugin.manualCheck();
 
       expect(mockContext.setSmartThingsState).not.toHaveBeenCalled();
     });
@@ -174,7 +197,7 @@ describe('AutoModeMonitorPlugin', () => {
 
       mockContext.getDeviceStatus.mockResolvedValue(deviceState);
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       expect(mockContext.setSmartThingsState).toHaveBeenCalledWith('device-1', {
         thermostatMode: 'heat',
@@ -197,7 +220,7 @@ describe('AutoModeMonitorPlugin', () => {
 
       mockContext.getDeviceStatus.mockResolvedValue(deviceState);
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       expect(mockContext.setSmartThingsState).toHaveBeenCalledWith('device-1', {
         thermostatMode: 'cool',
@@ -220,7 +243,7 @@ describe('AutoModeMonitorPlugin', () => {
 
       mockContext.getDeviceStatus.mockResolvedValue(deviceState);
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       expect(mockContext.setSmartThingsState).toHaveBeenCalledWith('device-1', {
         thermostatMode: 'heat',
@@ -243,7 +266,7 @@ describe('AutoModeMonitorPlugin', () => {
 
       mockContext.getDeviceStatus.mockResolvedValue(deviceState);
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       expect(mockContext.setSmartThingsState).toHaveBeenCalledWith('device-1', {
         thermostatMode: 'cool',
@@ -259,6 +282,7 @@ describe('AutoModeMonitorPlugin', () => {
       };
       await plugin.init(mockContext);
       await plugin.start();
+      await flushMicrotasks();
 
       const deviceState = createMockDeviceState({
         id: 'device-1',
@@ -274,7 +298,7 @@ describe('AutoModeMonitorPlugin', () => {
 
       mockContext.getDeviceStatus.mockResolvedValue(deviceState);
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       expect(mockContext.setSmartThingsState).toHaveBeenCalledWith('device-1', {
         thermostatMode: 'cool',
@@ -305,7 +329,7 @@ describe('AutoModeMonitorPlugin', () => {
         .mockResolvedValueOnce(device1State)
         .mockResolvedValueOnce(device2State);
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       expect(mockContext.setSmartThingsState).toHaveBeenCalledWith('device-1', {
         thermostatMode: 'heat',
@@ -337,7 +361,7 @@ describe('AutoModeMonitorPlugin', () => {
         .mockResolvedValueOnce(device1State)
         .mockResolvedValueOnce(device2State);
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       expect(mockContext.setSmartThingsState).toHaveBeenCalledTimes(2);
     });
@@ -363,7 +387,7 @@ describe('AutoModeMonitorPlugin', () => {
         .mockRejectedValueOnce(new Error('API Error'))
         .mockResolvedValueOnce({});
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       // Should continue processing second device even if first fails
       expect(mockContext.setSmartThingsState).toHaveBeenCalledTimes(2);
@@ -404,10 +428,125 @@ describe('AutoModeMonitorPlugin', () => {
 
       mockContext.getDeviceStatus.mockResolvedValue(deviceState);
 
-      await plugin.onPollCycle!([]);
+      await plugin.manualCheck();
 
       // Should only call setSmartThingsState for the thermostat device
       expect(mockContext.setSmartThingsState).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not correct a device when currentTemperature is 0 (missing sensor reading)', async () => {
+      // SmartThingsAPI.getDeviceStatus coerces a missing/broken temperature
+      // reading to 0 via `Number(...) || 0`. A naive "0 < midpoint" check
+      // would force such a device to heat; it should instead be treated as
+      // missing data and skipped.
+      const deviceState = createMockDeviceState({
+        id: 'device-1',
+        mode: 'auto',
+        currentTemperature: 0,
+        coolingSetpoint: 72,
+        heatingSetpoint: 68,
+      });
+
+      mockContext.getDevices.mockReturnValue([
+        createMockDevice({ deviceId: 'device-1', mode: 'auto' }),
+      ]);
+
+      mockContext.getDeviceStatus.mockResolvedValue(deviceState);
+
+      const result = await plugin.manualCheck();
+
+      expect(mockContext.setSmartThingsState).not.toHaveBeenCalled();
+      expect(result.corrected).toEqual([]);
+      expect(mockContext.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ temp: 0 }),
+        expect.stringContaining('missing temperature data')
+      );
+    });
+
+    it('should run the check when the cron task fires (cron is the single trigger)', async () => {
+      const deviceState = createMockDeviceState({
+        id: 'device-1',
+        mode: 'auto',
+        currentTemperature: 65,
+        coolingSetpoint: 72,
+        heatingSetpoint: 68,
+      });
+
+      mockContext.getDevices.mockReturnValue([
+        createMockDevice({ deviceId: 'device-1', mode: 'auto' }),
+      ]);
+      mockContext.getDeviceStatus.mockResolvedValue(deviceState);
+
+      // The describe-level beforeEach already called plugin.start(), which
+      // registered the cron callback via the mocked cron.schedule. Invoke
+      // that captured callback directly to simulate the cron firing.
+      const cronCallback = (cron.schedule as jest.Mock).mock.calls[0][1] as () => Promise<void>;
+      await cronCallback();
+
+      expect(mockContext.setSmartThingsState).toHaveBeenCalledWith('device-1', {
+        thermostatMode: 'heat',
+        heatingSetpoint: 68,
+      });
+    });
+
+    it('should skip an overlapping check while one is already in progress (reentrancy latch)', async () => {
+      const deviceState = createMockDeviceState({
+        id: 'device-1',
+        mode: 'auto',
+        currentTemperature: 65,
+        coolingSetpoint: 72,
+        heatingSetpoint: 68,
+      });
+
+      mockContext.getDevices.mockReturnValue([
+        createMockDevice({ deviceId: 'device-1', mode: 'auto' }),
+      ]);
+
+      // Hold getDeviceStatus pending so the first check is still in flight
+      // (and isChecking is still true) when the second check starts.
+      let resolveStatus!: (state: DeviceState) => void;
+      const pendingStatus = new Promise<DeviceState>(resolve => {
+        resolveStatus = resolve;
+      });
+      mockContext.getDeviceStatus.mockReturnValue(pendingStatus);
+
+      const firstCheck = plugin.manualCheck();
+      const secondCheck = plugin.manualCheck();
+
+      resolveStatus(deviceState);
+
+      const [firstResult, secondResult] = await Promise.all([firstCheck, secondCheck]);
+
+      expect(secondResult).toEqual({ checked: 0, corrected: [], errors: [], skipped: true });
+      expect(firstResult.corrected).toEqual(['device-1']);
+      // Only the first (non-skipped) check should have issued a correction.
+      expect(mockContext.setSmartThingsState).toHaveBeenCalledTimes(1);
+      expect(mockContext.logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({ trigger: 'manual' }),
+        expect.stringContaining('already in progress')
+      );
+    });
+
+    it('should perform no device fetches or commands on onPollCycle', async () => {
+      // onPollCycle is now an intentional no-op: the cron task is the
+      // single trigger for auto-mode checks. Clear the mocks first since
+      // the describe-level beforeEach's plugin.start() already triggered an
+      // (empty, no-op) initial check.
+      mockContext.getDevices.mockReturnValue([
+        createMockDevice({ deviceId: 'device-1', mode: 'auto' }),
+      ]);
+      mockContext.getDeviceStatus.mockResolvedValue(
+        createMockDeviceState({ id: 'device-1', mode: 'auto', currentTemperature: 65 })
+      );
+      mockContext.getDevices.mockClear();
+      mockContext.getDeviceStatus.mockClear();
+      mockContext.setSmartThingsState.mockClear();
+
+      await plugin.onPollCycle!([]);
+
+      expect(mockContext.getDevices).not.toHaveBeenCalled();
+      expect(mockContext.getDeviceStatus).not.toHaveBeenCalled();
+      expect(mockContext.setSmartThingsState).not.toHaveBeenCalled();
     });
   });
 

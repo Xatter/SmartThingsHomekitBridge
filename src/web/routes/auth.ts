@@ -140,7 +140,7 @@ export function createAuthRoutes(auth: SmartThingsAuthentication, onAuthSuccess?
 
   router.post('/logout', async (req: Request, res: Response) => {
     try {
-      auth.clear();
+      await auth.clearPersistent();
       res.json({ success: true });
     } catch (error) {
       logger.error({ err: error }, 'Logout error');

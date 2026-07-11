@@ -46,6 +46,26 @@ export class SmartThingsHAPServer {
   private lastUpdateTime = new Map<string, number>();
   private readonly UPDATE_COOLDOWN_MS = 2000; // 2 second cooldown between updates
 
+  // Trailing-edge debounce state for updateDeviceState(): while a device is
+  // within its cooldown window, the latest state is coalesced here and
+  // flushed by a single tracked timer once the cooldown expires - instead of
+  // being silently dropped.
+  private pendingUpdates = new Map<string, DeviceState>();
+  private cooldownTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  // Round-trip memory for TargetTemperature: records the Fahrenheit value we
+  // last commanded to SmartThings alongside the exact Celsius value the user
+  // set in HomeKit, so that when a poll echoes back that same Fahrenheit
+  // value we can push the original Celsius value instead of a reconverted
+  // (and potentially drifted) one.
+  private lastCommanded = new Map<string, { commandedF: number; originalC: number }>();
+
+  // Tracks the untracked-before unpair->reinitialize timer so stop() can
+  // cancel it, and a flag so the timer callback (and any initialize()/start()
+  // chained after it) can bail out if the server is shutting down.
+  private unpairRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopping = false;
+
   private devices = new Map<string, {
     name: string;
     type: string;
@@ -86,7 +106,11 @@ export class SmartThingsHAPServer {
       const bridgeUUID = HAP_uuid.generate('SmartThings-Bridge-Main');
       this.bridge = new Bridge('SmartThings Bridge', bridgeUUID);
 
-      // Listen for unpair event to clean up when removed from HomeKit
+      // Listen for unpair event to clean up when removed from HomeKit.
+      // Defensively strip any pre-existing 'unpaired' listeners first so
+      // repeated initialize() calls (e.g. the post-unpair re-init below)
+      // never stack duplicate handlers on the same bridge object.
+      (this.bridge as any).removeAllListeners?.('unpaired');
       this.bridge.on('unpaired' as any, () => {
         logger.info('🔓 Bridge unpaired from HomeKit - cleaning up persistence');
         this.handleUnpaired();
@@ -346,10 +370,12 @@ export class SmartThingsHAPServer {
       return;
     }
 
-    // Check if this is a cached accessory that wasn't restored (shouldn't happen normally)
+    // Check if this is a cached accessory that wasn't restored (shouldn't happen normally).
+    // Don't drop the device silently - fall through and create the accessory.
+    // The UUID is generated deterministically from deviceId below, so
+    // HomeKit identity is preserved even though restoration was skipped.
     if (this.accessoryCache.has(deviceId)) {
-      logger.info(`⚠️  HAP: Device ${deviceState.name} is cached but wasn't restored`);
-      return;
+      logger.warn(`⚠️  HAP: Device ${deviceState.name} is cached but wasn't restored - creating accessory now instead of dropping it`);
     }
 
     try {
@@ -435,7 +461,10 @@ export class SmartThingsHAPServer {
       setpoint: deviceState.temperatureSetpoint,
       mode: deviceState.mode
     }, '⚙️  Setting up characteristics');
-    // Current Temperature (read-only)
+    // Current Temperature (read-only). HomeKit requires an initial numeric value at
+    // accessory creation, so fall back to a safe default if the SmartThings reading is
+    // missing - this is a structural requirement, not a general-purpose 0-coercion.
+    const safeCurrentTemp = deviceState.currentTemperature ?? 68; // Default to 68°F if undefined
     thermostatService
       .getCharacteristic(Characteristic.CurrentTemperature)
       .setProps({
@@ -443,7 +472,7 @@ export class SmartThingsHAPServer {
         maxValue: 100,
         minStep: 0.1
       })
-      .setValue(this.fahrenheitToCelsius(deviceState.currentTemperature));
+      .setValue(this.quantize(this.fahrenheitToCelsius(safeCurrentTemp), 0.1));
 
     // Target Temperature (read/write)
     const safeTargetSetpoint = deviceState.temperatureSetpoint || 68; // Default to 68°F if undefined/null/0
@@ -454,7 +483,7 @@ export class SmartThingsHAPServer {
         maxValue: 35,
         minStep: 0.5
       })
-      .setValue(this.fahrenheitToCelsius(safeTargetSetpoint))
+      .setValue(this.quantize(this.fahrenheitToCelsius(safeTargetSetpoint), 0.5))
       .on('set', (value: CharacteristicValue, callback: CharacteristicSetCallback) => {
         logger.info(`🏠 HomeKit SET TargetTemperature for ${deviceId}: ${value}°C`);
         this.handleTargetTemperatureChange(deviceId, value as number, callback);
@@ -463,9 +492,21 @@ export class SmartThingsHAPServer {
         logger.info(`🏠 HomeKit GET TargetTemperature for ${deviceId}`);
         const device = this.devices.get(deviceId);
         if (device) {
-          const temp = this.fahrenheitToCelsius(device.state.temperatureSetpoint);
-          logger.info(`   Returning: ${temp}°C (${device.state.temperatureSetpoint}°F)`);
-          callback(null, temp);
+          if (device.state.temperatureSetpoint !== undefined) {
+            const temp = this.quantize(this.fahrenheitToCelsius(device.state.temperatureSetpoint), 0.5);
+            logger.info(`   Returning: ${temp}°C (${device.state.temperatureSetpoint}°F)`);
+            callback(null, temp);
+            return;
+          }
+          // Setpoint currently unavailable (missing/broken SmartThings reading). GET must
+          // synchronously return a number to HomeKit - unlike a push update, there's no way to
+          // "skip" a read - but fabricating a fixed 68°F here would contradict the push path
+          // (which deliberately leaves the characteristic untouched rather than overwrite a
+          // known-good value with a guess). Instead, return whatever value is already cached on
+          // the characteristic (set at creation, or from the last successful update).
+          const cachedValue = thermostatService.getCharacteristic(Characteristic.TargetTemperature).value;
+          logger.debug(`   TargetTemperature setpoint unavailable for ${deviceId} - returning last cached value (${cachedValue})`);
+          callback(null, cachedValue);
         } else {
           logger.info(`   ❌ Device not found!`);
           callback(new Error('Device not found'));
@@ -520,12 +561,20 @@ export class SmartThingsHAPServer {
     callback: CharacteristicSetCallback
   ): Promise<void> {
     const fahrenheitValue = this.celsiusToFahrenheit(celsiusValue);
+    const commandedF = Math.round(fahrenheitValue);
     logger.info(`HAP: Target temperature change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
+
+    // Remember the exact Celsius value the user set alongside the rounded
+    // Fahrenheit value we're about to send to SmartThings. If a later poll
+    // reports this same Fahrenheit value back, we push this original Celsius
+    // value to HomeKit instead of reconverting (which can drift, e.g.
+    // 22.5C -> 73F -> 22.78C -> rounds to 23C).
+    this.lastCommanded.set(deviceId, { commandedF, originalC: celsiusValue });
 
     // Update our local state immediately
     const device = this.devices.get(deviceId);
     if (device) {
-      device.state.temperatureSetpoint = Math.round(fahrenheitValue);
+      device.state.temperatureSetpoint = commandedF;
     }
 
     // Respond to HomeKit immediately
@@ -536,7 +585,7 @@ export class SmartThingsHAPServer {
       this.coordinator.handleThermostatEvent({
         deviceId,
         type: 'temperature',
-        temperature: Math.round(fahrenheitValue)
+        temperature: commandedF
       }).catch((error: any) => {
         logger.error({ deviceId, err: error }, 'Error updating SmartThings');
       });
@@ -628,7 +677,10 @@ export class SmartThingsHAPServer {
 
   /**
    * Updates HomeKit characteristics when SmartThings device state changes.
-   * Includes cooldown period to prevent excessive updates.
+   * Includes cooldown period to prevent excessive updates. Updates that
+   * arrive during the cooldown window are not dropped - the latest one is
+   * coalesced and applied via a single trailing-edge timer once the
+   * cooldown expires.
    * @param deviceId - Device to update
    * @param deviceState - New device state
    */
@@ -643,18 +695,71 @@ export class SmartThingsHAPServer {
     const lastUpdate = this.lastUpdateTime.get(deviceId) || 0;
     const now = Date.now();
     if (now - lastUpdate < this.UPDATE_COOLDOWN_MS) {
-      logger.info(`⏸️  HAP: Skipping update for ${deviceState.name} - cooldown period (${now - lastUpdate}ms since last update)`);
+      // Trailing-edge debounce: remember the latest state (coalescing any
+      // update already pending) and make sure exactly one timer is scheduled
+      // to flush it once the cooldown window expires.
+      this.pendingUpdates.set(deviceId, deviceState);
+      logger.info(`⏸️  HAP: Deferring update for ${deviceState.name} - cooldown period (${now - lastUpdate}ms since last update)`);
+
+      if (!this.cooldownTimers.has(deviceId)) {
+        const remainingMs = this.UPDATE_COOLDOWN_MS - (now - lastUpdate);
+        const timer = setTimeout(() => {
+          this.cooldownTimers.delete(deviceId);
+          const pending = this.pendingUpdates.get(deviceId);
+          this.pendingUpdates.delete(deviceId);
+          if (pending) {
+            this.applyDeviceStateUpdate(deviceId, pending).catch(error => {
+              logger.error({ deviceId, err: error }, '❌ Failed to apply deferred HAP device state update');
+            });
+          }
+        }, Math.max(remainingMs, 0));
+        this.cooldownTimers.set(deviceId, timer);
+      }
+      return;
+    }
+
+    await this.applyDeviceStateUpdate(deviceId, deviceState);
+  }
+
+  /**
+   * Actually applies a device state update to the HomeKit characteristics.
+   * Called either directly (cooldown already elapsed) or from the trailing
+   * timer scheduled by updateDeviceState() once the cooldown expires.
+   */
+  private async applyDeviceStateUpdate(deviceId: string, deviceState: DeviceState): Promise<void> {
+    const device = this.devices.get(deviceId);
+    if (!device) {
+      logger.warn(`HAP: Device ${deviceId} not found for deferred state update`);
       return;
     }
 
     try {
-      logger.info(`🔄 HAP: updateDeviceState called for ${deviceState.name} (${deviceId})`);
-      logger.info(`   Caller stack: ${new Error().stack?.split('\n')[2]?.trim()}`);
+      logger.info(`🔄 HAP: applyDeviceStateUpdate called for ${deviceState.name} (${deviceId})`);
 
-      // Check if values actually changed
+      // Check if values actually changed. A missing (undefined) reading in deviceState never
+      // counts as a "change" to push to HomeKit - we skip pushing that characteristic below
+      // and leave whatever value HomeKit already has rather than pushing NaN.
       const oldState = device.state;
-      const tempChanged = Math.abs(oldState.currentTemperature - deviceState.currentTemperature) > 0.1;
-      const setpointChanged = Math.abs(oldState.temperatureSetpoint - deviceState.temperatureSetpoint) > 0.1;
+      const newCurrentTemp = deviceState.currentTemperature;
+      const newSetpointF = deviceState.temperatureSetpoint;
+
+      const tempChanged = newCurrentTemp !== undefined &&
+        (oldState.currentTemperature === undefined ||
+          Math.abs(oldState.currentTemperature - newCurrentTemp) > 0.1);
+
+      // Round-trip check: if this poll's setpoint matches a value we just
+      // commanded to SmartThings, treat it as our own echo. We always want
+      // to (re)assert the originally-requested Celsius value in that case,
+      // even if it happens to already match device.state numerically, since
+      // the goal is to correct any drift that crept into the characteristic.
+      const pendingCommand = this.lastCommanded.get(deviceId);
+      const isRoundTripEcho = !!pendingCommand && newSetpointF !== undefined &&
+        Math.abs(newSetpointF - pendingCommand.commandedF) < 0.5;
+
+      const setpointChanged = newSetpointF !== undefined &&
+        (oldState.temperatureSetpoint === undefined ||
+          Math.abs(oldState.temperatureSetpoint - newSetpointF) > 0.1 ||
+          isRoundTripEcho);
       const modeChanged = oldState.mode !== deviceState.mode;
 
       if (!tempChanged && !setpointChanged && !modeChanged) {
@@ -663,24 +768,37 @@ export class SmartThingsHAPServer {
       }
 
       logger.info({ deviceId, tempChanged, setpointChanged, modeChanged }, '   Changes detected');
-      this.lastUpdateTime.set(deviceId, now);
+      this.lastUpdateTime.set(deviceId, Date.now());
 
       // Update characteristics if values have changed
       const service = device.thermostatService;
 
       // Update current temperature
-      if (tempChanged) {
-        const newTemp = this.fahrenheitToCelsius(deviceState.currentTemperature);
-        logger.info(`   Updating CurrentTemperature: ${oldState.currentTemperature}°F -> ${deviceState.currentTemperature}°F (${newTemp}°C)`);
+      if (newCurrentTemp === undefined) {
+        logger.debug({ deviceId }, '   Skipping CurrentTemperature push - reading unavailable (undefined)');
+      } else if (tempChanged) {
+        const newTemp = this.quantize(this.fahrenheitToCelsius(newCurrentTemp), 0.1);
+        logger.info(`   Updating CurrentTemperature: ${oldState.currentTemperature}°F -> ${newCurrentTemp}°F (${newTemp}°C)`);
         service
           .getCharacteristic(Characteristic.CurrentTemperature)
           .updateValue(newTemp);
       }
 
       // Update target temperature
-      if (setpointChanged) {
-        const newSetpoint = this.fahrenheitToCelsius(deviceState.temperatureSetpoint);
-        logger.info(`   Updating TargetTemperature: ${oldState.temperatureSetpoint}°F -> ${deviceState.temperatureSetpoint}°F (${newSetpoint}°C)`);
+      if (newSetpointF === undefined) {
+        logger.debug({ deviceId }, '   Skipping TargetTemperature push - setpoint unavailable (undefined)');
+      } else if (setpointChanged) {
+        let newSetpoint: number;
+        if (isRoundTripEcho && pendingCommand) {
+          // Push back exactly what the user originally set rather than the
+          // reconverted (and possibly drifted) Fahrenheit-from-SmartThings value.
+          newSetpoint = this.quantize(pendingCommand.originalC, 0.5);
+          logger.info(`   Round-trip echo detected for setpoint ${newSetpointF}°F - restoring original ${newSetpoint}°C instead of reconverted value`);
+          this.lastCommanded.delete(deviceId);
+        } else {
+          newSetpoint = this.quantize(this.fahrenheitToCelsius(newSetpointF), 0.5);
+        }
+        logger.info(`   Updating TargetTemperature: ${oldState.temperatureSetpoint}°F -> ${newSetpointF}°F (${newSetpoint}°C)`);
         service
           .getCharacteristic(Characteristic.TargetTemperature)
           .updateValue(newSetpoint);
@@ -731,6 +849,17 @@ export class SmartThingsHAPServer {
       }
     }
 
+    // Cancel any pending trailing-edge cooldown flush for this device so it
+    // doesn't fire (and re-add tracking state) after removal.
+    const cooldownTimer = this.cooldownTimers.get(deviceId);
+    if (cooldownTimer) {
+      clearTimeout(cooldownTimer);
+      this.cooldownTimers.delete(deviceId);
+    }
+    this.pendingUpdates.delete(deviceId);
+    this.lastUpdateTime.delete(deviceId);
+    this.lastCommanded.delete(deviceId);
+
     this.devices.delete(deviceId);
     await this.accessoryCache.remove(deviceId);
     logger.info(`✅ HAP: Device ${deviceId} removed from tracking and cache`);
@@ -743,6 +872,18 @@ export class SmartThingsHAPServer {
 
   private celsiusToFahrenheit(celsius: number): number {
     return (celsius * 9 / 5) + 32;
+  }
+
+  /**
+   * Rounds a value to the nearest multiple of `step`, stripping the
+   * floating-point noise that `Math.round(value / step) * step` can leave
+   * behind (e.g. 22.799999999999997). Used to keep every Celsius value we
+   * push to a HomeKit characteristic aligned to its minStep so HAP-NodeJS
+   * doesn't warn about out-of-step values.
+   */
+  private quantize(value: number, step: number): number {
+    const quantized = Math.round(value / step) * step;
+    return Math.round(quantized * 1000) / 1000;
   }
 
   // Mode mapping methods
@@ -846,6 +987,11 @@ export class SmartThingsHAPServer {
   }
 
   private async handleUnpaired(): Promise<void> {
+    if (this.stopping) {
+      logger.info('⏭️  Ignoring unpair event - server is stopping');
+      return;
+    }
+
     try {
       logger.info('🧹 Cleaning up after unpair...');
 
@@ -886,13 +1032,30 @@ export class SmartThingsHAPServer {
         this.bridge.unpublish();
       }
 
-      // Give it a moment before restarting
-      setTimeout(() => {
+      // Give it a moment before restarting. Track the timer handle so stop()
+      // can cancel it - otherwise it races shutdown: stop() nulls this.bridge,
+      // then this timer fires and resurrects it, and the process never
+      // exits cleanly.
+      if (this.unpairRestartTimer) {
+        clearTimeout(this.unpairRestartTimer);
+      }
+      this.unpairRestartTimer = setTimeout(() => {
+        this.unpairRestartTimer = null;
+
+        if (this.stopping) {
+          logger.info('⏭️  Skipping unpair restart - server is stopping');
+          return;
+        }
+
         logger.info('♻️ Reinitializing bridge for fresh pairing...');
         this.initialize(this.coordinator!).then(() => {
-          this.start().catch(error => {
-            logger.error({ err: error }, 'Error restarting bridge after unpair');
-          });
+          if (this.stopping) {
+            logger.info('⏭️  Skipping post-unpair bridge publish - server is stopping');
+            return;
+          }
+          return this.start();
+        }).catch(error => {
+          logger.error({ err: error }, 'Error restarting bridge after unpair');
         });
       }, 2000);
 
@@ -940,6 +1103,22 @@ export class SmartThingsHAPServer {
    * Makes the bridge no longer discoverable in HomeKit.
    */
   async stop(): Promise<void> {
+    this.stopping = true;
+
+    // Cancel the untracked-before unpair->reinitialize timer so it can't
+    // resurrect the bridge after this method has torn it down.
+    if (this.unpairRestartTimer) {
+      clearTimeout(this.unpairRestartTimer);
+      this.unpairRestartTimer = null;
+    }
+
+    // Cancel any pending trailing-edge cooldown flushes.
+    for (const timer of this.cooldownTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.cooldownTimers.clear();
+    this.pendingUpdates.clear();
+
     if (this.bridge) {
       try {
         this.bridge.unpublish();

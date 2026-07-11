@@ -1,5 +1,3 @@
-import { promises as fs } from 'fs';
-import * as path from 'path';
 import { logger } from '@/utils/logger';
 
 /**
@@ -55,7 +53,7 @@ export interface ControllerDecision {
 /**
  * Persistent state for the auto-mode controller
  */
-interface ControllerState {
+export interface ControllerState {
   /** Current global mode */
   currentMode: 'heat' | 'cool' | 'off';
   /** Timestamp of last mode switch (epoch ms) */
@@ -108,20 +106,23 @@ export interface ControllerConfig {
  * - Timing protections (minimum on/off/lock times)
  * - Flip guard for shoulder-season stability
  * - Freeze and high-temperature protection
- * - State persistence across restarts
+ * - State persistence across restarts (delegated to the host via a persist
+ *   callback — the controller itself never touches the filesystem)
  */
 export class AutoModeController {
   private state: ControllerState;
-  private readonly statePath: string;
+  private readonly persist?: (state: ControllerState) => Promise<void>;
   private readonly config: ControllerConfig;
 
   /**
    * Creates a new auto-mode controller.
-   * @param statePath - Path to persist controller state
+   * @param persist - Optional callback invoked with the full internal state
+   *   whenever it changes (enroll/unenroll/applyDecision). The controller
+   *   never writes to disk itself; the host decides how/where to persist.
    * @param config - Optional configuration overrides
    */
-  constructor(statePath: string, config?: Partial<ControllerConfig>) {
-    this.statePath = statePath;
+  constructor(persist?: (state: ControllerState) => Promise<void>, config?: Partial<ControllerConfig>) {
+    this.persist = persist;
 
     // Default configuration based on the algorithm specification
     this.config = {
@@ -149,37 +150,76 @@ export class AutoModeController {
   }
 
   /**
-   * Loads persisted state from disk.
-   */
-  async load(): Promise<void> {
-    try {
-      const data = await fs.readFile(this.statePath, 'utf-8');
-      this.state = JSON.parse(data);
-      logger.info({
-        mode: this.state.currentMode,
-        enrolledCount: this.state.enrolledDeviceIds.length,
-      }, 'Auto-mode controller state loaded');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        logger.error({ err: error }, 'Error loading auto-mode controller state');
-      }
-      // If file doesn't exist, keep default initialized state
-    }
-  }
-
-  /**
-   * Persists current state to disk.
+   * Persists current state via the host-provided persist callback.
+   * No-op if no callback was supplied to the constructor.
    */
   async save(): Promise<void> {
+    if (!this.persist) {
+      return;
+    }
     try {
-      const dir = path.dirname(this.statePath);
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(this.statePath, JSON.stringify(this.state, null, 2));
+      await this.persist({ ...this.state, enrolledDeviceIds: [...this.state.enrolledDeviceIds] });
       logger.debug('Auto-mode controller state saved');
     } catch (error) {
       logger.error({ err: error }, 'Error saving auto-mode controller state');
       throw error;
     }
+  }
+
+  /**
+   * Restores internal state from a previously persisted value. Only known
+   * `ControllerState` fields are copied, and each is type-validated before
+   * being applied — unrecognized/junk keys and invalid types are ignored,
+   * leaving the corresponding field at its current value.
+   *
+   * @param saved - Value previously returned by the persist callback (or
+   *   loaded from storage by the host). Treated as untrusted input.
+   */
+  restoreState(saved: unknown): void {
+    if (!saved || typeof saved !== 'object') {
+      return;
+    }
+
+    const candidate = saved as Record<string, unknown>;
+
+    if (
+      candidate.currentMode === 'heat' ||
+      candidate.currentMode === 'cool' ||
+      candidate.currentMode === 'off'
+    ) {
+      this.state.currentMode = candidate.currentMode;
+    }
+
+    if (typeof candidate.lastSwitchTime === 'number' && Number.isFinite(candidate.lastSwitchTime)) {
+      this.state.lastSwitchTime = candidate.lastSwitchTime;
+    }
+
+    if (typeof candidate.lastOnTime === 'number' && Number.isFinite(candidate.lastOnTime)) {
+      this.state.lastOnTime = candidate.lastOnTime;
+    }
+
+    if (typeof candidate.lastOffTime === 'number' && Number.isFinite(candidate.lastOffTime)) {
+      this.state.lastOffTime = candidate.lastOffTime;
+    }
+
+    if (
+      Array.isArray(candidate.enrolledDeviceIds) &&
+      candidate.enrolledDeviceIds.every((id) => typeof id === 'string')
+    ) {
+      this.state.enrolledDeviceIds = [...(candidate.enrolledDeviceIds as string[])];
+    }
+
+    logger.info({
+      mode: this.state.currentMode,
+      enrolledCount: this.state.enrolledDeviceIds.length,
+    }, 'Auto-mode controller state restored');
+  }
+
+  /**
+   * Returns a snapshot copy of the full internal persistent state.
+   */
+  getState(): ControllerState {
+    return { ...this.state, enrolledDeviceIds: [...this.state.enrolledDeviceIds] };
   }
 
   /**

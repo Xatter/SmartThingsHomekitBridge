@@ -18,6 +18,15 @@ export interface RetryOptions {
 export interface RetryableError extends Error {
   statusCode?: number;
   code?: string;
+  /**
+   * Axios-shaped error response, as thrown by @smartthings/core-sdk (v8+).
+   * The SDK is axios-based and does NOT set `statusCode` on thrown errors -
+   * the HTTP status lives at `error.response.status` instead.
+   */
+  response?: {
+    status?: number;
+    headers?: Record<string, string | string[] | undefined>;
+  };
 }
 
 const DEFAULT_OPTIONS: Required<RetryOptions> = {
@@ -28,6 +37,15 @@ const DEFAULT_OPTIONS: Required<RetryOptions> = {
   jitter: true,
   operationName: 'operation',
 };
+
+/**
+ * Reads the HTTP status code off an error, whichever shape it came in as.
+ * Some callers set `error.statusCode` directly; the SmartThings SDK (axios-based)
+ * instead throws errors shaped like `{ response: { status } }`.
+ */
+function getStatusCode(error: RetryableError): number | undefined {
+  return error.statusCode ?? error.response?.status;
+}
 
 /**
  * Determines if an error is transient and should be retried.
@@ -46,14 +64,15 @@ function isRetryableError(error: RetryableError): boolean {
     return true;
   }
 
-  // HTTP status codes
-  if (error.statusCode) {
+  // HTTP status codes (checks both error.statusCode and axios-shaped error.response.status)
+  const statusCode = getStatusCode(error);
+  if (statusCode) {
     // 429 Rate Limiting
-    if (error.statusCode === 429) {
+    if (statusCode === 429) {
       return true;
     }
     // 5xx Server Errors
-    if (error.statusCode >= 500 && error.statusCode < 600) {
+    if (statusCode >= 500 && statusCode < 600) {
       return true;
     }
   }
@@ -62,12 +81,48 @@ function isRetryableError(error: RetryableError): boolean {
 }
 
 /**
- * Calculates the delay for the next retry attempt using exponential backoff.
+ * Extracts a Retry-After delay (in ms) from a 429 error's response headers, if present.
+ * Only the integer-seconds form of Retry-After is supported (which is what SmartThings sends).
+ * @param error - The error to inspect
+ * @param maxDelayMs - Upper bound to cap the resulting delay at
+ * @returns Delay in milliseconds, or undefined if no usable Retry-After header is present
+ */
+function getRetryAfterMs(error: RetryableError, maxDelayMs: number): number | undefined {
+  if (getStatusCode(error) !== 429) {
+    return undefined;
+  }
+
+  const headerValue = error.response?.headers?.['retry-after'];
+  if (headerValue === undefined || headerValue === null) {
+    return undefined;
+  }
+
+  const rawValue = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+  const seconds = Number(rawValue);
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return undefined;
+  }
+
+  return Math.min(seconds * 1000, maxDelayMs);
+}
+
+/**
+ * Calculates the delay for the next retry attempt.
+ * For 429 responses that carry a Retry-After header, that value is used directly
+ * (capped at maxDelayMs). Otherwise falls back to exponential backoff.
  * @param attempt - Current attempt number (0-indexed)
  * @param options - Retry options
+ * @param error - The error that triggered this retry, used to honor Retry-After
  * @returns Delay in milliseconds
  */
-function calculateDelay(attempt: number, options: Required<RetryOptions>): number {
+function calculateDelay(attempt: number, options: Required<RetryOptions>, error?: RetryableError): number {
+  if (error) {
+    const retryAfterMs = getRetryAfterMs(error, options.maxDelayMs);
+    if (retryAfterMs !== undefined) {
+      return retryAfterMs;
+    }
+  }
+
   const exponentialDelay = options.initialDelayMs * Math.pow(options.backoffMultiplier, attempt);
   let delay = Math.min(exponentialDelay, options.maxDelayMs);
 
@@ -127,21 +182,21 @@ export async function withRetry<T>(
         logger.debug({
           operation: opts.operationName,
           err: lastError,
-          statusCode: lastError.statusCode,
+          statusCode: getStatusCode(lastError),
           code: lastError.code
         }, `Non-retryable error for ${opts.operationName}, failing immediately`);
         throw lastError;
       }
 
-      // Calculate delay and wait before retry
-      const delay = calculateDelay(attempt, opts);
+      // Calculate delay and wait before retry (honors Retry-After on 429s)
+      const delay = calculateDelay(attempt, opts, lastError);
       logger.warn({
         operation: opts.operationName,
         attempt: attempt + 1,
         maxRetries: opts.maxRetries,
         delayMs: delay,
         err: lastError.message,
-        statusCode: lastError.statusCode,
+        statusCode: getStatusCode(lastError),
         code: lastError.code
       }, `⚠️  ${opts.operationName} failed, retrying...`);
 

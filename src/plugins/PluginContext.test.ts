@@ -1,3 +1,6 @@
+import * as os from 'os';
+import * as path from 'path';
+import { promises as realFs } from 'fs';
 import { PluginContextImpl } from './PluginContext';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
@@ -285,6 +288,54 @@ describe('PluginContextImpl', () => {
       await context.setSmartThingsState('device-1', {});
 
       expect(mockApi.executeCommands).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('saveState', () => {
+    let tempDataPath: string;
+    let realContext: PluginContextImpl;
+
+    beforeEach(async () => {
+      tempDataPath = await realFs.mkdtemp(path.join(os.tmpdir(), 'plugin-context-test-'));
+      realContext = new PluginContextImpl(
+        'test-plugin',
+        mockLogger,
+        {},
+        mockGetDevices,
+        mockGetDevice,
+        mockApi,
+        mockHapServer,
+        tempDataPath
+      );
+    });
+
+    afterEach(async () => {
+      await realFs.rm(tempDataPath, { recursive: true, force: true });
+    });
+
+    it('writes a valid, parseable JSON file via atomicWriteJson', async () => {
+      const data = { count: 3, nested: { ok: true }, list: [1, 2, 3] };
+
+      await realContext.saveState('my-key', data);
+
+      const filePath = path.join(tempDataPath, 'plugins', 'test-plugin', 'my-key.json');
+      const contents = await realFs.readFile(filePath, 'utf-8');
+
+      expect(() => JSON.parse(contents)).not.toThrow();
+      expect(JSON.parse(contents)).toEqual(data);
+    });
+
+    it('leaves no temp files behind and can be read back via loadState', async () => {
+      const data = { foo: 'bar' };
+
+      await realContext.saveState('roundtrip', data);
+      const loaded = await realContext.loadState('roundtrip');
+
+      expect(loaded).toEqual(data);
+
+      const dir = path.join(tempDataPath, 'plugins', 'test-plugin');
+      const entries = await realFs.readdir(dir);
+      expect(entries.some((entry) => entry.endsWith('.tmp'))).toBe(false);
     });
   });
 });

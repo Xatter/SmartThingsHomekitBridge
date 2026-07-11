@@ -12,6 +12,19 @@ import { PluginManager } from '@/plugins';
 
 dotenv.config();
 
+// Several code paths intentionally fire-and-forget promises, so a rejection
+// here doesn't necessarily mean the process is in a bad state - just log it.
+process.on('unhandledRejection', (reason) => {
+  logger.error({ err: reason }, '⚠️  Unhandled promise rejection');
+});
+
+// An uncaught exception means we're in an unknown state - log and exit
+// rather than risk continuing with corrupted in-memory state.
+process.on('uncaughtException', (error) => {
+  logger.error({ err: error }, '❌ Uncaught exception, exiting');
+  process.exit(1);
+});
+
 async function startup(): Promise<void> {
   logger.info('🚀 Starting SmartThings HomeKit Bridge...');
 
@@ -152,8 +165,23 @@ async function startup(): Promise<void> {
       }, '🔗 HomeKit Pairing Information');
     }
 
+    let isShuttingDown = false;
+
     const gracefulShutdown = async (signal: string) => {
+      if (isShuttingDown) {
+        logger.warn({ signal }, '⚠️  Shutdown already in progress, ignoring duplicate signal');
+        return;
+      }
+      isShuttingDown = true;
+
       logger.info({ signal }, '🛑 Received signal, shutting down gracefully...');
+
+      // Failsafe: if shutdown hangs, force exit rather than leaving the process stuck
+      const shutdownDeadline = setTimeout(() => {
+        logger.error('❌ Graceful shutdown exceeded 10s deadline, forcing exit');
+        process.exit(1);
+      }, 10_000);
+      shutdownDeadline.unref();
 
       try {
         tokenRefreshTask.stop();

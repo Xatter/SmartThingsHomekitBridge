@@ -7,6 +7,9 @@ jest.mock('fs', () => ({
   promises: {
     readFile: jest.fn(),
     writeFile: jest.fn(),
+    mkdir: jest.fn(),
+    rename: jest.fn(),
+    unlink: jest.fn(),
   },
 }));
 
@@ -67,6 +70,22 @@ describe('AccessoryCache', () => {
       expect(actual).toEqual(expected);
     });
 
+    test('given cache file is corrupted, should quarantine it with a .corrupt suffix', async () => {
+      (fs.readFile as jest.Mock).mockResolvedValue('invalid json {');
+
+      const actual = await cache.load();
+
+      expect(actual).toEqual([]);
+      expect(fs.rename).toHaveBeenCalledWith(mockCacheFile, `${mockCacheFile}.corrupt`);
+    });
+
+    test('given quarantine rename itself fails, should still return empty array without throwing', async () => {
+      (fs.readFile as jest.Mock).mockResolvedValue('invalid json {');
+      (fs.rename as jest.Mock).mockRejectedValue(new Error('rename failed'));
+
+      await expect(cache.load()).resolves.toEqual([]);
+    });
+
     test('given other file read error, should return empty array and log error', async () => {
       const error = new Error('Permission denied');
       (fs.readFile as jest.Mock).mockRejectedValue(error);
@@ -79,17 +98,22 @@ describe('AccessoryCache', () => {
   });
 
   describe('save', () => {
-    test('given accessories array, should save to cache file with formatting', async () => {
+    test('given accessories array, should write atomically via a temp file then rename into place', async () => {
       const mockAccessories: CachedAccessory[] = [
         createMockAccessory({ deviceId: 'device-1' }),
       ];
 
       await cache.save(mockAccessories);
 
-      expect(fs.writeFile).toHaveBeenCalledWith(
-        mockCacheFile,
-        JSON.stringify(mockAccessories, null, 2)
-      );
+      // atomicWriteJson writes to a temp file in the same directory, then
+      // renames it into place - it must never write the destination file
+      // directly (that's the non-atomic behavior being fixed).
+      const [tempPath, contents] = (fs.writeFile as jest.Mock).mock.calls[0];
+      expect(tempPath).not.toBe(mockCacheFile);
+      expect(tempPath.startsWith(mockCacheFile)).toBe(true);
+      expect(contents).toBe(JSON.stringify(mockAccessories, null, 2));
+
+      expect(fs.rename).toHaveBeenCalledWith(tempPath, mockCacheFile);
     });
 
     test('given empty array, should save empty cache', async () => {
@@ -97,10 +121,9 @@ describe('AccessoryCache', () => {
 
       await cache.save(mockAccessories);
 
-      expect(fs.writeFile).toHaveBeenCalledWith(
-        mockCacheFile,
-        JSON.stringify([], null, 2)
-      );
+      const [tempPath, contents] = (fs.writeFile as jest.Mock).mock.calls[0];
+      expect(contents).toBe(JSON.stringify([], null, 2));
+      expect(fs.rename).toHaveBeenCalledWith(tempPath, mockCacheFile);
     });
 
     test('given write error, should handle gracefully', async () => {
@@ -216,6 +239,49 @@ describe('AccessoryCache', () => {
       const savedAccessories: CachedAccessory[] = JSON.parse(savedData);
 
       expect(savedAccessories).toHaveLength(0);
+    });
+  });
+
+  describe('write serialization', () => {
+    test('given concurrent addOrUpdate and remove calls, should serialize writes without interleaving', async () => {
+      const existing: CachedAccessory[] = [
+        createMockAccessory({ deviceId: 'device-1', name: 'Existing 1' }),
+      ];
+      (fs.readFile as jest.Mock).mockResolvedValue(JSON.stringify(existing));
+      await cache.load();
+
+      const writeOrder: string[] = [];
+      let releaseFirstWrite: (() => void) | undefined;
+      const firstWriteGate = new Promise<void>(resolve => {
+        releaseFirstWrite = resolve;
+      });
+
+      (fs.writeFile as jest.Mock).mockImplementation(async (filePath: string) => {
+        writeOrder.push(filePath);
+        if (writeOrder.length === 1) {
+          // Hold the first write open so we can assert the second operation
+          // hasn't started writing while the mutex is held.
+          await firstWriteGate;
+        }
+      });
+
+      const p1 = cache.addOrUpdate(createMockAccessory({ deviceId: 'device-2', name: 'Added' }));
+      const p2 = cache.remove('device-1');
+
+      // Flush pending microtasks; only the first op's write should have
+      // started because addOrUpdate/remove/save are serialized by the mutex.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(writeOrder.length).toBe(1);
+
+      releaseFirstWrite!();
+      await p1;
+      await p2;
+
+      expect(writeOrder.length).toBe(2);
+      const finalAccessories = cache.getAll();
+      expect(finalAccessories.map(a => a.deviceId).sort()).toEqual(['device-2']);
     });
   });
 

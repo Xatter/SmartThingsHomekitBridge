@@ -3,12 +3,14 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 import { Logger } from 'pino';
 
-// Mock fs
+// Mock fs (atomicWriteJson writes to a temp file, then renames it into place)
 jest.mock('fs', () => ({
   promises: {
     readFile: jest.fn(),
     writeFile: jest.fn(),
     mkdir: jest.fn(),
+    rename: jest.fn(),
+    unlink: jest.fn(),
   },
 }));
 
@@ -69,6 +71,7 @@ describe('PluginConfigManager', () => {
       mockFs.readFile.mockRejectedValue({ code: 'ENOENT' });
       mockFs.writeFile.mockResolvedValue(undefined);
       mockFs.mkdir.mockResolvedValue(undefined);
+      mockFs.rename.mockResolvedValue(undefined);
       await manager.load();
 
       // Initially enabled by default
@@ -78,16 +81,45 @@ describe('PluginConfigManager', () => {
       await manager.setEnabled('hvac-auto-mode', false);
       expect(manager.isEnabled('hvac-auto-mode')).toBe(false);
 
-      // Verify it was persisted
+      // Verify it was persisted atomically: written to a temp file alongside the
+      // target, then renamed into place at the real config path.
+      const finalPath = path.join(dataPath, 'plugin_config.json');
       expect(mockFs.writeFile).toHaveBeenCalledWith(
-        path.join(dataPath, 'plugin_config.json'),
+        expect.stringContaining(`${finalPath}.`),
         expect.stringContaining('"enabled": false'),
         'utf-8'
+      );
+      expect(mockFs.rename).toHaveBeenCalledWith(
+        expect.stringContaining(`${finalPath}.`),
+        finalPath
       );
 
       // Re-enable it
       await manager.setEnabled('hvac-auto-mode', true);
       expect(manager.isEnabled('hvac-auto-mode')).toBe(true);
+    });
+  });
+
+  describe('save', () => {
+    it('produces a valid JSON file matching the in-memory config', async () => {
+      mockFs.readFile.mockRejectedValue({ code: 'ENOENT' });
+      mockFs.writeFile.mockResolvedValue(undefined);
+      mockFs.mkdir.mockResolvedValue(undefined);
+      mockFs.rename.mockResolvedValue(undefined);
+      await manager.load();
+
+      await manager.setPluginConfig('hvac-auto-mode', { threshold: 5 });
+      await manager.setEnabled('core-devices', false);
+
+      const lastWriteCall = mockFs.writeFile.mock.calls[mockFs.writeFile.mock.calls.length - 1];
+      const writtenContent = lastWriteCall[1] as string;
+
+      // Content written to disk must be valid, parseable JSON...
+      const parsed = JSON.parse(writtenContent);
+      // ...and must match what getAllConfigs() reports as current state.
+      expect(parsed).toEqual(manager.getAllConfigs());
+      expect(parsed['hvac-auto-mode'].config).toEqual({ threshold: 5 });
+      expect(parsed['core-devices'].enabled).toBe(false);
     });
   });
 });

@@ -217,6 +217,37 @@ describe('PluginManager', () => {
       expect(pluginA.stop).toHaveBeenCalled();
       expect(pluginB.stop).not.toHaveBeenCalled();
     });
+
+    it('does not block shutdown for more than ~5s when a plugin stop() never resolves', async () => {
+      jest.useFakeTimers();
+      try {
+        await loadPluginsWithMocks();
+        mockConfigManager.isEnabled.mockReturnValue(true);
+        await pluginManager.startPlugins();
+
+        // plugin-a's stop() hangs forever
+        (pluginA.stop as jest.Mock).mockImplementation(() => new Promise(() => {}));
+
+        const stopPromise = pluginManager.stopPlugins();
+
+        // Advance past the 5s per-plugin stop timeout
+        await jest.advanceTimersByTimeAsync(5_000);
+        await stopPromise;
+
+        // The hung plugin's stop was still invoked, and we moved on to stop the rest
+        expect(pluginA.stop).toHaveBeenCalled();
+        expect(pluginB.stop).toHaveBeenCalled();
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ plugin: 'plugin-a' }),
+          expect.stringContaining('timeout')
+        );
+        // No plugins remain marked as running after stopPlugins completes
+        expect(pluginManager.isPluginRunning('plugin-a')).toBe(false);
+        expect(pluginManager.isPluginRunning('plugin-b')).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
   });
 
   describe('enablePlugin', () => {
@@ -362,7 +393,7 @@ describe('PluginManager', () => {
   });
 
   describe('disable/re-enable lifecycle', () => {
-    it('restores plugin to working state after disable then re-enable', async () => {
+    it('restores plugin to working state after disable then re-enable without re-initializing', async () => {
       await loadPluginsWithMocks();
       mockConfigManager.isEnabled.mockReturnValue(true);
       await pluginManager.initializePlugins();
@@ -376,10 +407,53 @@ describe('PluginManager', () => {
       // Re-enable plugin-a
       await pluginManager.enablePlugin('plugin-a');
 
-      // Should have called init again (re-initialization) then start
-      expect(pluginA.init).toHaveBeenCalledTimes(2); // once in initializePlugins, once in enablePlugin
+      // Should NOT call init again - it was already initialized at startup and
+      // re-running init() could wipe the plugin's in-memory state. start() should
+      // be called again though, since the plugin was stopped.
+      expect(pluginA.init).toHaveBeenCalledTimes(1); // only from initializePlugins
       expect(pluginA.start).toHaveBeenCalledTimes(2); // once in startPlugins, once in enablePlugin
       expect(pluginManager.isPluginRunning('plugin-a')).toBe(true);
+    });
+  });
+
+  describe('enablePlugin init/re-init behavior', () => {
+    it('does not call init() again for an already-initialized (but stopped) plugin, but does call start()', async () => {
+      await loadPluginsWithMocks();
+      mockConfigManager.isEnabled.mockReturnValue(true);
+      await pluginManager.initializePlugins();
+      await pluginManager.startPlugins();
+
+      await pluginManager.disablePlugin('plugin-a');
+      (pluginA.init as jest.Mock).mockClear();
+      (pluginA.start as jest.Mock).mockClear();
+
+      await pluginManager.enablePlugin('plugin-a');
+
+      expect(pluginA.init).not.toHaveBeenCalled();
+      expect(pluginA.start).toHaveBeenCalledTimes(1);
+      expect(pluginManager.isPluginRunning('plugin-a')).toBe(true);
+    });
+
+    it('calls init() then start() for a never-initialized plugin (e.g. loaded after startup initializePlugins() ran)', async () => {
+      await loadPluginsWithMocks();
+      // NOTE: initializePlugins() is intentionally not called here, so plugin-b
+      // is in the same state as a plugin that was loaded/added after the startup
+      // initializePlugins() pass already ran.
+      mockConfigManager.isEnabled.mockImplementation((name: string) => name === 'plugin-a');
+      await pluginManager.startPlugins();
+      expect(pluginB.init).not.toHaveBeenCalled();
+      expect(pluginManager.isPluginRunning('plugin-b')).toBe(false);
+
+      const callOrder: string[] = [];
+      (pluginB.init as jest.Mock).mockImplementation(async () => { callOrder.push('init'); });
+      (pluginB.start as jest.Mock).mockImplementation(async () => { callOrder.push('start'); });
+
+      await pluginManager.enablePlugin('plugin-b');
+
+      expect(pluginB.init).toHaveBeenCalledTimes(1);
+      expect(pluginB.start).toHaveBeenCalledTimes(1);
+      expect(callOrder).toEqual(['init', 'start']);
+      expect(pluginManager.isPluginRunning('plugin-b')).toBe(true);
     });
   });
 

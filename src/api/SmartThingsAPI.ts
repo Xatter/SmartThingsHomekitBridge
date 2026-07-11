@@ -5,6 +5,15 @@ import { logger } from '@/utils/logger';
 import { withRetry } from '@/utils/retry';
 
 /**
+ * Maximum time (ms) we'll wait on any single SmartThings API call before treating it
+ * as failed. The @smartthings/core-sdk (axios-based) has no built-in request timeout
+ * option, so we enforce one ourselves via `withTimeout` around every `client.devices.*`
+ * call. Without this, a hung network request would leave `withRetry` (and its callers)
+ * waiting forever.
+ */
+const SMARTTHINGS_REQUEST_TIMEOUT_MS = 15000;
+
+/**
  * API client for interacting with SmartThings devices.
  * Handles authentication, device discovery, and device control.
  */
@@ -55,6 +64,61 @@ export class SmartThingsAPI {
   }
 
   /**
+   * Races a SmartThings request against a timeout so a hung/never-resolving request
+   * (the SDK has no built-in timeout) can't block callers forever.
+   * @param promise - The in-flight SmartThings SDK call
+   * @param ms - Timeout in milliseconds
+   * @param label - Description used in the timeout error message/logs
+   */
+  private withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`${label} timed out after ${ms}ms`) as Error & { code?: string };
+        error.code = 'ETIMEDOUT';
+        reject(error);
+      }, ms);
+    });
+
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * Parses a raw SmartThings capability value (e.g.
+   * `status.components?.main?.temperatureMeasurement?.temperature?.value`) into a number,
+   * returning `undefined` when the reading is missing/broken (null, undefined, or non-numeric)
+   * rather than silently coercing it to 0. A genuine numeric 0 (a real, valid temperature) is
+   * preserved as 0 - this is NOT the same as `Number(...) || 0`, which conflates "no reading"
+   * with "reads exactly zero".
+   */
+  private parseOptionalNumber(value: unknown): number | undefined {
+    if (value === null || value === undefined) {
+      return undefined;
+    }
+    const parsed = Number(value);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  }
+
+  /**
+   * Extracts capability IDs from a raw SmartThings device object (as returned by
+   * client.devices.get), checking top-level capabilities first and falling back
+   * to component-level capabilities.
+   */
+  private getCapabilityIds(device: any): string[] {
+    let capabilityIds: string[] = (device?.capabilities || []).map((cap: any) => cap.id);
+
+    if (capabilityIds.length === 0 && device?.components) {
+      capabilityIds = device.components.reduce((allCaps: string[], component: any) => {
+        const componentCaps = component.capabilities?.map((cap: any) => cap.id) || [];
+        return allCaps.concat(componentCaps);
+      }, []);
+    }
+
+    return capabilityIds;
+  }
+
+  /**
    * Retrieves all devices from SmartThings account with detailed information.
    * Fetches capabilities from both top-level and component-level.
    * @returns Array of all SmartThings devices
@@ -69,7 +133,7 @@ export class SmartThingsAPI {
     try {
       logger.info('📡 Fetching device list from SmartThings...');
       const deviceList = await withRetry(
-        () => client.devices.list(),
+        () => this.withTimeout(client.devices.list(), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'list devices'),
         { maxRetries: 3, operationName: 'list devices' }
       );
       logger.info({ count: deviceList.length }, '📱 Found devices, fetching detailed info...');
@@ -79,7 +143,7 @@ export class SmartThingsAPI {
         try {
           logger.debug({ deviceId: deviceSummary.deviceId, name: deviceSummary.name }, '🔍 Fetching details for device');
           const deviceDetails = await withRetry(
-            () => client.devices.get(deviceSummary.deviceId),
+            () => this.withTimeout(client.devices.get(deviceSummary.deviceId), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'get device details'),
             { maxRetries: 2, operationName: 'get device details' }
           );
           logger.debug({
@@ -221,20 +285,21 @@ export class SmartThingsAPI {
 
     try {
       const status = await withRetry(
-        () => client.devices.getStatus(deviceId),
+        () => this.withTimeout(client.devices.getStatus(deviceId), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'get device status'),
         { maxRetries: 2, operationName: 'get device status' }
       );
       const device = await withRetry(
-        () => client.devices.get(deviceId),
+        () => this.withTimeout(client.devices.get(deviceId), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'get device info'),
         { maxRetries: 2, operationName: 'get device info' }
       );
 
-      // Get temperature measurement
-      const temperature = Number(status.components?.main?.temperatureMeasurement?.temperature?.value) || 0;
+      // Get temperature measurement. Missing/broken readings surface as `undefined`, not 0 -
+      // 0°F is a real, valid temperature and must not be confused with "no sensor reading".
+      const temperature = this.parseOptionalNumber(status.components?.main?.temperatureMeasurement?.temperature?.value);
 
       // Try standard thermostat setpoints first
-      let coolingSetpoint = Number(status.components?.main?.thermostatCoolingSetpoint?.coolingSetpoint?.value) || 0;
-      const heatingSetpoint = Number(status.components?.main?.thermostatHeatingSetpoint?.heatingSetpoint?.value) || 0;
+      const coolingSetpoint = this.parseOptionalNumber(status.components?.main?.thermostatCoolingSetpoint?.coolingSetpoint?.value);
+      const heatingSetpoint = this.parseOptionalNumber(status.components?.main?.thermostatHeatingSetpoint?.heatingSetpoint?.value);
 
       // Get mode - try thermostat mode first, then air conditioner mode
       let mode = status.components?.main?.thermostatMode?.thermostatMode?.value ||
@@ -249,16 +314,19 @@ export class SmartThingsAPI {
       // Get the actual display light status from the Samsung-specific capability
       const lightingStatus = status.components?.main?.['samsungce.airConditionerLighting']?.lighting?.value || 'off';
 
-      // For Samsung ACs: if switch is off, the device mode should be 'off' regardless of airConditionerMode
-      // However, during a mode change operation, there might be a brief period where the switch is still 'off'
-      // but the airConditionerMode has been set. In this case, we should trust the airConditionerMode.
+      // For Samsung ACs: whenever switch is off, we report mode as 'off', regardless of what
+      // airConditionerMode currently holds. This includes the brief window mid-transition where
+      // a mode-set command has already landed (airConditionerMode updated) but the switch status
+      // hasn't caught up yet - we intentionally do NOT trust airConditionerMode in that case.
       if (switchStatus === 'off' && status.components?.main?.airConditionerMode) {
-        const airConditionerMode = status.components?.main?.airConditionerMode?.airConditionerMode?.value;
         mode = 'off';
       }
 
-      // If no standard setpoints, use the cooling setpoint (Samsung units primarily use cooling)
-      const temperatureSetpoint = mode === 'cool' ? coolingSetpoint : (heatingSetpoint || coolingSetpoint);
+      // If no standard setpoints, use the cooling setpoint (Samsung units primarily use cooling).
+      // Use `??` (not `||`) so a genuine heatingSetpoint of 0°F isn't treated as missing - only
+      // fall back to coolingSetpoint when heatingSetpoint is actually undefined. If the chosen
+      // setpoint is itself missing, temperatureSetpoint correctly comes out undefined.
+      const temperatureSetpoint = mode === 'cool' ? coolingSetpoint : (heatingSetpoint ?? coolingSetpoint);
 
       return {
         id: deviceId,
@@ -268,9 +336,11 @@ export class SmartThingsAPI {
         mode: mode as 'heat' | 'cool' | 'auto' | 'off',
         lightOn: lightingStatus === 'on',
         lastUpdated: new Date(),
-        // Include separate setpoints for auto-mode coordination
-        heatingSetpoint: heatingSetpoint || undefined,
-        coolingSetpoint: coolingSetpoint || undefined,
+        // Include separate setpoints for auto-mode coordination. heatingSetpoint/coolingSetpoint
+        // are already `number | undefined` from parseOptionalNumber above - no `|| undefined`
+        // here, since that would incorrectly wipe out a genuine 0°F setpoint.
+        heatingSetpoint,
+        coolingSetpoint,
         // Samsung AC switch state for on/off control
         switchState: switchStatus as 'on' | 'off',
       };
@@ -297,7 +367,7 @@ export class SmartThingsAPI {
       logger.debug(`[turnOffLightSilently] Sending command to ${deviceId}: ${JSON.stringify(command, null, 2)}`);
 
       const response = await withRetry(
-        () => client.devices.executeCommand(deviceId, command),
+        () => this.withTimeout(client.devices.executeCommand(deviceId, command), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'turn off light'),
         { maxRetries: 2, operationName: 'turn off light' }
       );
       logger.debug(`[turnOffLightSilently] Response from ${deviceId}: ${JSON.stringify(response, null, 2)}`);
@@ -329,12 +399,12 @@ export class SmartThingsAPI {
       const command = mode === 'cool' ? 'setCoolingSetpoint' : 'setHeatingSetpoint';
 
       await withRetry(
-        () => client.devices.executeCommand(deviceId, {
+        () => this.withTimeout(client.devices.executeCommand(deviceId, {
           component: 'main',
           capability,
           command,
           arguments: [temperature],
-        }),
+        }), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'set temperature'),
         { maxRetries: 3, operationName: 'set temperature' }
       );
 
@@ -352,7 +422,14 @@ export class SmartThingsAPI {
 
   /**
    * Sets operating mode for a device.
-   * Tries standard thermostat mode first, falls back to Samsung AC mode.
+   * Determines whether the device is a standard thermostat or a Samsung air
+   * conditioner UP FRONT by inspecting its capabilities (mirrors the isSamsungAC
+   * logic in PluginContext.setSmartThingsState), rather than trying the standard
+   * thermostatMode command and falling back to the Samsung AC path on ANY failure.
+   * That try/fallback pattern was a bug: a transient network error against a
+   * traditional thermostat would fall into the Samsung path and send switch
+   * on/setAirConditionerMode commands, powering the device on as a side effect
+   * of an unrelated network blip.
    * For Samsung AC off mode, uses switch capability.
    * @param deviceId - Device to control
    * @param mode - Target operating mode
@@ -365,15 +442,23 @@ export class SmartThingsAPI {
     }
 
     try {
-      // Try standard thermostat mode first
-      try {
+      // Decide the path by capability, not by trial-and-error.
+      const device = await withRetry(
+        () => this.withTimeout(client.devices.get(deviceId), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'get device for mode capability check'),
+        { maxRetries: 2, operationName: 'get device for setMode capability check' }
+      );
+      const capabilityIds = this.getCapabilityIds(device);
+      const isSamsungAC = capabilityIds.includes('airConditionerMode') && !capabilityIds.includes('thermostatMode');
+
+      if (!isSamsungAC) {
+        // Standard thermostat - use thermostatMode capability
         await withRetry(
-          () => client.devices.executeCommand(deviceId, {
+          () => this.withTimeout(client.devices.executeCommand(deviceId, {
             component: 'main',
             capability: 'thermostatMode',
             command: 'setThermostatMode',
             arguments: [mode],
-          }),
+          }), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'set thermostat mode'),
           { maxRetries: 3, operationName: 'set thermostat mode' }
         );
         logger.debug(`Set thermostat mode to ${mode} for device ${deviceId}`);
@@ -382,62 +467,60 @@ export class SmartThingsAPI {
         await this.turnOffLightSilently(client, deviceId);
 
         return true;
-      } catch (thermostatError) {
-        // If thermostat mode fails, try air conditioner mode for Samsung devices
-        logger.debug(`Thermostat mode failed, trying air conditioner mode for device ${deviceId}`);
+      }
 
-        // Handle Samsung AC "off" mode specially - use switch capability
-        if (mode === 'off') {
-          await withRetry(
-            () => client.devices.executeCommand(deviceId, {
-              component: 'main',
-              capability: 'switch',
-              command: 'off',
-              arguments: [],
-            }),
-            { maxRetries: 3, operationName: 'turn off AC' }
-          );
-          logger.debug(`Turned Samsung AC off using switch capability for device ${deviceId}`);
+      // Samsung air conditioner path
+      // Handle Samsung AC "off" mode specially - use switch capability
+      if (mode === 'off') {
+        await withRetry(
+          () => this.withTimeout(client.devices.executeCommand(deviceId, {
+            component: 'main',
+            capability: 'switch',
+            command: 'off',
+            arguments: [],
+          }), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'turn off AC'),
+          { maxRetries: 3, operationName: 'turn off AC' }
+        );
+        logger.debug(`Turned Samsung AC off using switch capability for device ${deviceId}`);
 
-          // Always turn off the light after any command
-          await this.turnOffLightSilently(client, deviceId);
+        // Always turn off the light after any command
+        await this.turnOffLightSilently(client, deviceId);
 
-          return true;
-        } else {
-          // For heat/cool/auto modes, use airConditionerMode
-          // First turn the device on if it's not already on
-          logger.debug(`Turning on Samsung AC switch for device ${deviceId} before setting mode to ${mode}`);
-          await withRetry(
-            () => client.devices.executeCommand(deviceId, {
-              component: 'main',
-              capability: 'switch',
-              command: 'on',
-              arguments: [],
-            }),
-            { maxRetries: 3, operationName: 'turn on AC' }
-          );
-          logger.debug(`Samsung AC switch turned on for device ${deviceId}`);
+        return true;
+      } else {
+        // For heat/cool/auto modes, use airConditionerMode
+        // First turn the device on if it's not already on
+        logger.debug(`Turning on Samsung AC switch for device ${deviceId} before setting mode to ${mode}`);
+        await withRetry(
+          () => this.withTimeout(client.devices.executeCommand(deviceId, {
+            component: 'main',
+            capability: 'switch',
+            command: 'on',
+            arguments: [],
+          }), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'turn on AC'),
+          { maxRetries: 3, operationName: 'turn on AC' }
+        );
+        logger.debug(`Samsung AC switch turned on for device ${deviceId}`);
 
-          // Small delay to ensure switch command is processed
-          await new Promise(resolve => setTimeout(resolve, 1000));
+        // Small delay to ensure switch command is processed
+        await new Promise(resolve => setTimeout(resolve, 1000));
 
-          logger.debug(`Setting Samsung AC mode to ${mode} for device ${deviceId}`);
-          await withRetry(
-            () => client.devices.executeCommand(deviceId, {
-              component: 'main',
-              capability: 'airConditionerMode',
-              command: 'setAirConditionerMode',
-              arguments: [mode],
-            }),
-            { maxRetries: 3, operationName: 'set AC mode' }
-          );
-          logger.debug(`Set Samsung AC mode to ${mode} for device ${deviceId}`);
+        logger.debug(`Setting Samsung AC mode to ${mode} for device ${deviceId}`);
+        await withRetry(
+          () => this.withTimeout(client.devices.executeCommand(deviceId, {
+            component: 'main',
+            capability: 'airConditionerMode',
+            command: 'setAirConditionerMode',
+            arguments: [mode],
+          }), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'set AC mode'),
+          { maxRetries: 3, operationName: 'set AC mode' }
+        );
+        logger.debug(`Set Samsung AC mode to ${mode} for device ${deviceId}`);
 
-          // Always turn off the light after any command
-          await this.turnOffLightSilently(client, deviceId);
+        // Always turn off the light after any command
+        await this.turnOffLightSilently(client, deviceId);
 
-          return true;
-        }
+        return true;
       }
     } catch (error) {
       logger.error({ deviceId, err: error }, 'Error setting mode for device');
@@ -477,7 +560,7 @@ export class SmartThingsAPI {
       logger.debug(`[turnLightOff] Sending command to ${deviceId}: ${JSON.stringify(command, null, 2)}`);
 
       const response = await withRetry(
-        () => client.devices.executeCommand(deviceId, command),
+        () => this.withTimeout(client.devices.executeCommand(deviceId, command), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'turn display light off'),
         { maxRetries: 2, operationName: 'turn display light off' }
       );
       logger.debug(`[turnLightOff] Response from ${deviceId}: ${JSON.stringify(response, null, 2)}`);
@@ -527,7 +610,7 @@ export class SmartThingsAPI {
       logger.debug(`[turnLightOn] Sending command to ${deviceId}: ${JSON.stringify(command, null, 2)}`);
 
       const response = await withRetry(
-        () => client.devices.executeCommand(deviceId, command),
+        () => this.withTimeout(client.devices.executeCommand(deviceId, command), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'turn display light on'),
         { maxRetries: 2, operationName: 'turn display light on' }
       );
       logger.debug(`[turnLightOn] Response from ${deviceId}: ${JSON.stringify(response, null, 2)}`);
@@ -570,7 +653,7 @@ export class SmartThingsAPI {
       logger.debug(`[setLightingLevel] Sending command to ${deviceId}: ${JSON.stringify(command, null, 2)}`);
 
       const response = await withRetry(
-        () => client.devices.executeCommand(deviceId, command),
+        () => this.withTimeout(client.devices.executeCommand(deviceId, command), SMARTTHINGS_REQUEST_TIMEOUT_MS, 'set lighting level'),
         { maxRetries: 2, operationName: 'set lighting level' }
       );
       logger.debug(`[setLightingLevel] Response from ${deviceId}: ${JSON.stringify(response, null, 2)}`);
@@ -663,22 +746,35 @@ export class SmartThingsAPI {
       throw new Error('No SmartThings client available');
     }
 
-    try {
-      for (const cmd of commands) {
+    const describeCommand = (cmd: { component: string; capability: string; command: string }): string =>
+      `${cmd.component}/${cmd.capability}/${cmd.command}`;
+
+    // Track which commands in the batch already succeeded so that if a later command
+    // fails, we don't lose track of partial progress (e.g. switch-on succeeded but the
+    // follow-up mode-set failed => device left running, but in the wrong mode).
+    const succeeded: string[] = [];
+
+    for (const cmd of commands) {
+      const description = describeCommand(cmd);
+      try {
         await withRetry(
-          () => client.devices.executeCommand(deviceId, {
+          () => this.withTimeout(client.devices.executeCommand(deviceId, {
             component: cmd.component,
             capability: cmd.capability,
             command: cmd.command,
             arguments: cmd.arguments || [],
-          }),
+          }), SMARTTHINGS_REQUEST_TIMEOUT_MS, `execute command ${description}`),
           { maxRetries: 3, initialDelayMs: 1000 }
         );
+        succeeded.push(description);
         logger.debug({ deviceId, command: cmd }, 'Executed command');
+      } catch (error) {
+        const message = succeeded.length > 0
+          ? `Command batch partially failed for device ${deviceId}: succeeded=[${succeeded.join(', ')}], failed=${description}. Device may be left in an inconsistent state.`
+          : `Command batch failed for device ${deviceId}: failed=${description} (no prior commands in this batch succeeded).`;
+        logger.error({ err: error, deviceId, commands, succeeded, failed: description }, 'Error executing commands');
+        throw new Error(message, { cause: error });
       }
-    } catch (error) {
-      logger.error({ err: error, deviceId, commands }, 'Error executing commands');
-      throw error;
     }
   }
 }

@@ -2,9 +2,15 @@ import { SmartThingsHAPServer } from './HAPServer';
 import { Coordinator } from '@/coordinator/Coordinator';
 import { DeviceState } from '@/types';
 import { AccessoryCache } from './AccessoryCache';
+import { Bridge, Characteristic } from 'hap-nodejs';
 
 // Mock dependencies
 jest.mock('./AccessoryCache');
+jest.mock('fs', () => ({
+  promises: {
+    unlink: jest.fn().mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' })),
+  },
+}));
 jest.mock('hap-nodejs', () => {
   const mockCharacteristic = {
     setProps: jest.fn().mockReturnThis(),
@@ -35,6 +41,7 @@ jest.mock('hap-nodejs', () => {
     unpublish: jest.fn(),
     setupURI: jest.fn(() => 'X-HM://test-setup-uri'),
     on: jest.fn(),
+    removeAllListeners: jest.fn(),
     bridgedAccessories: [],
   };
 
@@ -285,6 +292,23 @@ describe('SmartThingsHAPServer', () => {
       // Should not throw and should handle the undefined gracefully
       expect(hapServer['devices'].has('device-123')).toBe(true);
     });
+
+    test('given device that is cached but was never restored into devices, should create the accessory instead of dropping it', async () => {
+      mockAccessoryCache.has.mockReturnValue(true);
+      const deviceState = createMockDeviceState();
+
+      await hapServer.addDevice('device-123', deviceState);
+
+      const bridge = hapServer['bridge'];
+      expect(bridge?.addBridgedAccessory).toHaveBeenCalled();
+      expect(hapServer['devices'].has('device-123')).toBe(true);
+      expect(mockAccessoryCache.addOrUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          deviceId: 'device-123',
+          name: 'Test Thermostat',
+        })
+      );
+    });
   });
 
   describe('updateDeviceState', () => {
@@ -297,6 +321,16 @@ describe('SmartThingsHAPServer', () => {
 
       // Clear cooldown to allow immediate update
       hapServer['lastUpdateTime'].clear();
+    });
+
+    afterEach(() => {
+      // Some tests below use fake timers and/or leave a trailing-edge
+      // cooldown timer scheduled; make sure nothing leaks between tests.
+      for (const timer of hapServer['cooldownTimers'].values()) {
+        clearTimeout(timer);
+      }
+      hapServer['cooldownTimers'].clear();
+      jest.useRealTimers();
     });
 
     test('given changed temperature, should update characteristic', async () => {
@@ -363,6 +397,55 @@ describe('SmartThingsHAPServer', () => {
       await expect(
         hapServer.updateDeviceState('non-existent', deviceState)
       ).resolves.not.toThrow();
+    });
+
+    test('given rapid updates within the cooldown window, should coalesce them and flush only the latest state once the cooldown expires', async () => {
+      jest.useFakeTimers();
+
+      // First update applies immediately (no prior cooldown) and starts the window.
+      await hapServer.updateDeviceState('device-123', createMockDeviceState({ currentTemperature: 74 }));
+      expect(hapServer['devices'].get('device-123')?.state.currentTemperature).toBe(74);
+
+      // Two rapid updates land inside the cooldown window - neither should be
+      // dropped (the old behavior); they should coalesce into a single
+      // pending state instead.
+      await hapServer.updateDeviceState('device-123', createMockDeviceState({ currentTemperature: 76 }));
+      await hapServer.updateDeviceState('device-123', createMockDeviceState({ currentTemperature: 78 }));
+
+      // Still showing the pre-cooldown value - the deferred updates haven't
+      // been applied yet.
+      expect(hapServer['devices'].get('device-123')?.state.currentTemperature).toBe(74);
+      // Exactly one timer tracked for the device, not one per coalesced call.
+      expect(hapServer['cooldownTimers'].size).toBe(1);
+
+      jest.advanceTimersByTime(2000);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The LATEST coalesced state (78) wins, not the intermediate 76 or a
+      // dropped update.
+      expect(hapServer['devices'].get('device-123')?.state.currentTemperature).toBe(78);
+      expect(hapServer['cooldownTimers'].size).toBe(0);
+    });
+
+    test('given a round-trip echo of the commanded Fahrenheit setpoint, should push the original Celsius value instead of a reconverted one', async () => {
+      const handleTemperatureChange = (hapServer as any).handleTargetTemperatureChange.bind(hapServer);
+      const mockCallback = jest.fn();
+
+      // User sets 22.5C in HomeKit -> celsiusToFahrenheit -> rounds to 73F,
+      // which is what gets commanded to SmartThings.
+      await handleTemperatureChange('device-123', 22.5, mockCallback);
+      expect(hapServer['devices'].get('device-123')?.state.temperatureSetpoint).toBe(73);
+
+      // Next poll echoes back 73F. A naive reconversion
+      // (fahrenheitToCelsius(73) -> 22.78 -> quantized to nearest 0.5) would
+      // land on 23C, not what the user actually set.
+      const polledState = createMockDeviceState({ temperatureSetpoint: 73 });
+      await hapServer.updateDeviceState('device-123', polledState);
+
+      const device = hapServer['devices'].get('device-123')!;
+      const targetTempChar = device.thermostatService.getCharacteristic(Characteristic.TargetTemperature);
+      expect(targetTempChar.updateValue).toHaveBeenCalledWith(22.5);
     });
   });
 
@@ -559,6 +642,58 @@ describe('SmartThingsHAPServer', () => {
 
       const device = hapServer['devices'].get('device-123');
       expect(device?.state.mode).toBe('heat');
+    });
+  });
+
+  describe('stop() and unpair restart race', () => {
+    beforeEach(async () => {
+      await hapServer.initialize(mockCoordinator);
+      await hapServer.start();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    test('given an unpair event followed by stop(), should cancel the restart timer and not resurrect the bridge', async () => {
+      jest.useFakeTimers();
+
+      const bridgeCallsBeforeUnpair = (Bridge as unknown as jest.Mock).mock.calls.length;
+
+      // Simulate HomeKit unpairing the bridge - this schedules an untracked
+      // (pre-fix) 2s timer that reinitializes and republishes the bridge.
+      await (hapServer as any).handleUnpaired();
+      expect(hapServer['unpairRestartTimer']).not.toBeNull();
+
+      // Shut down before the 2s restart timer fires.
+      await hapServer.stop();
+
+      expect(hapServer['unpairRestartTimer']).toBeNull();
+      expect(hapServer['bridge']).toBeNull();
+
+      // Advance well past when the restart timer would have fired.
+      jest.advanceTimersByTime(5000);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // stop() must have cancelled the timer - it should never fire and
+      // resurrect the bridge (which would otherwise create a new Bridge and
+      // leave the process unable to exit cleanly).
+      expect((Bridge as unknown as jest.Mock).mock.calls.length).toBe(bridgeCallsBeforeUnpair);
+      expect(hapServer['bridge']).toBeNull();
+    });
+
+    test('given repeated initialize() calls, should not accumulate duplicate unpaired listeners', async () => {
+      const bridge = hapServer['bridge'] as any;
+      const callsAfterFirstInit = bridge.on.mock.calls.filter((call: any[]) => call[0] === 'unpaired').length;
+      expect(callsAfterFirstInit).toBe(1);
+
+      await hapServer.initialize(mockCoordinator);
+
+      const callsAfterSecondInit = bridge.removeAllListeners.mock.calls.filter((call: any[]) => call[0] === 'unpaired').length;
+      // Each initialize() call must clear any previous 'unpaired' listener
+      // before adding its own, so repeated calls don't stack handlers.
+      expect(callsAfterSecondInit).toBeGreaterThanOrEqual(1);
     });
   });
 });

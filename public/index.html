@@ -611,7 +611,10 @@
 
                     const response = await fetch(url, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
                         body: body
                     });
 
@@ -764,6 +767,7 @@
                     const action = device.included ? 'exclude' : 'include';
                     const response = await fetch(`/api/devices/${device.deviceId}/${action}`, {
                         method: 'POST',
+                        headers: { 'X-Requested-With': 'XMLHttpRequest' },
                     });
                     const result = await response.json();
 
@@ -784,7 +788,10 @@
 
             async function handleReloadDevices() {
                 try {
-                    const response = await fetch('/api/devices/reload', { method: 'POST' });
+                    const response = await fetch('/api/devices/reload', {
+                        method: 'POST',
+                        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                    });
                     if (response.ok) {
                         setReloadNotice(null);
                         alert('Devices reloaded successfully!');
@@ -1027,7 +1034,11 @@
                 try {
                     const response = await fetch('/api/homekit/reset-pairing', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' }
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
+                        body: JSON.stringify({ confirm: true })
                     });
 
                     const data = await response.json();
@@ -1317,6 +1328,7 @@
                     const action = plugin.running ? 'disable' : 'enable';
                     const response = await fetch(`/api/plugins/${plugin.name}/${action}`, {
                         method: 'POST',
+                        headers: { 'X-Requested-With': 'XMLHttpRequest' },
                     });
                     const result = await response.json();
 

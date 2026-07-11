@@ -10,9 +10,26 @@ interface PendingFlip {
   startedAt: number;
   allOffAt?: number;
   deviceIds: string[];
+  /** Number of drivePendingFlip() calls that observed awaiting_off without all devices reporting off. */
+  driveAttempts: number;
+  /**
+   * Set on a restored flip whose startedAt is older than STALE_FLIP_MS, or
+   * whose persisted shape is malformed/internally inconsistent. When set,
+   * the next drivePendingFlip() call aborts-with-restore immediately
+   * instead of resuming the state machine.
+   */
+  stale?: boolean;
 }
 
-const OFF_CYCLE_TIMEOUT_MS = 30_000;
+/**
+ * drivePendingFlip only runs on poll cycles (>=60s apart, per node-cron
+ * minute granularity). Abort after this many consecutive awaiting_off
+ * drives that still haven't observed all enrolled devices reporting off.
+ */
+const MAX_AWAITING_OFF_DRIVES = 3;
+
+/** A restored pending flip older than this is considered stale and aborted-with-restore on the first poll. */
+const STALE_FLIP_MS = 30 * 60 * 1000;
 
 /**
  * HVAC Auto-Mode Plugin
@@ -43,17 +60,17 @@ class HVACAutoModePlugin implements Plugin {
   async init(context: PluginContext): Promise<void> {
     this.context = context;
 
-    // Initialize the auto-mode controller
+    // Initialize the auto-mode controller. Persistence is delegated back to
+    // the plugin context — the controller itself never touches the filesystem.
     this.controller = new AutoModeController(
-      'state', // State key for plugin context
+      (state) => this.context.saveState('state', state),
       this.context.config // Pass through config from plugin settings
     );
 
     // Load controller state
     const savedState = await this.context.loadState('state');
     if (savedState) {
-      // Restore from plugin state
-      Object.assign((this.controller as any).state, savedState);
+      this.controller.restoreState(savedState);
       this.context.logger.info(
         {
           mode: this.controller.getCurrentMode(),
@@ -61,6 +78,35 @@ class HVACAutoModePlugin implements Plugin {
         },
         'Auto-mode controller state restored'
       );
+    }
+
+    // Restore any in-flight heat<->cool flip that was interrupted by a restart.
+    // The persisted value is treated as untrusted input: a malformed or
+    // internally inconsistent flip is marked stale so the first poll runs
+    // abort-with-restore instead of resuming a state machine that could
+    // hold units powered off forever.
+    const rawFlip = await this.context.loadState<unknown>('pendingFlip');
+    const restoredFlip = this.sanitizeRestoredFlip(rawFlip);
+    if (restoredFlip) {
+      const ageMs = Date.now() - restoredFlip.startedAt;
+      if (restoredFlip.stale) {
+        this.context.logger.warn(
+          { rawFlip },
+          '⚠️  Restored pending flip is malformed — will abort with restore on first poll'
+        );
+      } else if (ageMs > STALE_FLIP_MS) {
+        restoredFlip.stale = true;
+        this.context.logger.warn(
+          { targetMode: restoredFlip.targetMode, ageMs },
+          '⚠️  Restored pending flip is stale (>30min) — will abort with restore on first poll'
+        );
+      } else {
+        this.context.logger.info(
+          { targetMode: restoredFlip.targetMode, phase: restoredFlip.phase, ageMs },
+          '♻️  Restored in-progress heat<->cool flip'
+        );
+      }
+      this.pendingFlip = restoredFlip;
     }
 
     this.context.logger.info('HVAC Auto-Mode plugin initialized');
@@ -71,13 +117,8 @@ class HVACAutoModePlugin implements Plugin {
   }
 
   async stop(): Promise<void> {
-    // Save state on shutdown
-    const status = this.controller.getStatus();
-    await this.context.saveState('state', {
-      currentMode: status.currentMode,
-      enrolledDeviceIds: status.enrolledDeviceIds,
-      timeSinceLastSwitch: status.timeSinceLastSwitch,
-    });
+    // Save the full internal state (including timing locks) on shutdown.
+    await this.saveControllerState();
 
     this.context.logger.info('HVAC Auto-Mode plugin stopped');
   }
@@ -143,7 +184,7 @@ class HVACAutoModePlugin implements Plugin {
       // Device is enrolled - show AUTO in HomeKit
       return {
         ...state,
-        thermostatMode: this.AUTO_MODE_MARKER,
+        mode: this.AUTO_MODE_MARKER,
       };
     }
 
@@ -340,6 +381,20 @@ class HVACAutoModePlugin implements Plugin {
       '🔻 Mode flip starting — sending OFF to all enrolled devices'
     );
 
+    // Record and persist the flip BEFORE sending any OFF commands. If the
+    // process dies mid-send (crash, OOM, deploy), the restored flip either
+    // resumes or aborts-with-restore on the next startup — either way the
+    // units are brought back. Persisting after the sends would leave a
+    // crash window where devices are off with no record of the flip.
+    this.pendingFlip = {
+      targetMode,
+      phase: 'awaiting_off',
+      startedAt: Date.now(),
+      deviceIds: enrolledIds,
+      driveAttempts: 0,
+    };
+    await this.savePendingFlip();
+
     for (const device of enrolledDevices) {
       try {
         await this.context.setSmartThingsState(device.id, {
@@ -352,13 +407,6 @@ class HVACAutoModePlugin implements Plugin {
         );
       }
     }
-
-    this.pendingFlip = {
-      targetMode,
-      phase: 'awaiting_off',
-      startedAt: Date.now(),
-      deviceIds: enrolledIds,
-    };
   }
 
   /**
@@ -367,6 +415,39 @@ class HVACAutoModePlugin implements Plugin {
    */
   private async drivePendingFlip(devices: UnifiedDevice[]): Promise<void> {
     const flip = this.pendingFlip!;
+
+    // A restored flip that has exceeded the max age is not resumed — the
+    // enrolled units were already sent OFF and may have been sitting idle
+    // for a long time. Abort and restore their pre-flip mode immediately.
+    if (flip.stale) {
+      await this.abortFlip(flip, 'Restored pending flip exceeded max age');
+      return;
+    }
+
+    // Never command devices the user has since unenrolled (e.g. via a
+    // manual HomeKit mode change). Intersect on every drive.
+    const enrolledIds = this.controller.getEnrolledDeviceIds();
+    const stillEnrolled = flip.deviceIds.filter(id => enrolledIds.includes(id));
+
+    if (stillEnrolled.length === 0) {
+      this.context.logger.warn(
+        { targetMode: flip.targetMode, deviceIds: flip.deviceIds },
+        '🚫 All flip devices have been unenrolled — clearing pending flip without sending commands'
+      );
+      this.pendingFlip = null;
+      await this.savePendingFlip();
+      return;
+    }
+
+    if (stillEnrolled.length !== flip.deviceIds.length) {
+      this.context.logger.info(
+        { targetMode: flip.targetMode, before: flip.deviceIds, after: stillEnrolled },
+        '✂️  Flip device set trimmed — one or more devices were unenrolled mid-flip'
+      );
+      flip.deviceIds = stillEnrolled;
+      await this.savePendingFlip();
+    }
+
     const now = Date.now();
     const flipDevices = devices.filter(d => flip.deviceIds.includes(d.deviceId));
 
@@ -377,6 +458,7 @@ class HVACAutoModePlugin implements Plugin {
       if (allOff) {
         flip.phase = 'awaiting_min_off_time';
         flip.allOffAt = now;
+        await this.savePendingFlip();
         this.context.logger.info(
           { targetMode: flip.targetMode, minOffSeconds: this.controller.getConfig().minOffTime },
           '✅ All enrolled devices off — waiting min-off-time before flipping mode'
@@ -384,20 +466,23 @@ class HVACAutoModePlugin implements Plugin {
         return;
       }
 
-      if (now - flip.startedAt >= OFF_CYCLE_TIMEOUT_MS) {
+      flip.driveAttempts += 1;
+
+      if (flip.driveAttempts >= MAX_AWAITING_OFF_DRIVES) {
         const stillOn = flipDevices
           .filter(d => d.currentState?.switchState !== 'off')
           .map(d => ({ deviceId: d.deviceId, name: d.label, switch: d.currentState?.switchState }));
         this.context.logger.warn(
-          { targetMode: flip.targetMode, timeoutMs: OFF_CYCLE_TIMEOUT_MS, stillOn },
-          '❌ Off-cycle timeout — aborting flip, controller mode unchanged'
+          { targetMode: flip.targetMode, driveAttempts: flip.driveAttempts, stillOn },
+          '❌ Off-cycle drive attempts exhausted — aborting flip with restore'
         );
-        this.pendingFlip = null;
+        await this.abortFlip(flip, 'Off-cycle drive attempts exhausted');
         return;
       }
 
+      await this.savePendingFlip();
       this.context.logger.debug(
-        { elapsedMs: now - flip.startedAt },
+        { driveAttempts: flip.driveAttempts },
         '⏳ Waiting for all enrolled devices to report off'
       );
       return;
@@ -446,20 +531,123 @@ class HVACAutoModePlugin implements Plugin {
     });
 
     this.pendingFlip = null;
+    await this.savePendingFlip();
     await this.saveControllerState();
+  }
+
+  /**
+   * Abort a pending flip, restoring the controller's pre-flip mode to any
+   * flip devices that are still enrolled (the enrolled units were already
+   * sent OFF as part of starting the flip, so they must not be left
+   * powered off). If the pre-flip mode is 'off', there is nothing to
+   * restore — just clear the flip.
+   */
+  private async abortFlip(flip: PendingFlip, reason: string): Promise<void> {
+    const preFlipMode = this.controller.getCurrentMode();
+    const enrolledIds = this.controller.getEnrolledDeviceIds();
+    const restoreTargets = flip.deviceIds.filter(id => enrolledIds.includes(id));
+
+    this.context.logger.warn(
+      { targetMode: flip.targetMode, preFlipMode, restoreTargets, reason },
+      '↩️  Aborting flip — restoring pre-flip mode to still-enrolled devices'
+    );
+
+    if (preFlipMode !== 'off') {
+      for (const deviceId of restoreTargets) {
+        try {
+          await this.context.setSmartThingsState(deviceId, {
+            thermostatMode: preFlipMode,
+          });
+        } catch (error) {
+          this.context.logger.error(
+            { err: error, deviceId },
+            '❌ Failed to restore pre-flip mode during abort'
+          );
+        }
+      }
+    }
+
+    this.pendingFlip = null;
+    await this.savePendingFlip();
+  }
+
+  /**
+   * Persist the pending flip (or its clearing) to plugin state so an
+   * in-flight flip survives a restart.
+   */
+  private async savePendingFlip(): Promise<void> {
+    await this.context.saveState('pendingFlip', this.pendingFlip);
+  }
+
+  /**
+   * Validate a restored PendingFlip loaded from persistence, treating it as
+   * untrusted input. Returns null when there is nothing to restore.
+   *
+   * A malformed or internally inconsistent flip (wrong types, unknown
+   * phase, or 'awaiting_min_off_time' without allOffAt — which would hold
+   * forever since elapsedSinceOff would always compute as 0 with the units
+   * powered off) is returned with `stale: true` so the first poll runs the
+   * abort-with-restore path instead of resuming. If deviceIds is unusable,
+   * fall back to the currently enrolled IDs so the abort can still restore
+   * the units that were sent OFF.
+   */
+  private sanitizeRestoredFlip(raw: unknown): PendingFlip | null {
+    if (!raw || typeof raw !== 'object') {
+      return null;
+    }
+
+    const candidate = raw as Record<string, unknown>;
+
+    const validTargetMode = candidate.targetMode === 'heat' || candidate.targetMode === 'cool';
+    const validPhase = candidate.phase === 'awaiting_off' || candidate.phase === 'awaiting_min_off_time';
+    const validStartedAt = typeof candidate.startedAt === 'number' && Number.isFinite(candidate.startedAt);
+    const validAllOffAt =
+      candidate.allOffAt === undefined ||
+      (typeof candidate.allOffAt === 'number' && Number.isFinite(candidate.allOffAt));
+    const validDeviceIds =
+      Array.isArray(candidate.deviceIds) &&
+      candidate.deviceIds.length > 0 &&
+      candidate.deviceIds.every((id) => typeof id === 'string');
+    const validDriveAttempts =
+      typeof candidate.driveAttempts === 'number' && Number.isFinite(candidate.driveAttempts);
+    const consistent =
+      candidate.phase !== 'awaiting_min_off_time' ||
+      (typeof candidate.allOffAt === 'number' && Number.isFinite(candidate.allOffAt));
+
+    const malformed = !(
+      validTargetMode &&
+      validPhase &&
+      validStartedAt &&
+      validAllOffAt &&
+      validDeviceIds &&
+      validDriveAttempts &&
+      consistent
+    );
+
+    return {
+      // Placeholder values below are only ever used on the abort-with-restore
+      // path (malformed => stale), which does not read targetMode/phase/
+      // startedAt beyond logging.
+      targetMode: validTargetMode ? (candidate.targetMode as 'heat' | 'cool') : 'heat',
+      phase: validPhase ? (candidate.phase as PendingFlip['phase']) : 'awaiting_off',
+      startedAt: validStartedAt ? (candidate.startedAt as number) : Date.now(),
+      allOffAt:
+        typeof candidate.allOffAt === 'number' && Number.isFinite(candidate.allOffAt)
+          ? candidate.allOffAt
+          : undefined,
+      deviceIds: validDeviceIds
+        ? [...(candidate.deviceIds as string[])]
+        : this.controller.getEnrolledDeviceIds(),
+      driveAttempts: validDriveAttempts ? (candidate.driveAttempts as number) : 0,
+      ...(malformed ? { stale: true } : {}),
+    };
   }
 
   /**
    * Save controller state to plugin persistence
    */
   private async saveControllerState(): Promise<void> {
-    const status = this.controller.getStatus();
-    await this.context.saveState('state', {
-      currentMode: status.currentMode,
-      enrolledDeviceIds: status.enrolledDeviceIds,
-      lastSwitchTime: Date.now() - status.timeSinceLastSwitch * 1000,
-      ...(this.controller as any).state, // Include all internal state
-    });
+    await this.context.saveState('state', this.controller.getState());
   }
 
   /**
@@ -479,39 +667,45 @@ class HVACAutoModePlugin implements Plugin {
         path: '/decision',
         method: 'get',
         handler: async (req: Request, res: Response) => {
-          const devices = this.context.getDevices();
-          const enrolledIds = this.controller.getEnrolledDeviceIds();
+          try {
+            const devices = this.context.getDevices();
+            const enrolledIds = this.controller.getEnrolledDeviceIds();
 
-          const autoModeDevices: AutoModeDevice[] = devices
-            .filter(d => enrolledIds.includes(d.deviceId))
-            .filter(d =>
-              d.currentTemperature !== undefined &&
-              d.heatingSetpoint !== undefined &&
-              d.coolingSetpoint !== undefined
-            )
-            .map(d => ({
-              id: d.deviceId,
-              name: d.label,
-              currentTemperature: d.currentTemperature!,
-              lowerBound: d.heatingSetpoint!,
-              upperBound: d.coolingSetpoint!,
-              weight: 1.0,
-            }));
+            const autoModeDevices: AutoModeDevice[] = devices
+              .filter(d => enrolledIds.includes(d.deviceId))
+              .filter(d =>
+                d.currentTemperature !== undefined &&
+                d.heatingSetpoint !== undefined &&
+                d.coolingSetpoint !== undefined
+              )
+              .map(d => ({
+                id: d.deviceId,
+                name: d.label,
+                currentTemperature: d.currentTemperature!,
+                lowerBound: d.heatingSetpoint!,
+                upperBound: d.coolingSetpoint!,
+                weight: 1.0,
+              }));
 
-          if (autoModeDevices.length === 0) {
-            return res.json({
-              mode: 'off',
-              totalHeatDemand: 0,
-              totalCoolDemand: 0,
-              deviceDemands: [],
-              reason: 'No enrolled devices with valid data',
-              switchSuppressed: false,
-              secondsUntilSwitchAllowed: 0,
-            });
+            if (autoModeDevices.length === 0) {
+              res.json({
+                mode: 'off',
+                totalHeatDemand: 0,
+                totalCoolDemand: 0,
+                deviceDemands: [],
+                reason: 'No enrolled devices with valid data',
+                switchSuppressed: false,
+                secondsUntilSwitchAllowed: 0,
+              });
+              return;
+            }
+
+            const decision = this.controller.evaluate(autoModeDevices);
+            res.json(decision);
+          } catch (error) {
+            this.context.logger.error({ err: error }, '❌ Failed to compute auto-mode decision');
+            res.status(500).json({ error: 'Failed to compute auto-mode decision' });
           }
-
-          const decision = this.controller.evaluate(autoModeDevices);
-          res.json(decision);
         },
       },
     ];

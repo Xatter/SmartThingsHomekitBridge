@@ -307,4 +307,136 @@ describe('withRetry', () => {
     // Restore Math.random
     Math.random = originalRandom;
   });
+
+  // The SmartThings SDK (@smartthings/core-sdk v8) is axios-based: thrown errors carry
+  // `error.response.status`, NOT `error.statusCode`. These tests cover that shape.
+  describe('axios-shaped errors (error.response.status)', () => {
+    it('should retry an axios-shaped 429 using the Retry-After header delay, not exponential backoff', async () => {
+      const error = Object.assign(new Error('Rate limited'), {
+        response: { status: 429, headers: { 'retry-after': '2' } },
+      }) as RetryableError;
+
+      const mockFn = jest
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue('success');
+
+      // Default initialDelayMs is 1000ms - if Retry-After were ignored, the retry would
+      // fire at 1000ms. We assert it does NOT fire until the full 2000ms (2s) has passed.
+      const promise = withRetry(mockFn, { maxRetries: 3 });
+
+      await Promise.resolve();
+      expect(mockFn).toHaveBeenCalledTimes(1);
+
+      jest.advanceTimersByTime(1000);
+      await Promise.resolve();
+      expect(mockFn).toHaveBeenCalledTimes(1); // not yet - Retry-After said 2s
+
+      jest.advanceTimersByTime(1000); // now at 2000ms total
+      await Promise.resolve();
+      expect(mockFn).toHaveBeenCalledTimes(2);
+
+      const result = await promise;
+      expect(result).toBe('success');
+    });
+
+    it('should cap the Retry-After delay at maxDelayMs', async () => {
+      const error = Object.assign(new Error('Rate limited'), {
+        response: { status: 429, headers: { 'retry-after': '100' } }, // 100s, way over cap
+      }) as RetryableError;
+
+      const mockFn = jest
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue('success');
+
+      const promise = withRetry(mockFn, { maxRetries: 3, maxDelayMs: 5000 });
+
+      await Promise.resolve();
+      expect(mockFn).toHaveBeenCalledTimes(1);
+
+      jest.advanceTimersByTime(5000);
+      await Promise.resolve();
+      expect(mockFn).toHaveBeenCalledTimes(2);
+
+      const result = await promise;
+      expect(result).toBe('success');
+    });
+
+    it('should fall back to exponential backoff for a 429 with no Retry-After header', async () => {
+      const error = Object.assign(new Error('Rate limited'), {
+        response: { status: 429 },
+      }) as RetryableError;
+
+      const mockFn = jest
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue('success');
+
+      const promise = withRetry(mockFn, {
+        maxRetries: 3,
+        initialDelayMs: 1000,
+        jitter: false,
+      });
+
+      await Promise.resolve();
+      expect(mockFn).toHaveBeenCalledTimes(1);
+
+      jest.advanceTimersByTime(1000);
+      await Promise.resolve();
+      expect(mockFn).toHaveBeenCalledTimes(2);
+
+      const result = await promise;
+      expect(result).toBe('success');
+    });
+
+    it('should retry an axios-shaped 500 error (error.response.status)', async () => {
+      const error = Object.assign(new Error('Server error'), {
+        response: { status: 500 },
+      }) as RetryableError;
+
+      const mockFn = jest
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue('success');
+
+      const promise = withRetry(mockFn, { maxRetries: 3 });
+      await jest.runAllTimersAsync();
+      const result = await promise;
+
+      expect(result).toBe('success');
+      expect(mockFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('should NOT retry an axios-shaped 400 error (error.response.status)', async () => {
+      const error = Object.assign(new Error('Bad request'), {
+        response: { status: 400 },
+      }) as RetryableError;
+
+      const mockFn = jest.fn().mockRejectedValue(error);
+
+      const promise = withRetry(mockFn, { maxRetries: 3 });
+      jest.runAllTimers();
+
+      await expect(promise).rejects.toThrow('Bad request');
+      expect(mockFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('REGRESSION: plain error.statusCode errors are still classified correctly alongside axios-shaped ones', async () => {
+      const legacyError: RetryableError = new Error('Server error');
+      legacyError.statusCode = 503;
+
+      const mockFn = jest
+        .fn()
+        .mockRejectedValueOnce(legacyError)
+        .mockResolvedValue('success');
+
+      const promise = withRetry(mockFn, { maxRetries: 3 });
+      await jest.runAllTimersAsync();
+      const result = await promise;
+
+      expect(result).toBe('success');
+      expect(mockFn).toHaveBeenCalledTimes(2);
+    });
+  });
 });

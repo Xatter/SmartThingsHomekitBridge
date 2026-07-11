@@ -502,6 +502,46 @@ describe('Samsung AC getDeviceStatus - Mode Translation and Switch State', () =>
     expect(result?.coolingSetpoint).toBe(72);
     expect(result?.heatingSetpoint).toBe(68);
   });
+
+  test('given a device with no temperatureMeasurement capability data, currentTemperature is undefined (not 0)', async () => {
+    // A missing/broken sensor reading must surface as `undefined`, not be silently
+    // coerced to 0 - 0°F is a real, valid temperature and must never be confused
+    // with "no reading available".
+    mockClient.devices.getStatus.mockResolvedValue({
+      components: {
+        main: {
+          thermostatCoolingSetpoint: { coolingSetpoint: { value: 72 } },
+          airConditionerMode: { airConditionerMode: { value: 'cool' } },
+          switch: { switch: { value: 'on' } },
+          'samsungce.airConditionerLighting': { lighting: { value: 'off' } }
+        }
+      }
+    });
+
+    const result = await api.getDeviceStatus('test-device');
+
+    expect(result).not.toBeNull();
+    expect(result?.currentTemperature).toBeUndefined();
+  });
+
+  test('given a device genuinely reporting 0°F, currentTemperature is 0 (not coerced away)', async () => {
+    mockClient.devices.getStatus.mockResolvedValue({
+      components: {
+        main: {
+          temperatureMeasurement: { temperature: { value: 0 } },
+          thermostatCoolingSetpoint: { coolingSetpoint: { value: 72 } },
+          airConditionerMode: { airConditionerMode: { value: 'cool' } },
+          switch: { switch: { value: 'on' } },
+          'samsungce.airConditionerLighting': { lighting: { value: 'off' } }
+        }
+      }
+    });
+
+    const result = await api.getDeviceStatus('test-device');
+
+    expect(result).not.toBeNull();
+    expect(result?.currentTemperature).toBe(0);
+  });
 });
 
 describe('🚨 STOP! Did you just try to "fix" the backwards light commands? 🚨', () => {
@@ -628,5 +668,329 @@ describe('🚨 STOP! Did you just try to "fix" the backwards light commands? �
      * ONLY THIS BACKWARDS NAMING WORKS!
      */
     expect(true).toBe(true); // This test is just documentation
+  });
+});
+
+/**
+ * setMode Capability-Based Routing Tests
+ *
+ * setMode used to decide "standard thermostat vs Samsung AC" by trying the
+ * thermostatMode command and falling back to the Samsung AC switch/airConditionerMode
+ * path on ANY failure - including a transient network error against a perfectly
+ * ordinary thermostat. That fallback would send switch-on / setAirConditionerMode
+ * commands to a device that never asked for them, powering it on as a side effect
+ * of an unrelated network blip.
+ *
+ * setMode now fetches the device up front and decides the path from its
+ * capabilities (mirrors PluginContext.setSmartThingsState's isSamsungAC check),
+ * so a failure on one path can never spill into the other.
+ */
+describe('setMode - capability-based routing (not try/fallback-on-error)', () => {
+  let api: SmartThingsAPI;
+  let mockClient: any;
+  let mockAuth: jest.Mocked<SmartThingsAuthentication>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    mockAuth = {
+      hasAuth: jest.fn().mockReturnValue(true),
+      ensureValidToken: jest.fn().mockResolvedValue(true),
+      getAccessToken: jest.fn().mockReturnValue('test-token'),
+      setAccessToken: jest.fn(),
+      refreshAccessToken: jest.fn()
+    } as any;
+
+    api = new SmartThingsAPI(mockAuth);
+
+    mockClient = {
+      devices: {
+        executeCommand: jest.fn().mockResolvedValue({ status: 'success' }),
+        get: jest.fn(),
+        getStatus: jest.fn()
+      }
+    };
+    jest.spyOn(api as any, 'getClient').mockResolvedValue(mockClient);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  function callsForCapability(capability: string): any[] {
+    return mockClient.devices.executeCommand.mock.calls.filter(
+      ([, cmd]: [string, any]) => cmd.capability === capability
+    );
+  }
+
+  test('standard thermostat (thermostatMode capability) uses thermostatMode command, never switch/airConditionerMode', async () => {
+    mockClient.devices.get.mockResolvedValue({
+      capabilities: [{ id: 'thermostatMode' }, { id: 'temperatureMeasurement' }]
+    });
+
+    const promise = api.setMode('device-1', 'cool');
+    await jest.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result).toBe(true);
+    expect(callsForCapability('thermostatMode')).toHaveLength(1);
+    expect(callsForCapability('thermostatMode')[0][1].command).toBe('setThermostatMode');
+    expect(callsForCapability('thermostatMode')[0][1].arguments).toEqual(['cool']);
+    expect(callsForCapability('switch')).toHaveLength(0);
+    expect(callsForCapability('airConditionerMode')).toHaveLength(0);
+  });
+
+  test('CRITICAL: a transient error on a capability-known standard thermostat does NOT fall back to switch commands', async () => {
+    mockClient.devices.get.mockResolvedValue({
+      capabilities: [{ id: 'thermostatMode' }]
+    });
+
+    // A transient network error, not a "this device doesn't support thermostatMode" error.
+    const transientError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    mockClient.devices.executeCommand.mockRejectedValue(transientError);
+
+    const promise = api.setMode('device-1', 'cool');
+    await jest.runAllTimersAsync();
+    const result = await promise;
+
+    // The call ultimately fails (network blip persisted through retries), but it must
+    // NEVER have touched switch/airConditionerMode - doing so would turn the device on.
+    expect(result).toBe(false);
+    expect(callsForCapability('switch')).toHaveLength(0);
+    expect(callsForCapability('airConditionerMode')).toHaveLength(0);
+    expect(mockClient.devices.executeCommand.mock.calls.length).toBeGreaterThan(0);
+    mockClient.devices.executeCommand.mock.calls.forEach(([, cmd]: [string, any]) => {
+      expect(cmd.capability).toBe('thermostatMode');
+    });
+  });
+
+  test('Samsung AC (airConditionerMode capability, no thermostatMode) turns switch on then sets airConditionerMode for heat/cool/auto', async () => {
+    mockClient.devices.get.mockResolvedValue({
+      capabilities: [{ id: 'airConditionerMode' }, { id: 'switch' }]
+    });
+
+    const promise = api.setMode('device-1', 'cool');
+    await jest.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result).toBe(true);
+    expect(callsForCapability('thermostatMode')).toHaveLength(0);
+    expect(callsForCapability('switch')).toHaveLength(1);
+    expect(callsForCapability('switch')[0][1].command).toBe('on');
+    expect(callsForCapability('airConditionerMode')).toHaveLength(1);
+    expect(callsForCapability('airConditionerMode')[0][1].command).toBe('setAirConditionerMode');
+    expect(callsForCapability('airConditionerMode')[0][1].arguments).toEqual(['cool']);
+  });
+
+  test('Samsung AC "off" mode uses switch.off, never airConditionerMode', async () => {
+    mockClient.devices.get.mockResolvedValue({
+      capabilities: [{ id: 'airConditionerMode' }, { id: 'switch' }]
+    });
+
+    const promise = api.setMode('device-1', 'off');
+    await jest.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result).toBe(true);
+    expect(callsForCapability('switch')).toHaveLength(1);
+    expect(callsForCapability('switch')[0][1].command).toBe('off');
+    expect(callsForCapability('airConditionerMode')).toHaveLength(0);
+  });
+
+  test('capability lookup falls back to component-level capabilities when top-level list is empty', async () => {
+    mockClient.devices.get.mockResolvedValue({
+      capabilities: [],
+      components: [
+        { capabilities: [{ id: 'airConditionerMode' }] }
+      ]
+    });
+
+    const promise = api.setMode('device-1', 'heat');
+    await jest.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result).toBe(true);
+    expect(callsForCapability('airConditionerMode')).toHaveLength(1);
+  });
+
+  test('returns false without sending any command when the client is unavailable', async () => {
+    jest.spyOn(api as any, 'getClient').mockResolvedValueOnce(null);
+
+    const result = await api.setMode('device-1', 'cool');
+
+    expect(result).toBe(false);
+    expect(mockClient.devices.executeCommand).not.toHaveBeenCalled();
+    expect(mockClient.devices.get).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * executeCommands Partial-Failure Context Tests
+ *
+ * When command N of a batch fails, the thrown error must retain which commands
+ * already succeeded (e.g. switch-on landed but mode-set failed => unit is running
+ * in the wrong mode) rather than losing that context.
+ */
+describe('executeCommands - partial failure context', () => {
+  let api: SmartThingsAPI;
+  let mockClient: any;
+  let mockAuth: jest.Mocked<SmartThingsAuthentication>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    mockAuth = {
+      hasAuth: jest.fn().mockReturnValue(true),
+      ensureValidToken: jest.fn().mockResolvedValue(true),
+      getAccessToken: jest.fn().mockReturnValue('test-token'),
+      setAccessToken: jest.fn(),
+      refreshAccessToken: jest.fn()
+    } as any;
+
+    api = new SmartThingsAPI(mockAuth);
+
+    mockClient = {
+      devices: {
+        executeCommand: jest.fn(),
+        get: jest.fn(),
+        getStatus: jest.fn()
+      }
+    };
+    jest.spyOn(api as any, 'getClient').mockResolvedValue(mockClient);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test('all commands succeeding resolves with no error', async () => {
+    mockClient.devices.executeCommand.mockResolvedValue({ status: 'success' });
+
+    const commands = [
+      { component: 'main', capability: 'switch', command: 'on' },
+      { component: 'main', capability: 'airConditionerMode', command: 'setAirConditionerMode', arguments: ['cool'] },
+    ];
+
+    await expect(api.executeCommands('device-1', commands)).resolves.toBeUndefined();
+    expect(mockClient.devices.executeCommand).toHaveBeenCalledTimes(2);
+  });
+
+  test('failure message names succeeded commands and the failed command, with the original error preserved', async () => {
+    const failureError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+
+    mockClient.devices.executeCommand
+      .mockResolvedValueOnce({ status: 'success' }) // switch-on succeeds
+      .mockRejectedValue(failureError); // mode-set fails on every attempt/retry after that
+
+    const commands = [
+      { component: 'main', capability: 'switch', command: 'on' },
+      { component: 'main', capability: 'airConditionerMode', command: 'setAirConditionerMode', arguments: ['cool'] },
+    ];
+
+    const promise = api.executeCommands('device-1', commands);
+    // Attach a handler immediately (before advancing timers) so the eventual rejection
+    // is never briefly "unhandled" while fake timers drive the retries to completion.
+    const captured = promise.catch((error) => error);
+    await jest.runAllTimersAsync();
+    const caught = await captured;
+
+    expect(caught).toBeInstanceOf(Error);
+    // Names the command that already succeeded...
+    expect(caught.message).toContain('main/switch/on');
+    // ...and the one that failed...
+    expect(caught.message).toContain('main/airConditionerMode/setAirConditionerMode');
+    // ...without losing the original error.
+    expect(caught.cause).toBe(failureError);
+  });
+
+  test('failure on the very first command reports that no prior commands succeeded', async () => {
+    const failureError = new Error('boom');
+    mockClient.devices.executeCommand.mockRejectedValue(failureError);
+
+    const commands = [
+      { component: 'main', capability: 'switch', command: 'on' },
+    ];
+
+    const promise = api.executeCommands('device-1', commands);
+    const captured = promise.catch((error) => error);
+    await jest.runAllTimersAsync();
+    const caught = await captured;
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught.message).toContain('main/switch/on');
+    expect(caught.cause).toBe(failureError);
+  });
+
+  test('throws when no client is available, without attempting any command', async () => {
+    jest.spyOn(api as any, 'getClient').mockResolvedValueOnce(null);
+
+    await expect(api.executeCommands('device-1', [
+      { component: 'main', capability: 'switch', command: 'on' },
+    ])).rejects.toThrow('No SmartThings client available');
+
+    expect(mockClient.devices.executeCommand).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * SmartThings Request Timeout Tests
+ *
+ * @smartthings/core-sdk (axios-based) has no built-in request-timeout option
+ * (verified against node_modules/@smartthings/core-sdk/dist/*.d.ts - RestClientConfig
+ * has no timeout field, and the compiled endpoint-client.js builds a fixed axios
+ * config with no timeout set). SmartThingsAPI enforces its own timeout via the
+ * private `withTimeout` helper wrapped around every client.devices.* call.
+ */
+describe('withTimeout - SmartThings request timeout enforcement', () => {
+  let api: SmartThingsAPI;
+  let mockAuth: jest.Mocked<SmartThingsAuthentication>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    mockAuth = {
+      hasAuth: jest.fn().mockReturnValue(true),
+      ensureValidToken: jest.fn().mockResolvedValue(true),
+      getAccessToken: jest.fn().mockReturnValue('test-token'),
+      setAccessToken: jest.fn(),
+      refreshAccessToken: jest.fn()
+    } as any;
+
+    api = new SmartThingsAPI(mockAuth);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test('rejects with an ETIMEDOUT-coded error once the timeout elapses, instead of hanging forever', async () => {
+    const neverResolves = new Promise<never>(() => {
+      // Simulates a SmartThings request that never settles (hung connection).
+    });
+
+    const timeoutPromise = (api as any).withTimeout(neverResolves, 15000, 'test operation');
+
+    let caught: any;
+    const observed = timeoutPromise.catch((err: any) => {
+      caught = err;
+    });
+
+    jest.advanceTimersByTime(15000);
+    await observed;
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught.code).toBe('ETIMEDOUT');
+    expect(caught.message).toContain('test operation');
+  });
+
+  test('resolves normally when the underlying request finishes before the timeout', async () => {
+    const fastPromise = Promise.resolve('done');
+
+    const result = await (api as any).withTimeout(fastPromise, 15000, 'test operation');
+
+    expect(result).toBe('done');
   });
 });

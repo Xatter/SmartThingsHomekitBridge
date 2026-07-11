@@ -49,6 +49,12 @@ export function createHomeKitRoutes(hapServer: SmartThingsHAPServer): Router {
 
   router.post('/reset-pairing', async (req: Request, res: Response) => {
     try {
+      if (req.body?.confirm !== true) {
+        return res.status(400).json({
+          error: 'Resetting HomeKit pairing requires a confirmation. Send { "confirm": true } in the request body.'
+        });
+      }
+
       logger.info('Pairing reset requested via API');
       await hapServer.resetPairing();
       res.json({

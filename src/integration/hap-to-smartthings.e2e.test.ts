@@ -146,9 +146,12 @@ describe('HAP → SmartThings E2E Tests (API Verification)', () => {
           await api.setMode(TEST_DEVICE_ID, 'off');
         } else {
           await api.setMode(TEST_DEVICE_ID, originalStatus.mode);
-          // Restore temperature setpoint
-          const targetMode = originalStatus.mode === 'heat' ? 'heat' : 'cool';
-          await api.setTemperature(TEST_DEVICE_ID, originalStatus.temperatureSetpoint, targetMode);
+          // Restore temperature setpoint (only if the original reading was available -
+          // a missing/undefined setpoint means there's nothing meaningful to restore)
+          if (originalStatus.temperatureSetpoint !== undefined) {
+            const targetMode = originalStatus.mode === 'heat' ? 'heat' : 'cool';
+            await api.setTemperature(TEST_DEVICE_ID, originalStatus.temperatureSetpoint, targetMode);
+          }
         }
         console.log('✅ Device state restored');
       } catch (error) {

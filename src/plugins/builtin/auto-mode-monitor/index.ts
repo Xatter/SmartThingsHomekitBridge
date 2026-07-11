@@ -5,6 +5,17 @@ import { Request, Response } from 'express';
 import { isThermostatLikeDevice } from '@/utils/deviceUtils';
 
 /**
+ * Result of a check-and-correct pass. `skipped` is set when a check was
+ * requested while another was already running (see the isChecking latch).
+ */
+interface CheckResult {
+  checked: number;
+  corrected: string[];
+  errors: string[];
+  skipped?: boolean;
+}
+
+/**
  * Auto Mode Monitor Plugin
  *
  * Monitors mini-splits and other HVAC devices for 'auto' mode and
@@ -32,6 +43,11 @@ class AutoModeMonitorPlugin implements Plugin {
   private interval: string = '*/1 * * * *'; // Default: every minute
   private defaultHeatTemperature: number = 68;
   private defaultCoolTemperature: number = 72;
+  // Reentrancy latch: a single check can take longer than the cron interval
+  // (it does a serial getDeviceStatus per thermostat), so without this a slow
+  // run and the next scheduled run can overlap and issue duplicate corrective
+  // commands. Both the cron trigger and manualCheck share this latch.
+  private isChecking: boolean = false;
 
   async init(context: PluginContext): Promise<void> {
     this.context = context;
@@ -73,10 +89,17 @@ class AutoModeMonitorPlugin implements Plugin {
   }
 
   /**
-   * Run auto-mode check on each poll cycle
+   * No-op: the internal node-cron task (see startMonitoring) is the single
+   * trigger for auto-mode checks, since it honors config.checkInterval.
+   * This method previously ALSO called checkAndCorrectAutoMode on every
+   * poll cycle, which meant the check ran from two independent triggers
+   * (cron + poll cycle) and could issue duplicate corrective SmartThings
+   * commands while doubling SmartThings API load. Keeping this as an
+   * explicit no-op (rather than removing it) documents that decision for
+   * future readers.
    */
-  async onPollCycle(devices: UnifiedDevice[]): Promise<void> {
-    await this.checkAndCorrectAutoMode();
+  async onPollCycle(_devices: UnifiedDevice[]): Promise<void> {
+    // Intentionally does nothing. See method doc above.
   }
 
   /**
@@ -140,9 +163,47 @@ class AutoModeMonitorPlugin implements Plugin {
   }
 
   /**
-   * Check all devices and correct those in auto mode
+   * Cron-triggered entry point. Runs the shared check via the reentrancy
+   * latch and swallows the result (the cron task has nowhere to report it);
+   * errors are logged inside runCheck / the latch wrapper so this never
+   * throws.
    */
   private async checkAndCorrectAutoMode(): Promise<void> {
+    await this.runCheckWithLatch('cron');
+  }
+
+  /**
+   * Shared entry point for both the cron trigger and manualCheck. Ensures
+   * only one check runs at a time: each check does a serial getDeviceStatus
+   * per thermostat and can take longer than the cron interval, so without
+   * this latch a slow run and the next scheduled run (or a manual check)
+   * could overlap and issue duplicate corrective SmartThings commands.
+   */
+  private async runCheckWithLatch(trigger: 'cron' | 'manual'): Promise<CheckResult> {
+    if (this.isChecking) {
+      this.context.logger.debug(
+        { trigger },
+        'Auto mode check already in progress; skipping this run'
+      );
+      return { checked: 0, corrected: [], errors: [], skipped: true };
+    }
+
+    this.isChecking = true;
+    try {
+      return await this.runCheck();
+    } finally {
+      this.isChecking = false;
+    }
+  }
+
+  /**
+   * Core check-and-correct logic, shared by the cron trigger and
+   * manualCheck. Checks all devices and corrects those in auto mode.
+   */
+  private async runCheck(): Promise<CheckResult> {
+    const corrected: string[] = [];
+    const errors: string[] = [];
+
     const devices = this.context.getDevices();
 
     // Filter to thermostat-like devices
@@ -150,7 +211,7 @@ class AutoModeMonitorPlugin implements Plugin {
 
     if (thermostatDevices.length === 0) {
       this.context.logger.debug('No thermostat devices to monitor');
-      return;
+      return { checked: 0, corrected, errors };
     }
 
     // Get fresh status for all devices
@@ -166,6 +227,7 @@ class AutoModeMonitorPlugin implements Plugin {
           { err: error, deviceId: device.deviceId },
           'Failed to get device status'
         );
+        errors.push(device.deviceId);
       }
     }
 
@@ -187,7 +249,7 @@ class AutoModeMonitorPlugin implements Plugin {
 
     if (devicesInAutoMode.length === 0) {
       this.context.logger.debug('No devices in auto mode');
-      return;
+      return { checked: thermostatDevices.length, corrected, errors };
     }
 
     this.context.logger.info(
@@ -200,7 +262,7 @@ class AutoModeMonitorPlugin implements Plugin {
 
     if (!targetMode) {
       this.context.logger.warn('Could not determine target mode for auto-mode devices');
-      return;
+      return { checked: thermostatDevices.length, corrected, errors };
     }
 
     this.context.logger.info(
@@ -235,13 +297,17 @@ class AutoModeMonitorPlugin implements Plugin {
           },
           '✅ Corrected device from auto mode'
         );
+        corrected.push(device.deviceId);
       } catch (error) {
         this.context.logger.error(
           { err: error, deviceId: device.deviceId, deviceName: device.label },
           '❌ Failed to correct device from auto mode'
         );
+        errors.push(device.deviceId);
       }
     }
+
+    return { checked: thermostatDevices.length, corrected, errors };
   }
 
   /**
@@ -276,9 +342,14 @@ class AutoModeMonitorPlugin implements Plugin {
     const coolSetpoint = state.coolingSetpoint ?? this.defaultCoolTemperature;
     const midpoint = (heatSetpoint + coolSetpoint) / 2;
 
-    if (temp === undefined) {
+    // Missing/broken temperature readings now surface as `undefined` from
+    // SmartThingsAPI.getDeviceStatus (0°F is a real, valid temperature and is no
+    // longer used as a stand-in for "no reading"). We still also guard a literal
+    // 0 here defensively, in case some other upstream source (e.g. cached/persisted
+    // state written before this change) still has a legacy 0-coerced value.
+    if (temp === undefined || Number.isNaN(temp) || temp === 0) {
       this.context.logger.warn(
-        { deviceId: state.id, deviceName: state.name },
+        { deviceId: state.id, deviceName: state.name, temp },
         'Cannot determine mode: missing temperature data'
       );
       return null;
@@ -312,79 +383,13 @@ class AutoModeMonitorPlugin implements Plugin {
   }
 
   /**
-   * Manually trigger an auto mode check
+   * Manually trigger an auto mode check. Shares the isChecking latch with
+   * the cron trigger, so if a check is already running this returns
+   * immediately with `skipped: true` rather than silently doing nothing or
+   * running a second overlapping check.
    */
-  async manualCheck(): Promise<{
-    checked: number;
-    corrected: string[];
-    errors: string[];
-  }> {
-    const devices = this.context.getDevices();
-    const thermostatDevices = devices.filter(d => this.shouldHandleDevice(d));
-
-    const corrected: string[] = [];
-    const errors: string[] = [];
-
-    // Get fresh status for all devices
-    const deviceStates: Map<string, DeviceState> = new Map();
-    for (const device of thermostatDevices) {
-      try {
-        const state = await this.context.getDeviceStatus(device.deviceId);
-        if (state) {
-          deviceStates.set(device.deviceId, state);
-        }
-      } catch (error) {
-        errors.push(device.deviceId);
-      }
-    }
-
-    // Find and correct devices in auto mode
-    const devicesInAutoMode: Array<{ device: UnifiedDevice; state: DeviceState }> = [];
-    const devicesInOtherModes: Array<{ device: UnifiedDevice; state: DeviceState }> = [];
-
-    for (const device of thermostatDevices) {
-      const state = deviceStates.get(device.deviceId);
-      if (!state) continue;
-
-      const mode = (state.mode || '').toLowerCase();
-      if (mode === 'auto') {
-        devicesInAutoMode.push({ device, state });
-      } else if (mode === 'heat' || mode === 'cool') {
-        devicesInOtherModes.push({ device, state });
-      }
-    }
-
-    if (devicesInAutoMode.length > 0) {
-      const targetMode = this.determineTargetMode(devicesInAutoMode, devicesInOtherModes);
-
-      if (targetMode) {
-        for (const { device, state } of devicesInAutoMode) {
-          try {
-            const temperature = this.determineTemperature(targetMode, state);
-            const newState: Record<string, any> = {
-              thermostatMode: targetMode,
-            };
-
-            if (targetMode === 'heat') {
-              newState.heatingSetpoint = temperature;
-            } else {
-              newState.coolingSetpoint = temperature;
-            }
-
-            await this.context.setSmartThingsState(device.deviceId, newState);
-            corrected.push(device.deviceId);
-          } catch (error) {
-            errors.push(device.deviceId);
-          }
-        }
-      }
-    }
-
-    return {
-      checked: thermostatDevices.length,
-      corrected,
-      errors,
-    };
+  async manualCheck(): Promise<CheckResult> {
+    return this.runCheckWithLatch('manual');
   }
 
   /**

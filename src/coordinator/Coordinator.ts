@@ -1,6 +1,5 @@
 import * as cron from 'node-cron';
 import { promises as fs } from 'fs';
-import * as path from 'path';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { CoordinatorState, DeviceState, UnifiedDevice } from '@/types';
@@ -9,6 +8,13 @@ import { logger } from '@/utils/logger';
 import { PluginManager } from '@/plugins';
 import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 import { isThermostatLikeDevice } from '@/utils/deviceUtils';
+import { atomicWriteJson } from '@/utils/atomicWrite';
+import { AsyncMutex, singleFlight } from '@/utils/singleFlight';
+
+/** How long to suppress a stale poll's setpoint/mode from overwriting a HomeKit-initiated
+ * command. Must comfortably exceed the time it takes SmartThings to apply a command and
+ * for the next poll cycle to observe the new value. */
+const ECHO_SUPPRESS_MS = 90_000;
 
 /**
  * Coordinates device state between SmartThings API, HomeKit bridge, and plugins.
@@ -26,6 +32,37 @@ export class Coordinator {
   private pollTask: cron.ScheduledTask | null = null;
   private readonly pollInterval: string;
   private deviceMetadata: Map<string, UnifiedDevice> = new Map();
+
+  // --- Concurrency control (see class-level notes in reloadDevices/pollDevices) ---
+  private readonly mutex = new AsyncMutex();
+  /** True while a poll or reload body is actually executing (not merely queued). Used only
+   * to decide whether a poll cycle should be skipped - it is not itself a lock. */
+  private isBusy = false;
+  /** Set by stop(); checked at the top of pollDevices and inside the startup timer
+   * callback so neither fires after the coordinator has been stopped. */
+  private stopped = false;
+  private startupTimer: NodeJS.Timeout | null = null;
+  /** deviceId -> epoch ms until which a HomeKit-initiated command's setpoint/mode must not
+   * be overwritten by a poll (echo suppression, see updateDeviceStates). */
+  private readonly pendingEcho = new Map<string, number>();
+
+  /**
+   * All concurrent callers of reloadDevices() coalesce onto a single in-flight run
+   * (singleFlight), and that run always executes under `mutex` so it can never interleave
+   * with a poll cycle. NOTE: this function itself must never be awaited while `mutex` is
+   * already held by the caller - handleThermostatEvent's self-heal path relies on being
+   * able to call reloadDevices() without holding the mutex.
+   */
+  private readonly reloadDevicesCoalesced = singleFlight(() =>
+    this.mutex.runExclusive(async () => {
+      this.isBusy = true;
+      try {
+        await this.reloadDevicesInternal();
+      } finally {
+        this.isBusy = false;
+      }
+    })
+  );
 
   constructor(
     api: SmartThingsAPI,
@@ -71,7 +108,11 @@ export class Coordinator {
     // This ensures excluded devices are removed from HomeKit on startup
     if (this.api.hasAuth()) {
       // Defer device loading to avoid blocking pairing process
-      setTimeout(async () => {
+      this.startupTimer = setTimeout(async () => {
+        this.startupTimer = null;
+        if (this.stopped) {
+          return;
+        }
         logger.info('🔄 Syncing devices with inclusion settings and HomeKit...');
         await this.reloadDevices();
       }, 2000);
@@ -124,8 +165,7 @@ export class Coordinator {
         deviceStates: Array.from(this.state.deviceStates.entries()),
       };
 
-      await fs.mkdir(path.dirname(this.stateFilePath), { recursive: true });
-      await fs.writeFile(this.stateFilePath, JSON.stringify(stateToSave, null, 2));
+      await atomicWriteJson(this.stateFilePath, stateToSave);
     } catch (error) {
       logger.error({ err: error }, 'Error saving coordinator state');
     }
@@ -134,8 +174,15 @@ export class Coordinator {
   /**
    * Reloads all devices from SmartThings and syncs them to HomeKit.
    * Does not remove existing devices - preserves HomeKit stability.
+   *
+   * Safe to call concurrently: all callers coalesce onto a single in-flight run, and that
+   * run is serialized against poll cycles via the same mutex (see reloadDevicesCoalesced).
    */
   async reloadDevices(): Promise<void> {
+    await this.reloadDevicesCoalesced();
+  }
+
+  private async reloadDevicesInternal(): Promise<void> {
     if (!this.api.hasAuth()) {
       logger.warn('Cannot reload devices: No SmartThings authentication');
       return;
@@ -191,11 +238,15 @@ export class Coordinator {
         nonHvac: includedDevices.length - hvacDevices.length
       }, '🌡️  Filtering HVAC devices for HomeKit');
 
-      // Store device metadata for all included devices (needed for capability checks)
-      this.deviceMetadata.clear();
+      // Store device metadata for all included devices (needed for capability checks).
+      // Build the replacement map fully before swapping it in as a single assignment -
+      // clearing the existing map in place would leave a window where buildUnifiedDevice
+      // falls back to empty capabilities and every plugin hook silently no-ops.
+      const newDeviceMetadata = new Map<string, UnifiedDevice>();
       for (const device of includedDevices) {
-        this.deviceMetadata.set(device.deviceId, device);
+        newDeviceMetadata.set(device.deviceId, device);
       }
+      this.deviceMetadata = newDeviceMetadata;
 
       // Determine which devices should be removed from HomeKit
       const currentDeviceIds = new Set(this.state.pairedDevices);
@@ -243,6 +294,14 @@ export class Coordinator {
   private async updateDeviceStates(): Promise<void> {
     logger.debug('📊 Coordinator: Updating device states');
 
+    // Drop expired echo-suppression windows up front.
+    const now = Date.now();
+    for (const [deviceId, suppressUntil] of this.pendingEcho.entries()) {
+      if (now >= suppressUntil) {
+        this.pendingEcho.delete(deviceId);
+      }
+    }
+
     const promises = this.state.pairedDevices.map(async (deviceId) => {
       try {
         const deviceState = await this.api.getDeviceStatus(deviceId);
@@ -250,7 +309,10 @@ export class Coordinator {
           const previousState = this.state.deviceStates.get(deviceId);
           const device = this.buildUnifiedDevice(deviceId, deviceState);
 
-          // Allow plugins to modify state before applying to HomeKit
+          // Allow plugins to modify state before applying to HomeKit. This is a
+          // DISPLAY-ONLY masked view (e.g. hvac-auto-mode's beforeSetHomeKitState may
+          // return { ...state, mode: 'auto' }) - it must never be persisted as the
+          // internal device state used for command routing (see fix 7 below).
           let stateForHomeKit = await this.pluginManager.beforeSetHomeKitState(device, deviceState);
 
           if (stateForHomeKit === null) {
@@ -258,8 +320,22 @@ export class Coordinator {
             return;
           }
 
-          // Store the state
-          this.state.deviceStates.set(deviceId, stateForHomeKit);
+          // Echo suppression: a poll that read SmartThings before a HomeKit-initiated
+          // command has taken effect would otherwise see the stale setpoint/mode and
+          // push it back to HomeKit, visually reverting the change the user just made.
+          const suppressUntil = this.pendingEcho.get(deviceId);
+          if (suppressUntil !== undefined && Date.now() < suppressUntil) {
+            const suppressedState: DeviceState = previousState
+              ? { ...previousState, currentTemperature: deviceState.currentTemperature, lastUpdated: deviceState.lastUpdated }
+              : deviceState;
+            this.state.deviceStates.set(deviceId, suppressedState);
+            logger.debug({ deviceId }, 'echo-suppressed');
+            return;
+          }
+
+          // Store the RAW SmartThings state - masked display values (like mode: 'auto')
+          // must never corrupt internal state used for command routing.
+          this.state.deviceStates.set(deviceId, deviceState);
 
           // Update HAP if state changed
           if (previousState) {
@@ -270,7 +346,7 @@ export class Coordinator {
             const setpointDiff = (previousState.temperatureSetpoint !== undefined && deviceState.temperatureSetpoint !== undefined)
               ? Math.abs(previousState.temperatureSetpoint - deviceState.temperatureSetpoint)
               : Infinity; // Force update if setpoint becomes defined/undefined
-            const modeChanged = previousState.mode !== stateForHomeKit.mode;
+            const modeChanged = previousState.mode !== deviceState.mode;
 
             const stateChanged = modeChanged || setpointDiff > 0.5 || tempDiff > 0.5;
 
@@ -279,7 +355,7 @@ export class Coordinator {
                 deviceName: deviceState.name,
                 tempDiff: tempDiff.toFixed(1),
                 setpointDiff: setpointDiff.toFixed(1),
-                modeChange: modeChanged ? `${previousState.mode} -> ${stateForHomeKit.mode}` : 'unchanged',
+                modeChange: modeChanged ? `${previousState.mode} -> ${deviceState.mode}` : 'unchanged',
               }, '📈 State change detected');
               await this.hapServer.updateDeviceState(deviceId, stateForHomeKit);
 
@@ -358,12 +434,36 @@ export class Coordinator {
     });
   }
 
+  /**
+   * node-cron does not await this callback, so cycles can overlap if a previous cycle (or
+   * an in-flight reloadDevices()) is still running. Rather than queueing behind it - which
+   * would pile up stale work - an overlapping cycle is skipped entirely. The actual poll
+   * body still runs under `mutex` so it can never interleave with a reloadDevices() run.
+   */
   private async pollDevices(): Promise<void> {
+    if (this.stopped) {
+      return;
+    }
+
     if (!this.api.hasAuth()) {
       logger.warn('Coordinator polling: No SmartThings authentication');
       return;
     }
 
+    if (this.isBusy) {
+      logger.info('⏭️  Skipping poll cycle - a poll or reload is already running');
+      return;
+    }
+
+    this.isBusy = true;
+    try {
+      await this.mutex.runExclusive(() => this.pollDevicesInternal());
+    } finally {
+      this.isBusy = false;
+    }
+  }
+
+  private async pollDevicesInternal(): Promise<void> {
     logger.debug('⏰ Coordinator: Polling devices');
 
     await this.updateDeviceStates();
@@ -407,7 +507,25 @@ export class Coordinator {
         return;
       }
 
-      const device = this.buildUnifiedDevice(event.deviceId, currentState);
+      let device = this.buildUnifiedDevice(event.deviceId, currentState);
+
+      // Device capability metadata is cached in-memory and can go stale (e.g. it's only
+      // populated by reloadDevices(), which normally only runs once at startup). Sending a
+      // mode-change command with unknown capabilities defaults to the wrong SmartThings
+      // capability (e.g. thermostatMode instead of airConditionerMode for Samsung ACs) and
+      // SmartThings rejects it outright. Self-heal by refreshing the cache before giving up.
+      if (Object.keys(device.thermostatCapabilities).length === 0) {
+        logger.warn({ deviceId: event.deviceId },
+          '⚠️  Device capabilities unknown - refreshing device metadata before sending command');
+        await this.reloadDevices();
+        device = this.buildUnifiedDevice(event.deviceId, this.state.deviceStates.get(event.deviceId) || currentState);
+
+        if (Object.keys(device.thermostatCapabilities).length === 0) {
+          logger.error({ deviceId: event.deviceId },
+            '❌ Device capabilities still unknown after refresh - refusing to guess, aborting command');
+          return;
+        }
+      }
 
       // Map generic temperature to appropriate setpoint based on current mode
       // HAPServer sends 'temperature' for single setpoint changes, which we need to
@@ -541,24 +659,31 @@ export class Coordinator {
         await this.api.executeCommands(event.deviceId, commands);
         logger.info({ deviceId: event.deviceId, commands }, '✅ Commands sent to SmartThings');
 
-        // Update local state
-        currentState.mode = finalState.thermostatMode || currentState.mode;
+        // Echo suppression: a poll that reads SmartThings before this command has taken
+        // effect would otherwise see the stale setpoint/mode and push it right back to
+        // HomeKit, visually reverting the change the user just made.
+        this.pendingEcho.set(event.deviceId, Date.now() + ECHO_SUPPRESS_MS);
+
+        // Copy-on-write: never mutate the DeviceState object that's stored in the map -
+        // updateDeviceStates() may be concurrently reading or replacing it.
+        const updatedState: DeviceState = { ...currentState };
+        updatedState.mode = finalState.thermostatMode || updatedState.mode;
         if (finalState.heatingSetpoint !== undefined) {
-          currentState.heatingSetpoint = finalState.heatingSetpoint;
+          updatedState.heatingSetpoint = finalState.heatingSetpoint;
           // Update temperatureSetpoint if in heat mode
-          if (currentState.mode === 'heat') {
-            currentState.temperatureSetpoint = finalState.heatingSetpoint;
+          if (updatedState.mode === 'heat') {
+            updatedState.temperatureSetpoint = finalState.heatingSetpoint;
           }
         }
         if (finalState.coolingSetpoint !== undefined) {
-          currentState.coolingSetpoint = finalState.coolingSetpoint;
+          updatedState.coolingSetpoint = finalState.coolingSetpoint;
           // Update temperatureSetpoint if in cool/auto/off mode
-          if (currentState.mode !== 'heat') {
-            currentState.temperatureSetpoint = finalState.coolingSetpoint;
+          if (updatedState.mode !== 'heat') {
+            updatedState.temperatureSetpoint = finalState.coolingSetpoint;
           }
         }
-        currentState.lastUpdated = new Date();
-        this.state.deviceStates.set(event.deviceId, currentState);
+        updatedState.lastUpdated = new Date();
+        this.state.deviceStates.set(event.deviceId, updatedState);
         await this.saveState();
       }
     } catch (error) {
@@ -621,6 +746,13 @@ export class Coordinator {
    * Stop the coordinator
    */
   stop(): void {
+    this.stopped = true;
+
+    if (this.startupTimer) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = null;
+    }
+
     if (this.pollTask) {
       this.pollTask.stop();
       this.pollTask = null;

@@ -16,9 +16,12 @@ import { SmartThingsHAPServer } from '@/hap/HAPServer';
  * The `enabled` config flag only controls whether start() is called.
  */
 export class PluginManager {
+  private static readonly STOP_TIMEOUT_MS = 5_000;
+
   private readonly logger: Logger;
   private readonly plugins: Map<string, LoadedPlugin> = new Map();
   private readonly runningPlugins: Set<string> = new Set();
+  private readonly initializedPlugins: Set<string> = new Set();
   private readonly contexts: Map<string, PluginContext> = new Map();
   private readonly config: any;
   private readonly api: SmartThingsAPI;
@@ -161,6 +164,7 @@ export class PluginManager {
       const context = this.contexts.get(name)!;
       try {
         await loaded.plugin.init(context);
+        this.initializedPlugins.add(name);
         this.logger.info({ plugin: name }, 'Plugin initialized');
       } catch (error) {
         this.logger.error({ err: error, plugin: name }, 'Failed to initialize plugin');
@@ -201,14 +205,43 @@ export class PluginManager {
       if (!loaded) continue;
 
       try {
-        await loaded.plugin.stop();
-        this.logger.info({ plugin: name }, 'Plugin stopped');
+        await this.stopPluginWithTimeout(name, loaded.plugin);
       } catch (error) {
         this.logger.error({ err: error, plugin: name }, 'Failed to stop plugin');
       }
     }
 
     this.runningPlugins.clear();
+  }
+
+  /**
+   * Stop a single plugin, but don't let a hung stop() block shutdown forever.
+   * If the plugin doesn't resolve within STOP_TIMEOUT_MS, log a warning and move on.
+   */
+  private async stopPluginWithTimeout(name: string, plugin: Plugin): Promise<void> {
+    const timeoutMs = PluginManager.STOP_TIMEOUT_MS;
+
+    const timedOut = Symbol('stop-timeout');
+    let timer: NodeJS.Timeout;
+    const timeoutPromise = new Promise<typeof timedOut>((resolve) => {
+      timer = setTimeout(() => resolve(timedOut), timeoutMs);
+      timer.unref?.();
+    });
+
+    try {
+      const result = await Promise.race([plugin.stop().then(() => 'stopped' as const), timeoutPromise]);
+
+      if (result === timedOut) {
+        this.logger.warn(
+          { plugin: name, timeoutMs },
+          'Plugin stop() did not resolve within timeout, continuing shutdown'
+        );
+      } else {
+        this.logger.info({ plugin: name }, 'Plugin stopped');
+      }
+    } finally {
+      clearTimeout(timer!);
+    }
   }
 
   /**
@@ -398,9 +431,12 @@ export class PluginManager {
     const loaded = this.plugins.get(name);
     if (loaded && !this.runningPlugins.has(name)) {
       try {
-        const context = this.contexts.get(name);
-        if (context) {
-          await loaded.plugin.init(context);
+        if (!this.initializedPlugins.has(name)) {
+          const context = this.contexts.get(name);
+          if (context) {
+            await loaded.plugin.init(context);
+          }
+          this.initializedPlugins.add(name);
         }
         await loaded.plugin.start();
         this.runningPlugins.add(name);

@@ -13,6 +13,8 @@ jest.mock('fs', () => ({
     readFile: jest.fn(),
     writeFile: jest.fn(),
     mkdir: jest.fn(),
+    rename: jest.fn(),
+    unlink: jest.fn(),
   },
 }));
 
@@ -103,6 +105,8 @@ describe('Coordinator', () => {
     (fs.readFile as jest.Mock).mockRejectedValue({ code: 'ENOENT' });
     (fs.writeFile as jest.Mock).mockResolvedValue(undefined);
     (fs.mkdir as jest.Mock).mockResolvedValue(undefined);
+    (fs.rename as jest.Mock).mockResolvedValue(undefined);
+    (fs.unlink as jest.Mock).mockResolvedValue(undefined);
 
     coordinator = new Coordinator(
       mockApi,
@@ -148,8 +152,12 @@ describe('Coordinator', () => {
     });
 
     test('given existing state with devices, should reload devices after delay', async () => {
-      jest.useFakeTimers();
-
+      // Note: this intentionally avoids jest.useFakeTimers() AND jest.spyOn(global,
+      // 'setTimeout') - in this environment (Jest 30 + Node's newer timer internals),
+      // touching the global setTimeout binding via either mechanism leaves it permanently
+      // unresolvable (ReferenceError) for the rest of the test file, even after
+      // useRealTimers()/mockRestore(). A real (short) wait is used instead so the actual
+      // global setTimeout is never faked or intercepted.
       const savedState = {
         pairedDevices: ['device-1', 'device-2'],
         averageTemperature: 72,
@@ -164,15 +172,13 @@ describe('Coordinator', () => {
 
       // reloadDevices should be scheduled but not called yet
       expect(reloadSpy).not.toHaveBeenCalled();
+      expect(coordinator['startupTimer']).not.toBeNull();
 
-      // Fast-forward 2 seconds
-      jest.advanceTimersByTime(2000);
-      await Promise.resolve();
+      // Wait past the 2-second startup delay.
+      await new Promise((resolve) => setTimeout(resolve, 2200));
 
       expect(reloadSpy).toHaveBeenCalled();
-
-      jest.useRealTimers();
-    });
+    }, 10000);
 
     test('given no auth, should not reload devices', async () => {
       mockApi.hasAuth.mockReturnValue(false);
@@ -188,11 +194,7 @@ describe('Coordinator', () => {
 
       await coordinator.initialize();
 
-      jest.useFakeTimers();
-      jest.advanceTimersByTime(3000);
-      await Promise.resolve();
-      jest.useRealTimers();
-
+      // No auth means initialize() never schedules the startup timer in the first place.
       expect(reloadSpy).not.toHaveBeenCalled();
     });
   });
@@ -243,13 +245,20 @@ describe('Coordinator', () => {
   });
 
   describe('saveState', () => {
-    test('given coordinator state, should save to file', async () => {
+    test('given coordinator state, should save to file atomically (write temp file, then rename)', async () => {
       await coordinator['saveState']();
 
       expect(fs.mkdir).toHaveBeenCalled();
+      // atomicWriteJson writes to a temp file in the same directory first...
       expect(fs.writeFile).toHaveBeenCalledWith(
-        mockStateFilePath,
-        expect.stringContaining('"pairedDevices"')
+        expect.stringContaining('coordinator-state.json'),
+        expect.stringContaining('"pairedDevices"'),
+        'utf-8'
+      );
+      // ...then atomically renames it into place at the real path.
+      expect(fs.rename).toHaveBeenCalledWith(
+        expect.stringContaining('coordinator-state.json'),
+        mockStateFilePath
       );
     });
 
@@ -532,6 +541,158 @@ describe('Coordinator', () => {
           arguments: [68],
         },
       ]);
+    });
+
+    test('given a successful command, should not mutate the DeviceState object previously stored in the map', async () => {
+      const original = createMockDeviceState({ mode: 'cool', coolingSetpoint: 72, temperatureSetpoint: 72 });
+      coordinator['state'].deviceStates.set('device-1', original);
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'temperature',
+        coolingSetpoint: 65,
+      });
+
+      // The object that was in the map before the call must be left untouched - it may be
+      // concurrently read/replaced by updateDeviceStates().
+      expect(original.coolingSetpoint).toBe(72);
+      expect(original.temperatureSetpoint).toBe(72);
+
+      // The map now holds a different object with the update applied.
+      const updated = coordinator.getDeviceState('device-1');
+      expect(updated).not.toBe(original);
+      expect(updated?.coolingSetpoint).toBe(65);
+    });
+  });
+
+  describe('poll/reload concurrency', () => {
+    test('given an overlapping poll cycle, should skip it entirely rather than queue it', async () => {
+      coordinator['state'].pairedDevices = ['device-1'];
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState());
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      // Fire two poll cycles back-to-back without awaiting the first - this mirrors
+      // node-cron, which does not await its callback.
+      const first = coordinator['pollDevices']();
+      const second = coordinator['pollDevices']();
+
+      await Promise.all([first, second]);
+
+      // Only the first cycle should have actually run the poll body.
+      expect(mockApi.getDeviceStatus).toHaveBeenCalledTimes(1);
+      expect(mockPluginManager.onPollCycle).toHaveBeenCalledTimes(1);
+    });
+
+    test('given concurrent reloadDevices calls, should coalesce onto a single in-flight run', async () => {
+      mockApi.getDevices.mockResolvedValue([]);
+
+      await Promise.all([
+        coordinator.reloadDevices(),
+        coordinator.reloadDevices(),
+        coordinator.reloadDevices(),
+      ]);
+
+      expect(mockApi.getDevices).toHaveBeenCalledTimes(1);
+    });
+
+    test('given stop() called before the startup timer fires, should not run the deferred reload', async () => {
+      // Avoids jest.useFakeTimers() and jest.spyOn(global, 'setTimeout'/'clearTimeout') -
+      // see note on the "reload devices after delay" test above. A real (short) wait is
+      // used instead so the global setTimeout/clearTimeout bindings are never touched.
+      const reloadSpy = jest.spyOn(coordinator as any, 'reloadDevices').mockResolvedValue(undefined);
+
+      await coordinator.initialize();
+      expect(coordinator['startupTimer']).not.toBeNull();
+
+      coordinator.stop();
+
+      // stop() should clear the tracked handle so the timer can never fire.
+      expect(coordinator['startupTimer']).toBeNull();
+
+      // Wait past when the startup delay would have elapsed - the deferred reload must
+      // never run.
+      await new Promise((resolve) => setTimeout(resolve, 2200));
+
+      expect(reloadSpy).not.toHaveBeenCalled();
+    }, 10000);
+  });
+
+  describe('echo suppression', () => {
+    // Note: this avoids jest.useFakeTimers() - see the note on the "reload devices after
+    // delay" test above. The suppress-until value is a plain Date.now()-based epoch ms
+    // stored in the private pendingEcho map, so expiry is simulated by writing to that
+    // map directly rather than by mocking the clock.
+    test('given a HomeKit-initiated change, a stale poll should not overwrite it until the suppression window expires', async () => {
+      coordinator['state'].pairedDevices = ['device-1'];
+      coordinator['state'].deviceStates.set(
+        'device-1',
+        createMockDeviceState({ mode: 'cool', coolingSetpoint: 72, temperatureSetpoint: 72, currentTemperature: 72 })
+      );
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      // User changes the setpoint via HomeKit.
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'temperature',
+        coolingSetpoint: 65,
+      });
+      expect(coordinator.getDeviceState('device-1')?.coolingSetpoint).toBe(65);
+      expect(coordinator['pendingEcho'].has('device-1')).toBe(true);
+
+      // A poll runs immediately after, but SmartThings hasn't caught up yet and still
+      // reports the OLD setpoint (with a fresh current temperature reading).
+      mockApi.getDeviceStatus.mockResolvedValue(
+        createMockDeviceState({ mode: 'cool', coolingSetpoint: 72, temperatureSetpoint: 72, currentTemperature: 74 })
+      );
+
+      await coordinator['updateDeviceStates']();
+
+      const suppressed = coordinator.getDeviceState('device-1');
+      // The stale setpoint must NOT snap back...
+      expect(suppressed?.coolingSetpoint).toBe(65);
+      expect(suppressed?.temperatureSetpoint).toBe(65);
+      // ...but currentTemperature is still allowed to update.
+      expect(suppressed?.currentTemperature).toBe(74);
+      expect(mockHapServer.updateDeviceState).not.toHaveBeenCalled();
+
+      // Simulate the suppression window having expired.
+      coordinator['pendingEcho'].set('device-1', Date.now() - 1);
+
+      await coordinator['updateDeviceStates']();
+
+      const afterExpiry = coordinator.getDeviceState('device-1');
+      expect(afterExpiry?.coolingSetpoint).toBe(72);
+      expect(mockHapServer.updateDeviceState).toHaveBeenCalledWith('device-1', expect.objectContaining({ coolingSetpoint: 72 }));
+      // The expired entry should have been cleaned up.
+      expect(coordinator['pendingEcho'].has('device-1')).toBe(false);
+    });
+  });
+
+  describe('raw vs masked state (HomeKit display masking)', () => {
+    test('given a plugin that masks mode for display, should store raw state internally but send the masked state to HAP', async () => {
+      coordinator['state'].pairedDevices = ['device-1'];
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      const rawState = createMockDeviceState({ mode: 'heat', currentTemperature: 68 });
+      mockApi.getDeviceStatus.mockResolvedValue(rawState);
+
+      // Simulates hvac-auto-mode's beforeSetHomeKitState, which returns a display-only
+      // masked state ({ ...state, mode: 'auto' }).
+      mockPluginManager.beforeSetHomeKitState.mockImplementation((_device, state) =>
+        Promise.resolve({ ...state, mode: 'auto' })
+      );
+
+      await coordinator['updateDeviceStates']();
+
+      // Internal state used for command routing must stay RAW.
+      expect(coordinator.getDeviceState('device-1')?.mode).toBe('heat');
+
+      // HAP receives the masked, display-only state.
+      expect(mockHapServer.updateDeviceState).toHaveBeenCalledWith(
+        'device-1',
+        expect.objectContaining({ mode: 'auto' })
+      );
     });
   });
 
