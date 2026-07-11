@@ -12,6 +12,7 @@ import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 import { createAuthRoutes } from './routes/auth';
 import { createDevicesRoutes } from './routes/devices';
 import { createHomeKitRoutes } from './routes/homekit';
+import { bootstrapOidc, createOidcRouter, requireAuth } from './oidc';
 import { logger } from '@/utils/logger';
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'DELETE', 'PATCH']);
@@ -144,6 +145,12 @@ export class WebServer {
     // callers use lowercase /api paths, so this does not affect legit traffic.
     this.app.set('case sensitive routing', true);
 
+    // Required for secure cookies + correct protocol/IP detection when the
+    // bridge sits behind gimli's nginx reverse proxy (TLS is terminated
+    // there; Express only sees plain HTTP). Without this, `req.secure` and
+    // the `secure` cookie flag would never see a "yes" even over HTTPS.
+    this.app.set('trust proxy', 1);
+
     const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS;
     if (allowedOrigins) {
       const origins = allowedOrigins.split(',').map(origin => origin.trim()).filter(Boolean);
@@ -167,12 +174,31 @@ export class WebServer {
     }
 
     const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+    // `secure` defaults to false so plain-http dev/local setups keep working;
+    // set SESSION_COOKIE_SECURE=true once the bridge is served over TLS
+    // (directly or via the reverse proxy, hence `trust proxy` above) so the
+    // session cookie is never sent over an unencrypted connection.
+    const sessionCookieSecure = process.env.SESSION_COOKIE_SECURE === 'true';
     this.app.use(session({
       secret: sessionSecret,
       resave: false,
       saveUninitialized: false,
-      cookie: { secure: false }
+      cookie: {
+        secure: sessionCookieSecure,
+        httpOnly: true,
+        sameSite: 'lax'
+      }
     }));
+
+    // OIDC login/callback/logout routes and the requireAuth gate must be
+    // registered here - after the session middleware (they read/write
+    // req.session) and before express.static()/the /api route mounts in
+    // setupRoutes() (so static assets and every API route, including ones
+    // mounted later, are covered). apiMutationGuard above is unaffected and
+    // stays as the drive-by-mutation defense-in-depth layer; OIDC is the
+    // primary gate.
+    this.app.use(createOidcRouter());
+    this.app.use(requireAuth);
 
     this.app.use(express.static(path.join(__dirname, '../../public')));
 
@@ -292,6 +318,15 @@ export class WebServer {
   }
 
   async start(): Promise<void> {
+    // Resolve OIDC discovery (with its own bounded retries) before we start
+    // accepting connections, so the very first requests see a deterministic
+    // state instead of racing initialization. bootstrapOidc() never throws:
+    // if OIDC is disabled it's a no-op, and if discovery fails it logs and
+    // schedules a background retry - requireAuth stays fail-closed either
+    // way, and the HAP/HomeKit bridge (already started before this in
+    // index.ts) is completely unaffected by a down SSO provider.
+    await bootstrapOidc();
+
     return new Promise((resolve, reject) => {
       this.server = this.app.listen(this.port, '0.0.0.0', () => {
         logger.info({ port: this.port, url: `http://0.0.0.0:${this.port}` }, 'Web server started');
