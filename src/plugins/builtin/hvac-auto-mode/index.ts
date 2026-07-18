@@ -56,6 +56,7 @@ class HVACAutoModePlugin implements Plugin {
   private controller!: AutoModeController;
   private readonly AUTO_MODE_MARKER = 'auto';
   private pendingFlip: PendingFlip | null = null;
+  private flipTimer: ReturnType<typeof setTimeout> | null = null;
 
   async init(context: PluginContext): Promise<void> {
     this.context = context;
@@ -117,6 +118,11 @@ class HVACAutoModePlugin implements Plugin {
   }
 
   async stop(): Promise<void> {
+    if (this.flipTimer) {
+      clearTimeout(this.flipTimer);
+      this.flipTimer = null;
+    }
+
     // Save the full internal state (including timing locks) on shutdown.
     await this.saveControllerState();
 
@@ -503,10 +509,12 @@ class HVACAutoModePlugin implements Plugin {
         flip.phase = 'awaiting_min_off_time';
         flip.allOffAt = now;
         await this.savePendingFlip();
+        const minOffMs = this.controller.getConfig().minOffTime * 1000;
         this.context.logger.info(
           { targetMode: flip.targetMode, minOffSeconds: this.controller.getConfig().minOffTime },
           '✅ All enrolled devices off — waiting min-off-time before flipping mode'
         );
+        this.scheduleFlipCompletion(minOffMs);
         return;
       }
 
@@ -535,16 +543,56 @@ class HVACAutoModePlugin implements Plugin {
     // awaiting_min_off_time
     const minOffMs = this.controller.getConfig().minOffTime * 1000;
     const elapsedSinceOff = now - (flip.allOffAt ?? now);
+    const remainingMs = minOffMs - elapsedSinceOff;
 
-    if (elapsedSinceOff < minOffMs) {
+    if (remainingMs > 0) {
       this.context.logger.debug(
-        { remainingMs: minOffMs - elapsedSinceOff },
+        { remainingMs },
         '⏳ Holding off-cycle for compressor min-off-time'
       );
+      this.scheduleFlipCompletion(remainingMs);
       return;
     }
 
-    // Min-off elapsed: bring units up in the new mode.
+    await this.completeFlip();
+  }
+
+  /**
+   * Schedule a timer to complete the flip after the remaining min-off-time.
+   * Replaces any existing timer (e.g. from a restored flip or a poll that
+   * re-checks while the timer is already running).
+   */
+  private scheduleFlipCompletion(delayMs: number): void {
+    if (this.flipTimer) {
+      clearTimeout(this.flipTimer);
+    }
+    this.context.logger.debug(
+      { delayMs },
+      '⏱️  Scheduling flip completion timer'
+    );
+    this.flipTimer = setTimeout(() => {
+      this.flipTimer = null;
+      this.completeFlip().catch(error => {
+        this.context.logger.error(
+          { err: error },
+          '❌ Failed to complete flip from timer'
+        );
+      });
+    }, delayMs);
+  }
+
+  /**
+   * Send the target mode to all flip devices and commit the mode change.
+   * Called either from the poll-driven drivePendingFlip (when min-off has
+   * elapsed by poll time) or from the scheduled timer (so the flip doesn't
+   * have to wait for the next 5-minute poll).
+   */
+  private async completeFlip(): Promise<void> {
+    const flip = this.pendingFlip;
+    if (!flip || flip.phase !== 'awaiting_min_off_time') {
+      return;
+    }
+
     this.context.logger.info(
       { targetMode: flip.targetMode, deviceCount: flip.deviceIds.length },
       '🔺 Min-off-time elapsed — applying new mode to enrolled devices'
@@ -563,7 +611,6 @@ class HVACAutoModePlugin implements Plugin {
       }
     }
 
-    // Commit the mode change to the controller now that the flip has executed.
     await this.controller.applyDecision({
       mode: flip.targetMode,
       totalHeatDemand: 0,
@@ -587,6 +634,10 @@ class HVACAutoModePlugin implements Plugin {
    * restore — just clear the flip.
    */
   private async abortFlip(flip: PendingFlip, reason: string): Promise<void> {
+    if (this.flipTimer) {
+      clearTimeout(this.flipTimer);
+      this.flipTimer = null;
+    }
     const preFlipMode = this.controller.getCurrentMode();
     const enrolledIds = this.controller.getEnrolledDeviceIds();
     const restoreTargets = flip.deviceIds.filter(id => enrolledIds.includes(id));

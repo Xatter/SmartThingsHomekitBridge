@@ -130,7 +130,7 @@ export class AutoModeController {
       coolHysteresis: 0.7,
       flipGuard: 2.0,
       minOnTime: 600,     // 10 minutes
-      minOffTime: 300,    // 5 minutes
+      minOffTime: 180,    // 3 minutes
       minLockTime: 1800,  // 30 minutes
       relativeDominanceThreshold: 0.25,  // 25%
       absoluteDominanceThreshold: 2.0,    // 2.0°F
