@@ -48,6 +48,7 @@ class AutoModeMonitorPlugin implements Plugin {
   // run and the next scheduled run can overlap and issue duplicate corrective
   // commands. Both the cron trigger and manualCheck share this latch.
   private isChecking: boolean = false;
+  private enrolledDeviceIds: Set<string> = new Set();
 
   async init(context: PluginContext): Promise<void> {
     this.context = context;
@@ -196,6 +197,25 @@ class AutoModeMonitorPlugin implements Plugin {
     }
   }
 
+  private async refreshEnrolledDeviceIds(): Promise<void> {
+    try {
+      // Read the hvac-auto-mode plugin's persisted state via path traversal.
+      // loadState joins the key with the plugin's own persist directory
+      // (data/plugins/auto-mode-monitor/), so '../hvac-auto-mode/state'
+      // resolves to data/plugins/hvac-auto-mode/state.json.
+      const data = await this.context.loadState<{ enrolledDeviceIds?: string[] }>(
+        '../hvac-auto-mode/state'
+      );
+      if (data && Array.isArray(data.enrolledDeviceIds)) {
+        this.enrolledDeviceIds = new Set(data.enrolledDeviceIds);
+      } else {
+        this.enrolledDeviceIds = new Set();
+      }
+    } catch {
+      this.enrolledDeviceIds = new Set();
+    }
+  }
+
   /**
    * Core check-and-correct logic, shared by the cron trigger and
    * manualCheck. Checks all devices and corrects those in auto mode.
@@ -203,6 +223,8 @@ class AutoModeMonitorPlugin implements Plugin {
   private async runCheck(): Promise<CheckResult> {
     const corrected: string[] = [];
     const errors: string[] = [];
+
+    await this.refreshEnrolledDeviceIds();
 
     const devices = this.context.getDevices();
 
@@ -238,6 +260,18 @@ class AutoModeMonitorPlugin implements Plugin {
     for (const device of thermostatDevices) {
       const state = deviceStates.get(device.deviceId);
       if (!state) continue;
+
+      // Skip devices enrolled in the hvac-auto-mode controller — that
+      // plugin is actively managing their mode and will send the correct
+      // heat/cool commands. Overriding them here with (possibly stale)
+      // SmartThings data causes mode desynchronization.
+      if (this.enrolledDeviceIds.has(device.deviceId)) {
+        this.context.logger.debug(
+          { deviceId: device.deviceId, deviceName: device.label },
+          'Skipping device managed by hvac-auto-mode controller'
+        );
+        continue;
+      }
 
       const mode = (state.mode || '').toLowerCase();
       if (mode === 'auto') {

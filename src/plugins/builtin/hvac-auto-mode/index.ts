@@ -334,6 +334,50 @@ class HVACAutoModePlugin implements Plugin {
             );
           }
         }
+      } else {
+        // Reconciliation: even though the controller's mode hasn't changed,
+        // verify that enrolled devices actually match. An external actor (e.g.
+        // another plugin, a physical remote, SmartThings cloud) may have
+        // changed a device's mode out from under us.
+        const expectedMode = this.controller.getCurrentMode();
+        if (expectedMode !== 'off') {
+          const desyncedDevices = autoModeDevices.filter(d => {
+            const unified = devices.find(u => u.deviceId === d.id);
+            if (!unified?.currentState) return false;
+            const actualMode = unified.currentState.mode;
+            // Samsung ACs report switch:off as mode:'off', skip those
+            if (actualMode === 'off' && unified.currentState.switchState === 'off') return false;
+            return actualMode !== expectedMode;
+          });
+
+          if (desyncedDevices.length > 0) {
+            this.context.logger.warn(
+              {
+                expectedMode,
+                desyncedCount: desyncedDevices.length,
+                devices: desyncedDevices.map(d => d.name),
+              },
+              '🔄 Detected desynced devices, re-sending mode'
+            );
+
+            for (const device of desyncedDevices) {
+              try {
+                await this.context.setSmartThingsState(device.id, {
+                  thermostatMode: expectedMode,
+                });
+                this.context.logger.info(
+                  { deviceId: device.id, deviceName: device.name, mode: expectedMode },
+                  '✅ Reconciled device mode'
+                );
+              } catch (error) {
+                this.context.logger.error(
+                  { err: error, deviceId: device.id, deviceName: device.name },
+                  '❌ Failed to reconcile device mode'
+                );
+              }
+            }
+          }
+        }
       }
     }
 
