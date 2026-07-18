@@ -544,15 +544,58 @@ export class SmartThingsHAPServer {
       .getCharacteristic(Characteristic.TemperatureDisplayUnits)
       .setValue(Characteristic.TemperatureDisplayUnits.FAHRENHEIT);
 
-    // Heating Threshold Temperature (required by HAP but set to safe minimum)
+    // Heating Threshold Temperature (used by HomeKit in Auto mode for the lower bound)
+    const DEFAULT_TEMP_BAND = 4;
+    const safeHeatingSetpoint = deviceState.heatingSetpoint
+      ?? (deviceState.coolingSetpoint !== undefined ? deviceState.coolingSetpoint - DEFAULT_TEMP_BAND : 68);
     thermostatService
       .getCharacteristic(Characteristic.HeatingThresholdTemperature)
-      .setValue(10); // 10°C minimum required by HAP
+      .setProps({
+        minValue: 0,
+        maxValue: 25,
+        minStep: 0.5
+      })
+      .setValue(this.quantize(this.fahrenheitToCelsius(safeHeatingSetpoint), 0.5))
+      .on('set', (value: CharacteristicValue, callback: CharacteristicSetCallback) => {
+        logger.info(`🏠 HomeKit SET HeatingThresholdTemperature for ${deviceId}: ${value}°C`);
+        this.handleHeatingThresholdChange(deviceId, value as number, callback);
+      })
+      .on('get', (callback: CharacteristicGetCallback) => {
+        const device = this.devices.get(deviceId);
+        if (device) {
+          const setpoint = device.state.heatingSetpoint
+            ?? (device.state.coolingSetpoint !== undefined ? device.state.coolingSetpoint - DEFAULT_TEMP_BAND : 68);
+          const temp = this.quantize(this.fahrenheitToCelsius(setpoint), 0.5);
+          callback(null, temp);
+        } else {
+          callback(new Error('Device not found'));
+        }
+      });
 
-    // Cooling Threshold Temperature (required by HAP but set to safe values)
+    // Cooling Threshold Temperature (used by HomeKit in Auto mode for the upper bound)
+    const safeCoolingSetpoint = deviceState.coolingSetpoint ?? deviceState.temperatureSetpoint ?? 72;
     thermostatService
       .getCharacteristic(Characteristic.CoolingThresholdTemperature)
-      .setValue(25); // 25°C (77°F) as reasonable cooling threshold
+      .setProps({
+        minValue: 10,
+        maxValue: 35,
+        minStep: 0.5
+      })
+      .setValue(this.quantize(this.fahrenheitToCelsius(safeCoolingSetpoint), 0.5))
+      .on('set', (value: CharacteristicValue, callback: CharacteristicSetCallback) => {
+        logger.info(`🏠 HomeKit SET CoolingThresholdTemperature for ${deviceId}: ${value}°C`);
+        this.handleCoolingThresholdChange(deviceId, value as number, callback);
+      })
+      .on('get', (callback: CharacteristicGetCallback) => {
+        const device = this.devices.get(deviceId);
+        if (device) {
+          const setpoint = device.state.coolingSetpoint ?? device.state.temperatureSetpoint ?? 72;
+          const temp = this.quantize(this.fahrenheitToCelsius(setpoint), 0.5);
+          callback(null, temp);
+        } else {
+          callback(new Error('Device not found'));
+        }
+      });
   }
 
   private async handleTargetTemperatureChange(
@@ -632,22 +675,25 @@ export class SmartThingsHAPServer {
     celsiusValue: number,
     callback: CharacteristicSetCallback
   ): Promise<void> {
-    try {
-      const fahrenheitValue = this.celsiusToFahrenheit(celsiusValue);
-      logger.info(`HAP: Cooling threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
+    const fahrenheitValue = this.celsiusToFahrenheit(celsiusValue);
+    const commandedF = Math.round(fahrenheitValue);
+    logger.info(`HAP: Cooling threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
 
-      if (this.coordinator) {
-        await this.coordinator.handleThermostatEvent({
-          deviceId,
-          type: 'temperature',
-          temperature: Math.round(fahrenheitValue)
-        });
-      }
+    const device = this.devices.get(deviceId);
+    if (device) {
+      device.state.coolingSetpoint = commandedF;
+    }
 
-      callback();
-    } catch (error) {
-      logger.error({ deviceId, err: error }, 'Error handling cooling threshold change');
-      callback(error as Error);
+    callback();
+
+    if (this.coordinator) {
+      this.coordinator.handleThermostatEvent({
+        deviceId,
+        type: 'temperature',
+        coolingSetpoint: commandedF,
+      }).catch((error: any) => {
+        logger.error({ deviceId, err: error }, 'Error handling cooling threshold change');
+      });
     }
   }
 
@@ -656,22 +702,25 @@ export class SmartThingsHAPServer {
     celsiusValue: number,
     callback: CharacteristicSetCallback
   ): Promise<void> {
-    try {
-      const fahrenheitValue = this.celsiusToFahrenheit(celsiusValue);
-      logger.info(`HAP: Heating threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
+    const fahrenheitValue = this.celsiusToFahrenheit(celsiusValue);
+    const commandedF = Math.round(fahrenheitValue);
+    logger.info(`HAP: Heating threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
 
-      if (this.coordinator) {
-        await this.coordinator.handleThermostatEvent({
-          deviceId,
-          type: 'temperature',
-          temperature: Math.round(fahrenheitValue)
-        });
-      }
+    const device = this.devices.get(deviceId);
+    if (device) {
+      device.state.heatingSetpoint = commandedF;
+    }
 
-      callback();
-    } catch (error) {
-      logger.error({ deviceId, err: error }, 'Error handling heating threshold change');
-      callback(error as Error);
+    callback();
+
+    if (this.coordinator) {
+      this.coordinator.handleThermostatEvent({
+        deviceId,
+        type: 'temperature',
+        heatingSetpoint: commandedF,
+      }).catch((error: any) => {
+        logger.error({ deviceId, err: error }, 'Error handling heating threshold change');
+      });
     }
   }
 
@@ -761,13 +810,19 @@ export class SmartThingsHAPServer {
           Math.abs(oldState.temperatureSetpoint - newSetpointF) > 0.1 ||
           isRoundTripEcho);
       const modeChanged = oldState.mode !== deviceState.mode;
+      const coolingThresholdChanged = deviceState.coolingSetpoint !== undefined &&
+        (oldState.coolingSetpoint === undefined ||
+          Math.abs(oldState.coolingSetpoint - deviceState.coolingSetpoint) > 0.1);
+      const heatingThresholdChanged = deviceState.heatingSetpoint !== undefined &&
+        (oldState.heatingSetpoint === undefined ||
+          Math.abs(oldState.heatingSetpoint - deviceState.heatingSetpoint) > 0.1);
 
-      if (!tempChanged && !setpointChanged && !modeChanged) {
+      if (!tempChanged && !setpointChanged && !modeChanged && !coolingThresholdChanged && !heatingThresholdChanged) {
         logger.info({ deviceId }, '   No changes detected, skipping update');
         return;
       }
 
-      logger.info({ deviceId, tempChanged, setpointChanged, modeChanged }, '   Changes detected');
+      logger.info({ deviceId, tempChanged, setpointChanged, modeChanged, coolingThresholdChanged, heatingThresholdChanged }, '   Changes detected');
       this.lastUpdateTime.set(deviceId, Date.now());
 
       // Update characteristics if values have changed
@@ -802,6 +857,22 @@ export class SmartThingsHAPServer {
         service
           .getCharacteristic(Characteristic.TargetTemperature)
           .updateValue(newSetpoint);
+      }
+
+      // Update threshold temperatures (used by HomeKit in Auto mode)
+      if (coolingThresholdChanged) {
+        const newCoolingC = this.quantize(this.fahrenheitToCelsius(deviceState.coolingSetpoint!), 0.5);
+        logger.info(`   Updating CoolingThresholdTemperature: ${oldState.coolingSetpoint}°F -> ${deviceState.coolingSetpoint}°F (${newCoolingC}°C)`);
+        service
+          .getCharacteristic(Characteristic.CoolingThresholdTemperature)
+          .updateValue(newCoolingC);
+      }
+      if (heatingThresholdChanged) {
+        const newHeatingC = this.quantize(this.fahrenheitToCelsius(deviceState.heatingSetpoint!), 0.5);
+        logger.info(`   Updating HeatingThresholdTemperature: ${oldState.heatingSetpoint}°F -> ${deviceState.heatingSetpoint}°F (${newHeatingC}°C)`);
+        service
+          .getCharacteristic(Characteristic.HeatingThresholdTemperature)
+          .updateValue(newHeatingC);
       }
 
       // Update current heating/cooling state
