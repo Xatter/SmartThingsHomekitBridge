@@ -94,6 +94,13 @@ jest.mock('qrcode', () => ({
   toString: jest.fn().mockResolvedValue('<svg>mock-qr-code</svg>'),
 }));
 
+// Jest 30 on Node 26: once any test in this file calls jest.useFakeTimers(), the
+// global timer functions are left undefined for everything that runs afterwards -
+// even after jest.useRealTimers(). Capture the real ones at module load so later
+// blocks can put them back.
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+
 describe('SmartThingsHAPServer', () => {
   let hapServer: SmartThingsHAPServer;
   let mockCoordinator: jest.Mocked<Coordinator>;
@@ -446,6 +453,100 @@ describe('SmartThingsHAPServer', () => {
       const device = hapServer['devices'].get('device-123')!;
       const targetTempChar = device.thermostatService.getCharacteristic(Characteristic.TargetTemperature);
       expect(targetTempChar.updateValue).toHaveBeenCalledWith(22.5);
+    });
+  });
+
+  describe('Auto-mode threshold writes', () => {
+    // Flush the coalescing buffer directly rather than waiting out the debounce.
+    // An earlier test in this file installs fake timers, which in this Jest/Node
+    // combination permanently breaks setTimeout for everything after it - so these
+    // tests must not depend on a real timer firing.
+    const flushCoalesceWindow = async (deviceId = 'device-123') => {
+      (hapServer as any).flushThresholdWrite(deviceId);
+      await Promise.resolve();
+    };
+
+    beforeEach(async () => {
+      // See the note at the top of this file - an earlier fake-timer test leaves the
+      // globals undefined, and queueThresholdWrite schedules a debounce timer.
+      (globalThis as any).setTimeout = realSetTimeout;
+      (globalThis as any).clearTimeout = realClearTimeout;
+
+      await hapServer.initialize(mockCoordinator);
+      await hapServer.start();
+      // No heatingSetpoint - the single-register case, where HomeKit's lower bound
+      // has to be synthesized as coolingSetpoint - 4.
+      await hapServer.addDevice('device-123', createMockDeviceState({ coolingSetpoint: 72 }));
+      mockCoordinator.handleThermostatEvent.mockClear();
+    });
+
+    afterEach(() => {
+      for (const timer of hapServer['thresholdTimers'].values()) {
+        clearTimeout(timer);
+      }
+      hapServer['thresholdTimers'].clear();
+    });
+
+    test('given both thresholds written in quick succession, should emit one combined event', async () => {
+      // 22°C -> 72°F upper bound, 15°C -> 59°F lower bound.
+      await (hapServer as any).handleCoolingThresholdChange('device-123', 22, jest.fn());
+      await (hapServer as any).handleHeatingThresholdChange('device-123', 15, jest.fn());
+
+      await flushCoalesceWindow();
+
+      expect(mockCoordinator.handleThermostatEvent).toHaveBeenCalledTimes(1);
+      expect(mockCoordinator.handleThermostatEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          deviceId: 'device-123',
+          heatingSetpoint: 59,
+          coolingSetpoint: 72,
+        })
+      );
+    });
+
+    test('given no heating setpoint from the device, should synthesize the lower bound', () => {
+      expect(hapServer['inferredHeating'].get('device-123')).toBe(68);
+    });
+
+    test('given a heating threshold echoing the synthesized bound, should not write it through', async () => {
+      // 20°C == 68°F - exactly the value synthesized for HomeKit, coming straight back.
+      // Forwarding it would alias onto the only setpoint register and drop it to 68.
+      await (hapServer as any).handleHeatingThresholdChange('device-123', 20, jest.fn());
+
+      await flushCoalesceWindow();
+
+      expect(mockCoordinator.handleThermostatEvent).not.toHaveBeenCalled();
+      expect(hapServer['devices'].get('device-123')?.state.heatingSetpoint).toBeUndefined();
+    });
+
+    test('given a genuine heating threshold change, should write it through', async () => {
+      // 16°C -> 61°F, nowhere near the synthesized 68°F.
+      await (hapServer as any).handleHeatingThresholdChange('device-123', 16, jest.fn());
+
+      await flushCoalesceWindow();
+
+      expect(mockCoordinator.handleThermostatEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ heatingSetpoint: 61 })
+      );
+      expect(hapServer['devices'].get('device-123')?.state.heatingSetpoint).toBe(61);
+    });
+
+    test('given a device that reports its own heating setpoint, should not synthesize a bound', async () => {
+      await hapServer.addDevice('device-real', createMockDeviceState({
+        id: 'device-real',
+        coolingSetpoint: 72,
+        heatingSetpoint: 66,
+      }));
+
+      expect(hapServer['inferredHeating'].has('device-real')).toBe(false);
+
+      // 20°C == 68°F would have been swallowed as an echo on a synthesized bound.
+      await (hapServer as any).handleHeatingThresholdChange('device-real', 20, jest.fn());
+      await flushCoalesceWindow('device-real');
+
+      expect(mockCoordinator.handleThermostatEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ deviceId: 'device-real', heatingSetpoint: 68 })
+      );
     });
   });
 

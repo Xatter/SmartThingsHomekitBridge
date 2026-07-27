@@ -60,6 +60,27 @@ export class SmartThingsHAPServer {
   // (and potentially drifted) one.
   private lastCommanded = new Map<string, { commandedF: number; originalC: number }>();
 
+  // Devices with a single setpoint register (Samsung mini-splits) report no
+  // heating setpoint, but HomeKit's Auto mode requires a lower bound. This is the
+  // °F gap synthesized below the real setpoint - display-only, and it must never
+  // be written back to the device.
+  private static readonly DEFAULT_TEMP_BAND = 4;
+  private static readonly DEFAULT_HEATING_F = 68;
+
+  // HomeKit writes both Auto-mode thresholds as separate characteristic sets a few
+  // milliseconds apart. Forwarding each one immediately produced two independent
+  // SmartThings command batches which, on a single-register device, raced for the
+  // same register. Buffer them briefly and emit one combined event instead.
+  private static readonly THRESHOLD_COALESCE_MS = 300;
+  private pendingThresholds = new Map<string, { heating?: number; cooling?: number }>();
+  private thresholdTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  // Heating threshold values synthesized for HomeKit because the device reports no
+  // real heating setpoint. If HomeKit writes one straight back, it is echoing our
+  // own fiction - passing it through would drag the real setpoint down by
+  // DEFAULT_TEMP_BAND on every round trip.
+  private inferredHeating = new Map<string, number>();
+
   // Tracks the untracked-before unpair->reinitialize timer so stop() can
   // cancel it, and a flag so the timer callback (and any initialize()/start()
   // chained after it) can bail out if the server is shutting down.
@@ -545,9 +566,6 @@ export class SmartThingsHAPServer {
       .setValue(Characteristic.TemperatureDisplayUnits.FAHRENHEIT);
 
     // Heating Threshold Temperature (used by HomeKit in Auto mode for the lower bound)
-    const DEFAULT_TEMP_BAND = 4;
-    const safeHeatingSetpoint = deviceState.heatingSetpoint
-      ?? (deviceState.coolingSetpoint !== undefined ? deviceState.coolingSetpoint - DEFAULT_TEMP_BAND : 68);
     thermostatService
       .getCharacteristic(Characteristic.HeatingThresholdTemperature)
       .setProps({
@@ -555,7 +573,7 @@ export class SmartThingsHAPServer {
         maxValue: 25,
         minStep: 0.5
       })
-      .setValue(this.quantize(this.fahrenheitToCelsius(safeHeatingSetpoint), 0.5))
+      .setValue(this.quantize(this.fahrenheitToCelsius(this.resolveHeatingThresholdF(deviceId, deviceState)), 0.5))
       .on('set', (value: CharacteristicValue, callback: CharacteristicSetCallback) => {
         logger.info(`🏠 HomeKit SET HeatingThresholdTemperature for ${deviceId}: ${value}°C`);
         this.handleHeatingThresholdChange(deviceId, value as number, callback);
@@ -563,10 +581,8 @@ export class SmartThingsHAPServer {
       .on('get', (callback: CharacteristicGetCallback) => {
         const device = this.devices.get(deviceId);
         if (device) {
-          const setpoint = device.state.heatingSetpoint
-            ?? (device.state.coolingSetpoint !== undefined ? device.state.coolingSetpoint - DEFAULT_TEMP_BAND : 68);
-          const temp = this.quantize(this.fahrenheitToCelsius(setpoint), 0.5);
-          callback(null, temp);
+          const setpoint = this.resolveHeatingThresholdF(deviceId, device.state);
+          callback(null, this.quantize(this.fahrenheitToCelsius(setpoint), 0.5));
         } else {
           callback(new Error('Device not found'));
         }
@@ -670,6 +686,87 @@ export class SmartThingsHAPServer {
     }
   }
 
+  /**
+   * Returns the °F value to show HomeKit as the Auto-mode heating (lower) bound.
+   *
+   * When the device reports no heating setpoint of its own, the bound is
+   * synthesized from the cooling setpoint and remembered, so that a write-back of
+   * that same value can later be recognized as a UI echo rather than user intent.
+   */
+  private resolveHeatingThresholdF(deviceId: string, state: DeviceState): number {
+    if (state.heatingSetpoint !== undefined) {
+      this.inferredHeating.delete(deviceId);
+      return state.heatingSetpoint;
+    }
+
+    const inferred = state.coolingSetpoint !== undefined
+      ? state.coolingSetpoint - SmartThingsHAPServer.DEFAULT_TEMP_BAND
+      : SmartThingsHAPServer.DEFAULT_HEATING_F;
+    this.inferredHeating.set(deviceId, inferred);
+    return inferred;
+  }
+
+  /**
+   * Buffers Auto-mode threshold writes briefly and emits them as one event.
+   *
+   * HomeKit sets HeatingThresholdTemperature and CoolingThresholdTemperature as two
+   * separate characteristic writes milliseconds apart. Forwarding each immediately
+   * produced two independent SmartThings command batches; on a device where both
+   * bounds alias onto the same setpoint register they raced, and the loser's value
+   * won at random. Coalescing lets the coordinator see the whole range at once and
+   * pick the bound that owns the active mode.
+   */
+  private queueThresholdWrite(deviceId: string, update: { heating?: number; cooling?: number }): void {
+    const pending = this.pendingThresholds.get(deviceId) ?? {};
+    if (update.heating !== undefined) {
+      pending.heating = update.heating;
+    }
+    if (update.cooling !== undefined) {
+      pending.cooling = update.cooling;
+    }
+    this.pendingThresholds.set(deviceId, pending);
+
+    const existing = this.thresholdTimers.get(deviceId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+
+    const timer = setTimeout(
+      () => this.flushThresholdWrite(deviceId),
+      SmartThingsHAPServer.THRESHOLD_COALESCE_MS
+    );
+
+    this.thresholdTimers.set(deviceId, timer);
+  }
+
+  /**
+   * Emits the buffered threshold range for a device as a single coordinator event.
+   */
+  private flushThresholdWrite(deviceId: string): void {
+    const timer = this.thresholdTimers.get(deviceId);
+    if (timer) {
+      clearTimeout(timer);
+      this.thresholdTimers.delete(deviceId);
+    }
+
+    const batch = this.pendingThresholds.get(deviceId);
+    this.pendingThresholds.delete(deviceId);
+
+    if (!batch || !this.coordinator) {
+      return;
+    }
+
+    logger.info({ deviceId, ...batch }, '🎚️  Flushing coalesced Auto-mode threshold write');
+    this.coordinator.handleThermostatEvent({
+      deviceId,
+      type: 'temperature',
+      heatingSetpoint: batch.heating,
+      coolingSetpoint: batch.cooling,
+    }).catch((error: any) => {
+      logger.error({ deviceId, err: error }, 'Error handling threshold change');
+    });
+  }
+
   private async handleCoolingThresholdChange(
     deviceId: string,
     celsiusValue: number,
@@ -686,15 +783,7 @@ export class SmartThingsHAPServer {
 
     callback();
 
-    if (this.coordinator) {
-      this.coordinator.handleThermostatEvent({
-        deviceId,
-        type: 'temperature',
-        coolingSetpoint: commandedF,
-      }).catch((error: any) => {
-        logger.error({ deviceId, err: error }, 'Error handling cooling threshold change');
-      });
-    }
+    this.queueThresholdWrite(deviceId, { cooling: commandedF });
   }
 
   private async handleHeatingThresholdChange(
@@ -706,22 +795,27 @@ export class SmartThingsHAPServer {
     const commandedF = Math.round(fahrenheitValue);
     logger.info(`HAP: Heating threshold change for ${deviceId}: ${fahrenheitValue.toFixed(1)}°F`);
 
+    callback();
+
+    // Echo guard: if this is the synthesized lower bound coming straight back from
+    // the HomeKit UI, forwarding it would alias onto the device's only setpoint
+    // register and pull it down by DEFAULT_TEMP_BAND - the ratchet that walked units
+    // from 72°F down to 64°F. Round-tripping through °C can shift the value by up to
+    // a degree, hence the tolerance rather than an equality check.
+    const inferred = this.inferredHeating.get(deviceId);
+    if (inferred !== undefined && Math.abs(inferred - commandedF) <= 1) {
+      logger.info({ deviceId, commandedF, inferred },
+        '↩️  Ignoring echo of synthesized heating threshold - not user intent');
+      return;
+    }
+
     const device = this.devices.get(deviceId);
     if (device) {
       device.state.heatingSetpoint = commandedF;
     }
+    this.inferredHeating.delete(deviceId);
 
-    callback();
-
-    if (this.coordinator) {
-      this.coordinator.handleThermostatEvent({
-        deviceId,
-        type: 'temperature',
-        heatingSetpoint: commandedF,
-      }).catch((error: any) => {
-        logger.error({ deviceId, err: error }, 'Error handling heating threshold change');
-      });
-    }
+    this.queueThresholdWrite(deviceId, { heating: commandedF });
   }
 
   /**
@@ -930,6 +1024,16 @@ export class SmartThingsHAPServer {
     this.pendingUpdates.delete(deviceId);
     this.lastUpdateTime.delete(deviceId);
     this.lastCommanded.delete(deviceId);
+
+    // Same for a buffered Auto-mode threshold write - it must not reach the
+    // coordinator for a device that no longer exists.
+    const thresholdTimer = this.thresholdTimers.get(deviceId);
+    if (thresholdTimer) {
+      clearTimeout(thresholdTimer);
+      this.thresholdTimers.delete(deviceId);
+    }
+    this.pendingThresholds.delete(deviceId);
+    this.inferredHeating.delete(deviceId);
 
     this.devices.delete(deviceId);
     await this.accessoryCache.remove(deviceId);
@@ -1189,6 +1293,14 @@ export class SmartThingsHAPServer {
     }
     this.cooldownTimers.clear();
     this.pendingUpdates.clear();
+
+    // Cancel any buffered Auto-mode threshold writes.
+    for (const timer of this.thresholdTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.thresholdTimers.clear();
+    this.pendingThresholds.clear();
+    this.inferredHeating.clear();
 
     if (this.bridge) {
       try {

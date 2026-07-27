@@ -543,6 +543,141 @@ describe('Coordinator', () => {
       ]);
     });
 
+    // Regression: Samsung mini-splits expose a single setpoint register, so HomeKit's
+    // Auto-mode heating and cooling bounds both alias onto thermostatCoolingSetpoint.
+    // HomeKit sends BOTH on every Auto adjustment; writing both made the commands race
+    // and the loser's value won at random - which left an Auto range of 68-72 sitting
+    // at 68. Only the bound owning the active mode may reach the register.
+    describe('single-register devices (Samsung mini-splits)', () => {
+      const samsungDevice = (deviceId: string) => createMockDevice({
+        deviceId,
+        thermostatCapabilities: {
+          airConditionerMode: true,
+          thermostatMode: false,
+          temperatureMeasurement: true,
+          thermostatCoolingSetpoint: true,
+          thermostatHeatingSetpoint: false,
+        },
+      });
+
+      const expectSingleSetpointCommand = (deviceId: string, value: number) => {
+        expect(mockApi.executeCommands).toHaveBeenCalledWith(deviceId, [
+          {
+            component: 'main',
+            capability: 'thermostatCoolingSetpoint',
+            command: 'setCoolingSetpoint',
+            arguments: [value],
+          },
+        ]);
+      };
+
+      test('given both bounds in cool mode, should write only the cooling bound', async () => {
+        coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
+        coordinator['deviceMetadata'].set('device-1', samsungDevice('device-1'));
+
+        await coordinator.handleThermostatEvent({
+          deviceId: 'device-1',
+          type: 'temperature',
+          heatingSetpoint: 68,
+          coolingSetpoint: 72,
+        });
+
+        expectSingleSetpointCommand('device-1', 72);
+      });
+
+      test('given both bounds in heat mode, should write only the heating bound', async () => {
+        coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'heat' }));
+        coordinator['deviceMetadata'].set('device-1', samsungDevice('device-1'));
+
+        await coordinator.handleThermostatEvent({
+          deviceId: 'device-1',
+          type: 'temperature',
+          heatingSetpoint: 68,
+          coolingSetpoint: 72,
+        });
+
+        expectSingleSetpointCommand('device-1', 68);
+      });
+
+      test('given both bounds in auto mode, should write only the cooling bound', async () => {
+        coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'auto' }));
+        coordinator['deviceMetadata'].set('device-1', samsungDevice('device-1'));
+
+        await coordinator.handleThermostatEvent({
+          deviceId: 'device-1',
+          type: 'temperature',
+          heatingSetpoint: 68,
+          coolingSetpoint: 72,
+        });
+
+        expectSingleSetpointCommand('device-1', 72);
+      });
+
+      test('given only the bound that does not own the active mode, should send no setpoint command', async () => {
+        coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool' }));
+        coordinator['deviceMetadata'].set('device-1', samsungDevice('device-1'));
+
+        await coordinator.handleThermostatEvent({
+          deviceId: 'device-1',
+          type: 'temperature',
+          heatingSetpoint: 64,
+        });
+
+        expect(mockApi.executeCommands).not.toHaveBeenCalled();
+      });
+
+      test('given a mode change in the same event, should honour the new mode when picking the bound', async () => {
+        coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'cool', switchState: 'on' }));
+        coordinator['deviceMetadata'].set('device-1', samsungDevice('device-1'));
+
+        await coordinator.handleThermostatEvent({
+          deviceId: 'device-1',
+          type: 'both',
+          mode: 'heat',
+          heatingSetpoint: 68,
+          coolingSetpoint: 72,
+        });
+
+        expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', expect.arrayContaining([
+          {
+            component: 'main',
+            capability: 'thermostatCoolingSetpoint',
+            command: 'setCoolingSetpoint',
+            arguments: [68],
+          },
+        ]));
+        const [, commands] = mockApi.executeCommands.mock.calls[0];
+        expect(commands.filter((c: any) => c.command === 'setCoolingSetpoint')).toHaveLength(1);
+      });
+    });
+
+    test('given both bounds on a device with separate registers, should write both', async () => {
+      coordinator['state'].deviceStates.set('device-1', createMockDeviceState({ mode: 'auto' }));
+      coordinator['deviceMetadata'].set('device-1', createMockDevice({ deviceId: 'device-1' }));
+
+      await coordinator.handleThermostatEvent({
+        deviceId: 'device-1',
+        type: 'temperature',
+        heatingSetpoint: 68,
+        coolingSetpoint: 72,
+      });
+
+      expect(mockApi.executeCommands).toHaveBeenCalledWith('device-1', [
+        {
+          component: 'main',
+          capability: 'thermostatHeatingSetpoint',
+          command: 'setHeatingSetpoint',
+          arguments: [68],
+        },
+        {
+          component: 'main',
+          capability: 'thermostatCoolingSetpoint',
+          command: 'setCoolingSetpoint',
+          arguments: [72],
+        },
+      ]);
+    });
+
     test('given a successful command, should not mutate the DeviceState object previously stored in the map', async () => {
       const original = createMockDeviceState({ mode: 'cool', coolingSetpoint: 72, temperatureSetpoint: 72 });
       coordinator['state'].deviceStates.set('device-1', original);

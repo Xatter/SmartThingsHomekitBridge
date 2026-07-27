@@ -563,10 +563,10 @@ export class Coordinator {
 
       // Apply state changes to SmartThings
       const commands: any[] = [];
+      const caps = device.thermostatCapabilities;
 
       if (finalState.thermostatMode !== undefined) {
         // Check if device uses airConditionerMode or thermostatMode
-        const caps = device.thermostatCapabilities;
         const usesAirConditionerMode = caps.airConditionerMode && !caps.thermostatMode;
 
         logger.debug({
@@ -623,36 +623,54 @@ export class Coordinator {
         }
       }
 
-      if (finalState.heatingSetpoint !== undefined) {
-        const caps = device.thermostatCapabilities;
-        // Samsung ACs don't have thermostatHeatingSetpoint - use coolingSetpoint for all temps
-        if (caps.thermostatHeatingSetpoint) {
+      if (caps.thermostatHeatingSetpoint) {
+        // Independent heating and cooling registers - both bounds can be written
+        // without interfering with each other.
+        if (finalState.heatingSetpoint !== undefined) {
           commands.push({
             component: 'main',
             capability: 'thermostatHeatingSetpoint',
             command: 'setHeatingSetpoint',
             arguments: [finalState.heatingSetpoint],
           });
-        } else if (caps.thermostatCoolingSetpoint) {
-          // Fallback: use cooling setpoint (Samsung ACs use this for all modes)
-          logger.info({ deviceId: event.deviceId, setpoint: finalState.heatingSetpoint },
-            '🌡️  Using coolingSetpoint for heating (Samsung AC)');
+        }
+        if (finalState.coolingSetpoint !== undefined) {
           commands.push({
             component: 'main',
             capability: 'thermostatCoolingSetpoint',
             command: 'setCoolingSetpoint',
-            arguments: [finalState.heatingSetpoint],
+            arguments: [finalState.coolingSetpoint],
           });
         }
-      }
+      } else if (caps.thermostatCoolingSetpoint) {
+        // Single-register device (Samsung mini-splits): thermostatCoolingSetpoint is
+        // the only setpoint the hardware has, so HomeKit's heating and cooling
+        // thresholds both alias onto it. HomeKit sends BOTH on every Auto-mode
+        // adjustment, so writing both made the two commands race and whichever
+        // landed last silently won - which is how an Auto range of 68-72 could leave
+        // the unit sitting at 68. Only the bound that owns the active mode may write.
+        const activeMode = finalState.thermostatMode ?? currentState.mode;
+        const heatingOwnsRegister = activeMode === 'heat';
+        const ownedSetpoint = heatingOwnsRegister ? finalState.heatingSetpoint : finalState.coolingSetpoint;
+        const ignoredSetpoint = heatingOwnsRegister ? finalState.coolingSetpoint : finalState.heatingSetpoint;
 
-      if (finalState.coolingSetpoint !== undefined) {
-        commands.push({
-          component: 'main',
-          capability: 'thermostatCoolingSetpoint',
-          command: 'setCoolingSetpoint',
-          arguments: [finalState.coolingSetpoint],
-        });
+        if (ownedSetpoint !== undefined) {
+          logger.info({
+            deviceId: event.deviceId,
+            activeMode,
+            setpoint: ownedSetpoint,
+            ...(ignoredSetpoint !== undefined ? { ignoredSetpoint } : {}),
+          }, '🌡️  Single-register device - writing the bound that owns the active mode');
+          commands.push({
+            component: 'main',
+            capability: 'thermostatCoolingSetpoint',
+            command: 'setCoolingSetpoint',
+            arguments: [ownedSetpoint],
+          });
+        } else if (ignoredSetpoint !== undefined) {
+          logger.info({ deviceId: event.deviceId, activeMode, ignoredSetpoint },
+            '🌡️  Single-register device - ignoring bound that does not own the active mode');
+        }
       }
 
       if (commands.length > 0) {
