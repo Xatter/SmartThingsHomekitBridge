@@ -89,7 +89,8 @@ describe('HomeAssistantAPI', () => {
       mockFetch.mockImplementation((url: string) => {
         if (url.endsWith('/api/states/climate.samsung_ac')) {
           return haStateResponse('climate.samsung_ac', 'heat', {
-            temperature: 59,
+            temperature: 72,
+            current_temperature: 59,
             current_humidity: 58,
           });
         }
@@ -106,10 +107,10 @@ describe('HomeAssistantAPI', () => {
       expect(status!.name).toBe('Samsung-Room-Air-Conditioner');
       expect(status!.mode).toBe('heat');
       expect(status!.currentTemperature).toBe(59);
-      expect(status!.temperatureSetpoint).toBe(59);
+      expect(status!.temperatureSetpoint).toBe(72);
       // Single-register unit: coolingSetpoint carries the register, heating
       // stays undefined (mirrors the SmartThings payload for these units).
-      expect(status!.coolingSetpoint).toBe(59);
+      expect(status!.coolingSetpoint).toBe(72);
       expect(status!.heatingSetpoint).toBeUndefined();
       expect(status!.switchState).toBe('on');
       expect(status!.lightOn).toBe(false);

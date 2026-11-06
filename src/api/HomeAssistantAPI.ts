@@ -243,8 +243,11 @@ export class HomeAssistantAPI {
       );
       const attrs = st?.attributes || {};
 
-      const temperature = this.parseOptionalNumber(attrs.temperature);
+      // attrs.temperature is the TARGET setpoint; attrs.current_temperature
+      // is the room reading. Mapping the wrong one makes every unit read its
+      // own setpoint (caught live: all four units reported 72°F).
       const setpoint = this.parseOptionalNumber(attrs.temperature);
+      const temperature = this.parseOptionalNumber(attrs.current_temperature);
 
       // hvac_mode 'off' means powered off; dry/wind collapse to cool (mirrors
       // SmartThingsAPI's mode handling for Samsung ACs).
