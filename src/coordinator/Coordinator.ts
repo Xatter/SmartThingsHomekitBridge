@@ -1,6 +1,6 @@
 import * as cron from 'node-cron';
 import { promises as fs } from 'fs';
-import { SmartThingsAPI } from '@/api/SmartThingsAPI';
+import { DeviceBackend } from '@/api/DeviceBackend';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { CoordinatorState, DeviceState, UnifiedDevice } from '@/types';
 import { HAPThermostatEvent } from '@/hap/HAPServer';
@@ -23,7 +23,7 @@ const ECHO_SUPPRESS_MS = 90_000;
  * This is a refactored version that delegates device-specific logic to plugins.
  */
 export class Coordinator {
-  private readonly api: SmartThingsAPI;
+  private readonly api: DeviceBackend;
   private readonly hapServer: SmartThingsHAPServer;
   private readonly pluginManager: PluginManager;
   private readonly inclusionManager: DeviceInclusionManager;
@@ -65,7 +65,7 @@ export class Coordinator {
   );
 
   constructor(
-    api: SmartThingsAPI,
+    api: DeviceBackend,
     hapServer: SmartThingsHAPServer,
     pluginManager: PluginManager,
     inclusionManager: DeviceInclusionManager,

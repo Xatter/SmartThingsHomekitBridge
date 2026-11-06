@@ -3,7 +3,7 @@ import * as path from 'path';
 import { Logger } from 'pino';
 import { PluginContext as IPluginContext } from './types';
 import { UnifiedDevice } from '@/types';
-import { SmartThingsAPI } from '@/api/SmartThingsAPI';
+import { DeviceBackend } from '@/api/DeviceBackend';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { atomicWriteJson } from '@/utils/atomicWrite';
 
@@ -18,7 +18,7 @@ export class PluginContextImpl implements IPluginContext {
 
   private readonly getDevicesImpl: () => UnifiedDevice[];
   private readonly getDeviceImpl: (deviceId: string) => UnifiedDevice | undefined;
-  private readonly api: SmartThingsAPI;
+  private readonly api: DeviceBackend;
   private readonly hapServer: SmartThingsHAPServer;
   private readonly persistPath: string;
 
@@ -28,7 +28,7 @@ export class PluginContextImpl implements IPluginContext {
     config: any,
     getDevicesImpl: () => UnifiedDevice[],
     getDeviceImpl: (deviceId: string) => UnifiedDevice | undefined,
-    api: SmartThingsAPI,
+    api: DeviceBackend,
     hapServer: SmartThingsHAPServer,
     dataPath: string
   ) {

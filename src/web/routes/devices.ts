@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { SmartThingsAPI } from '@/api/SmartThingsAPI';
+import { DeviceBackend } from '@/api/DeviceBackend';
 import { Coordinator } from '@/coordinator/Coordinator';
 import { DeviceInclusionManager } from '@/config/DeviceInclusionManager';
 import { logger } from '@/utils/logger';
@@ -8,7 +8,7 @@ import { logger } from '@/utils/logger';
 const DEFAULT_TEMP_BAND_MARGIN = 2; // °F
 
 export function createDevicesRoutes(
-  api: SmartThingsAPI,
+  api: DeviceBackend,
   coordinator: Coordinator,
   inclusionManager: DeviceInclusionManager
 ): Router {

@@ -2,6 +2,8 @@ import dotenv from 'dotenv';
 import * as cron from 'node-cron';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { SmartThingsAPI } from '@/api/SmartThingsAPI';
+import { DeviceBackend } from '@/api/DeviceBackend';
+import { HomeAssistantAPI } from '@/api/HomeAssistantAPI';
 import { Coordinator } from '@/coordinator/Coordinator';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 import { WebServer } from '@/web/server';
@@ -57,6 +59,25 @@ async function startup(): Promise<void> {
 
     const smartThingsAPI = new SmartThingsAPI(smartThingsAuth);
 
+    // Device backend selection: the SmartThings cloud (default, unchanged) or
+    // the local Home Assistant instance on this Pi (DEVICE_BACKEND=homeassistant).
+    // Both implement the same surface - see src/api/DeviceBackend.ts. Device IDs
+    // stay the historical SmartThings ones in both modes so persisted state and
+    // HomeKit accessory UUIDs are stable across switches.
+    const backendName = (process.env.DEVICE_BACKEND || 'smartthings').toLowerCase();
+    let deviceBackend: DeviceBackend;
+    if (backendName === 'homeassistant') {
+      const haApi = HomeAssistantAPI.fromEnv();
+      if (!haApi) {
+        throw new Error('DEVICE_BACKEND=homeassistant but HA_URL/HA_TOKEN/HA_ENTITY_MAP (or HA_ENTITY_MAP_FILE) are missing');
+      }
+      deviceBackend = haApi;
+      logger.info({ units: haApi.getUnitCount() }, '🏠 Device backend: Home Assistant (local)');
+    } else {
+      deviceBackend = smartThingsAPI;
+      logger.info('🏠 Device backend: SmartThings cloud');
+    }
+
     // Schedule proactive token refresh every hour
     logger.info('🔐 Starting proactive token refresh scheduler (runs hourly)');
     const tokenRefreshTask = cron.schedule('0 * * * *', async () => {
@@ -79,7 +100,7 @@ async function startup(): Promise<void> {
     const pluginManager = new PluginManager(
       logger,
       config,
-      smartThingsAPI,
+      deviceBackend,
       hapServer,
       () => coordinator?.getDevices() || [],
       (deviceId: string) => coordinator?.getDevice(deviceId),
@@ -97,7 +118,7 @@ async function startup(): Promise<void> {
 
     // Now create the coordinator with plugin support
     coordinator = new Coordinator(
-      smartThingsAPI,
+      deviceBackend,
       hapServer,
       pluginManager,
       inclusionManager,
@@ -118,7 +139,7 @@ async function startup(): Promise<void> {
 
     webServer.setupRoutes(
       smartThingsAuth,
-      smartThingsAPI,
+      deviceBackend,
       coordinator,
       hapServer,
       onAuthSuccess,
@@ -126,7 +147,7 @@ async function startup(): Promise<void> {
       inclusionManager // Pass inclusion manager for device routes
     );
 
-    if (!smartThingsAPI.hasAuth()) {
+    if (!deviceBackend.hasAuth()) {
       logger.warn('⚠️  No SmartThings authentication found');
       logger.info({ url: `http://localhost:${webPort}` }, '🌐 Please visit web interface to authenticate with SmartThings');
     } else {

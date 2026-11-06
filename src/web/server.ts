@@ -3,7 +3,7 @@ import express, { NextFunction, Request, RequestHandler, Response } from 'expres
 import cors from 'cors';
 import session from 'express-session';
 import path from 'path';
-import { SmartThingsAPI } from '@/api/SmartThingsAPI';
+import { DeviceBackend } from '@/api/DeviceBackend';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { Coordinator } from '@/coordinator/Coordinator';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
@@ -210,7 +210,7 @@ export class WebServer {
 
   setupRoutes(
     auth: SmartThingsAuthentication,
-    api: SmartThingsAPI,
+    api: DeviceBackend,
     coordinator: Coordinator,
     hapServer: SmartThingsHAPServer,
     onAuthSuccess?: () => void,

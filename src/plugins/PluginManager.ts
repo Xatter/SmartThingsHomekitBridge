@@ -5,7 +5,7 @@ import { Plugin, LoadedPlugin, PluginContext, PluginWebRoute } from './types';
 import { PluginContextImpl } from './PluginContext';
 import { PluginConfigManager } from './PluginConfigManager';
 import { UnifiedDevice } from '@/types';
-import { SmartThingsAPI } from '@/api/SmartThingsAPI';
+import { DeviceBackend } from '@/api/DeviceBackend';
 import { SmartThingsHAPServer } from '@/hap/HAPServer';
 
 /**
@@ -24,7 +24,7 @@ export class PluginManager {
   private readonly initializedPlugins: Set<string> = new Set();
   private readonly contexts: Map<string, PluginContext> = new Map();
   private readonly config: any;
-  private readonly api: SmartThingsAPI;
+  private readonly api: DeviceBackend;
   private readonly hapServer: SmartThingsHAPServer;
   private readonly getDevicesImpl: () => UnifiedDevice[];
   private readonly getDeviceImpl: (deviceId: string) => UnifiedDevice | undefined;
@@ -35,7 +35,7 @@ export class PluginManager {
   constructor(
     logger: Logger,
     config: any,
-    api: SmartThingsAPI,
+    api: DeviceBackend,
     hapServer: SmartThingsHAPServer,
     getDevicesImpl: () => UnifiedDevice[],
     getDeviceImpl: (deviceId: string) => UnifiedDevice | undefined,

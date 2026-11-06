@@ -1,4 +1,5 @@
 import { SmartThingsClient, BearerTokenAuthenticator } from '@smartthings/core-sdk';
+import { DeviceBackend } from './DeviceBackend';
 import { SmartThingsAuthentication } from '@/auth/SmartThingsAuthentication';
 import { SmartThingsDevice, DeviceState, ThermostatCapabilities, UnifiedDevice } from '@/types';
 import { logger } from '@/utils/logger';
@@ -17,7 +18,7 @@ const SMARTTHINGS_REQUEST_TIMEOUT_MS = 15000;
  * API client for interacting with SmartThings devices.
  * Handles authentication, device discovery, and device control.
  */
-export class SmartThingsAPI {
+export class SmartThingsAPI implements DeviceBackend {
   private client: SmartThingsClient | null = null;
   private currentToken: string | null = null;
   private readonly auth: SmartThingsAuthentication;
